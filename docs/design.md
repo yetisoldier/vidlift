@@ -1,6 +1,6 @@
 # VidLift v0.1 Design
 
-Status: design doc for this repo, v0.1.0 (2026-10-02). Adapted from
+Status: design doc for this repo, v0.2 work started (2026-10-03). Adapted from
 the SD-file-upscaler scoping assessment written by the architect
 subagent on 2026-10-02 (bluray-to-mp4
 `docs/designs/sd-file-upscaler-scoping.md`, the binding spec for this
@@ -83,12 +83,11 @@ The v0.1 rule that carries to every later version: **the probe and
 classification core has zero GUI imports.** The classification that
 v0.2's engine path needs is exactly the classification v0.1 ships.
 
-## 3. v0.2: engine consumption + pre-flight report (gated on v0.2.19)
+## 3. v0.2: engine consumption + pre-flight report
 
-Everything here waits for bluray-to-mp4 v0.2.19 to land (benchmark
-afternoon on Eric's box, engine selected, one real DVD validated).
-VidLift does not re-run the benchmark and does not pick models; it
-inherits whatever routing v0.2.19 blesses.
+This work started after bluray-to-mp4 v0.2.20 shipped with a validated
+DVD AI-upscale path. VidLift does not re-run the benchmark and does not
+pick models; it inherits whatever routing that pipeline blesses.
 
 - Pinned import of the v0.2.19 upscale core (`upscale/` +
   `encode.py`) as a dependency (git submodule or path dep while both
@@ -111,6 +110,11 @@ inherits whatever routing v0.2.19 blesses.
   the pairing rule), and the honest expectation string per source
   class. This is the front door of the product because files have
   no "insert disc" moment of commitment.
+- First implemented slice: `vidlift plan --target 720p --gbph 1.5
+  FILE...` builds the batch plan from probe data: output geometry,
+  target bitrate/size, output name, subtitle handling note, source
+  expectation, and warnings. It deliberately stops before running the
+  sample benchmark or encode.
 - Honest expectations, stated per source class: a proper DVD MPEG-2
   rip gets "the best 720p that source can give, good, not
   transformative"; a ~700 MB XviD/DivX rip gets "clearly cleaner on a
@@ -139,8 +143,8 @@ GUI is a client of the core, never a container for it.
 
 1. v0.1 (this repo, now): skeleton + probe/classify + tests, design
    doc. Done when pytest is green twice in a fresh venv.
-2. Gate: bluray-to-mp4 v0.2.19 lands to the seam contract.
-3. v0.2 session A: engine consumption; prepare chain + classification
+2. Gate: bluray-to-mp4 v0.2.20 lands with a validated upscale path. Done.
+3. v0.2 session A: pre-flight plan CLI, then engine consumption; prepare chain + classification
    wiring; probe fixtures extended to recorded ffprobe JSON for
    Eric's real sample files.
 4. v0.2 session B: pre-flight report + batch queue UI.

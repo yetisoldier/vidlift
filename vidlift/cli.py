@@ -1,11 +1,8 @@
 """VidLift CLI.
 
-v0.1 ships `vidlift probe FILE...` and `vidlift --version`. The encode
-and batch commands arrive with v0.2 (engine gated on bluray-to-mp4
-v0.2.19). The CLI-first zero-touch rule from docs/design.md applies
-from day one: every capability VidLift ever grows must be drivable
-headless, because a queue of hours-long jobs cannot depend on a GUI
-babysitter.
+The CLI-first zero-touch rule from docs/design.md applies from day one:
+every capability VidLift grows must be drivable headless, because a queue
+of hours-long jobs cannot depend on a GUI babysitter.
 """
 
 from __future__ import annotations
@@ -14,6 +11,7 @@ import argparse
 import sys
 
 from . import __version__
+from .plan import PlanError, build_batch_plan
 from .probe import ProbeError, probe_and_classify
 
 
@@ -82,6 +80,38 @@ def _render_report(report) -> str:
     return "\n".join(lines)
 
 
+def _format_bytes(value: int | None) -> str:
+    if value is None:
+        return "unknown"
+    gb = value / 1_000_000_000
+    return f"{gb:.2f} GB"
+
+
+def _render_plan(item) -> str:
+    report = item.report
+    lines = [report.path]
+    lines.append(f"  verdict: {item.process_verdict}")
+    lines.append(f"  output: {item.output_path}")
+    lines.append(
+        f"  target: {item.output_width}x{item.output_height} HEVC MP4 "
+        f"at {item.target_gb_per_hour:g} GB/hour"
+    )
+    lines.append(
+        f"  bitrate plan: video {item.video_bitrate_kbps}k, "
+        f"audio {item.audio.bitrate_kbps}k {item.audio.label}"
+    )
+    lines.append(f"  estimated size: {_format_bytes(item.estimated_output_bytes)}")
+    lines.append(f"  subtitles: {item.subtitle_note}")
+    lines.append(f"  expectation: {item.expectation}")
+    if report.pal_speedup_suspected:
+        lines.append("  warning: PAL speedup suspected; VidLift will process as-is")
+    if report.interlaced_flagged:
+        lines.append("  warning: interlace flagged; engine must deinterlace before upscale")
+    if item.process_verdict != "ready":
+        lines.append("  action: skip unless explicitly forced in a later pipeline version")
+    return "\n".join(lines)
+
+
 def _cmd_probe(files: list[str]) -> int:
     failures = 0
     for path in files:
@@ -102,12 +132,44 @@ def _cmd_probe(files: list[str]) -> int:
     return 0
 
 
+def _cmd_plan(files: list[str], *, target: str, gbph: float, output_dir: str | None) -> int:
+    reports = []
+    failures = 0
+    for path in files:
+        try:
+            reports.append(probe_and_classify(path))
+        except ProbeError as exc:
+            failures += 1
+            print(f"{path}: error: {exc}", file=sys.stderr)
+    if reports:
+        try:
+            batch = build_batch_plan(
+                reports, target=target, gb_per_hour=gbph, output_dir=output_dir
+            )
+        except PlanError as exc:
+            print(f"plan error: {exc}", file=sys.stderr)
+            return 2
+        for item in batch.files:
+            print(_render_plan(item))
+            print()
+        print(
+            f"summary: {batch.runnable_count}/{len(batch.files)} ready, "
+            f"estimated total {_format_bytes(batch.total_estimated_bytes)}"
+        )
+    if failures:
+        print(
+            f"{failures} of {len(files)} file(s) failed to probe",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vidlift",
         description=(
-            "Batch AI upscaler for SD video files to 720p HEVC MP4 "
-            "(v0.1: probe and classify only; the engine arrives with v0.2)"
+            "Batch AI upscaler for SD video files to 720p HEVC MP4"
         ),
     )
     parser.add_argument(
@@ -120,6 +182,28 @@ def build_parser() -> argparse.ArgumentParser:
     probe_parser.add_argument(
         "files", nargs="+", metavar="FILE", help="video files to inspect"
     )
+    plan_parser = sub.add_parser(
+        "plan", help="pre-flight a batch before an upscale run"
+    )
+    plan_parser.add_argument(
+        "files", nargs="+", metavar="FILE", help="video files to pre-flight"
+    )
+    plan_parser.add_argument(
+        "--target",
+        choices=["720p"],
+        default="720p",
+        help="output frame target (default: 720p)",
+    )
+    plan_parser.add_argument(
+        "--gbph",
+        type=float,
+        default=1.5,
+        help="target gigabytes per hour (default: 1.5)",
+    )
+    plan_parser.add_argument(
+        "--output-dir",
+        help="directory for planned outputs (default: beside each input)",
+    )
     return parser
 
 
@@ -128,6 +212,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "probe":
         return _cmd_probe(args.files)
+    if args.command == "plan":
+        return _cmd_plan(
+            args.files,
+            target=args.target,
+            gbph=args.gbph,
+            output_dir=args.output_dir,
+        )
     parser.print_help()
     return 2
 

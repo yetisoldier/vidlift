@@ -14,7 +14,7 @@ formal license is attached; nothing here is intended for distribution.
 
 ## Status
 
-**Design phase.** What exists today (v0.1.0):
+**Early v0.2 build.** What exists today:
 
 - The probe/classify core: `vidlift probe FILE...` inspects any
   video file with ffprobe and reports resolution, SAR, displayed
@@ -22,11 +22,14 @@ formal license is attached; nothing here is intended for distribution.
   audio channels, subtitle types, a source-class guess, and a
   PAL-speedup suspicion.
 - The design document: [docs/design.md](docs/design.md).
+- The batch pre-flight planner: `vidlift plan FILE...` turns probe
+  data into target geometry, bitrate/size estimates, output names,
+  subtitle notes, and honest expectations before a long upscale run.
 
-What does NOT exist yet: the AI upscale engine, any encoding, and any
-GUI. The engine is being built as bluray-to-mp4 v0.2.19 (an
-importable, disc-agnostic core); VidLift consumes it in v0.2. No
-promises about output quality until the benchmark lands.
+What does NOT exist yet: the actual VidLift encode/upscale runner and
+the GUI. The sibling bluray-to-mp4 pipeline now has a validated DVD
+AI-upscale path, so VidLift is moving into the v0.2 planning and CLI
+layers that will consume that core.
 
 ## Quick start (what you can actually run today)
 
@@ -37,6 +40,7 @@ python -m venv .venv
 .venv/bin/pip install -e .
 .venv/bin/vidlift --version
 .venv/bin/vidlift probe some_movie.avi another_clip.mov
+.venv/bin/vidlift plan --target 720p --gbph 1.5 some_movie.avi
 ```
 
 For development:

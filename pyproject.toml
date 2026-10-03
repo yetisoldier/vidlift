@@ -8,6 +8,7 @@ dependencies = ["PyQt6>=6.7"]
 
 [project.scripts]
 vidlift = "vidlift.cli:main"
+vidlift-cli = "vidlift.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]
