@@ -141,6 +141,21 @@ the Section 1 seam honest. The v0.1 code already separates GUI-free
 core (`vidlift/probe.py`) from interface (`vidlift/cli.py`); v0.2's
 GUI is a client of the core, never a container for it.
 
+The runner grows the same way: **single-file CLI first, batch second,
+UI last.** The first execution milestone is a GUI-free
+`vidlift run FILE` that proves one file end-to-end. Batch logic and
+UI controls attach to that proven runner afterward; they do not
+ship first.
+
+Runner observability (lesson from bluray-to-mp4/Ripper): progress
+percent alone is insufficient for hours-long jobs. Runner state
+exposes, from day one: the current phase; a live log tail and the log
+file path; a last-activity timestamp (health is judged by activity,
+not percent); child process and GPU activity where the platform
+allows; cancel and retry; output verification after encode; and a
+per-run artifact manifest (inputs, plan, command lines, outputs,
+timings).
+
 ## 5. Sequencing
 
 1. v0.1 (this repo, now): skeleton + probe/classify + tests, design
@@ -150,9 +165,14 @@ GUI is a client of the core, never a container for it.
 4. v0.2 session B: engine consumption; prepare chain + classification
    wiring; probe fixtures extended to recorded ffprobe JSON for
    Eric's real sample files.
-5. v0.2 session C: runner UI controls + end-to-end validation (Linux for pipeline
-   correctness; Eric's Windows box for 3090 Ti throughput truth and
-   TV playback acceptance).
+5. v0.2 session C: single-file CLI runner with the full
+   observability contract above, proven end-to-end.
+6. v0.2 session D: batch queue over the proven runner; runner UI
+   controls + end-to-end validation (Linux for pipeline correctness;
+   Eric's Windows box for 3090 Ti throughput truth and TV playback
+   acceptance, with the packaging discipline from the roadmap:
+   external tool discovery, bundled ffmpeg/Real-ESRGAN paths, a
+   Windows smoke test of the runner, and output verification).
 
 Sample-file ask (small, high value, from Eric): 2-3 representatives
 of the actual collection: one ~700 MB XviD/DivX AVI (the expected
