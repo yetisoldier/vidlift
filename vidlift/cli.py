@@ -204,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         help="directory for planned outputs (default: beside each input)",
     )
+    sub.add_parser("gui", help="open the VidLift planning workbench")
     return parser
 
 
@@ -219,6 +220,10 @@ def main(argv: list[str] | None = None) -> int:
             gbph=args.gbph,
             output_dir=args.output_dir,
         )
+    if args.command == "gui":
+        from .gui import main as gui_main
+
+        return gui_main([])
     parser.print_help()
     return 2
 

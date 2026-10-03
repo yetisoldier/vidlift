@@ -21,15 +21,18 @@ formal license is attached; nothing here is intended for distribution.
   geometry, field order, frame rates, codec, container, duration,
   audio channels, subtitle types, a source-class guess, and a
   PAL-speedup suspicion.
-- The design document: [docs/design.md](docs/design.md).
 - The batch pre-flight planner: `vidlift plan FILE...` turns probe
   data into target geometry, bitrate/size estimates, output names,
   subtitle notes, and honest expectations before a long upscale run.
+- The PyQt planning workbench: `vidlift gui` gives the same planner a
+  batch-table interface with drag/drop, output-folder selection, and
+  selected-file details.
+- The documentation suite under [docs/](docs/).
 
-What does NOT exist yet: the actual VidLift encode/upscale runner and
-the GUI. The sibling bluray-to-mp4 pipeline now has a validated DVD
-AI-upscale path, so VidLift is moving into the v0.2 planning and CLI
-layers that will consume that core.
+What does NOT exist yet: the actual VidLift encode/upscale runner. The
+sibling bluray-to-mp4 pipeline now has a validated DVD AI-upscale path,
+so VidLift is moving into the v0.2 planning, UI, and runner layers that
+will consume that core.
 
 ## Quick start (what you can actually run today)
 
@@ -41,6 +44,7 @@ python -m venv .venv
 .venv/bin/vidlift --version
 .venv/bin/vidlift probe some_movie.avi another_clip.mov
 .venv/bin/vidlift plan --target 720p --gbph 1.5 some_movie.avi
+.venv/bin/vidlift gui
 ```
 
 For development:
@@ -50,6 +54,16 @@ python -m venv /tmp/vidlift-venv
 /tmp/vidlift-venv/bin/pip install -e .
 QT_QPA_PLATFORM=offscreen /tmp/vidlift-venv/bin/python -m pytest -q
 ```
+
+## Documentation
+
+- [Usage](docs/usage.md)
+- [CLI reference](docs/cli.md)
+- [UI guide](docs/ui.md)
+- [Development](docs/development.md)
+- [Architecture](docs/architecture.md)
+- [Roadmap](docs/roadmap.md)
+- [Design](docs/design.md)
 
 ## Planned shape (v0.2 and beyond)
 

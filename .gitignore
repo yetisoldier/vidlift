@@ -22,3 +22,4 @@ venv/
 
 # VidLift scratch space
 *.log
+.local/

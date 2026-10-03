@@ -1,6 +1,6 @@
-# VidLift v0.1 Design
+# VidLift Design
 
-Status: design doc for this repo, v0.2 work started (2026-10-03). Adapted from
+Status: v0.2 planner and planning UI work started (2026-10-03). Adapted from
 the SD-file-upscaler scoping assessment written by the architect
 subagent on 2026-10-02 (bluray-to-mp4
 `docs/designs/sd-file-upscaler-scoping.md`, the binding spec for this
@@ -121,10 +121,12 @@ pick models; it inherits whatever routing that pipeline blesses.
   TV, it cannot recover detail never captured in the file"; WMV/FLV
   get "helps least, watch the sample first." The report exists so a
   NO is learned from a 3-minute sample, not a 6-hour encode.
-- Batch queue UI (PyQt6): drag-drop files or pick a folder, queue in
-  drop order with per-file status, Start / Start All, cancel between
-  and mid-file. The queue is the product; no library, no watch list,
-  no metadata editor. Watch folder: optional v2, correctly excluded.
+- Planning UI (PyQt6): drag-drop files or pick a folder, queue in
+  drop order with per-file status, output folder selection, batch
+  summary, and selected-file details. Start / Start All, cancel, and
+  per-file encode progress arrive with the runner. The queue is the
+  product; no library, no watch list, no metadata editor. Watch
+  folder: optional v2, correctly excluded.
 
 ## 4. CLI-first: the zero-touch rule
 
@@ -144,11 +146,11 @@ GUI is a client of the core, never a container for it.
 1. v0.1 (this repo, now): skeleton + probe/classify + tests, design
    doc. Done when pytest is green twice in a fresh venv.
 2. Gate: bluray-to-mp4 v0.2.20 lands with a validated upscale path. Done.
-3. v0.2 session A: pre-flight plan CLI, then engine consumption; prepare chain + classification
+3. v0.2 session A: pre-flight plan CLI and planning UI. Done.
+4. v0.2 session B: engine consumption; prepare chain + classification
    wiring; probe fixtures extended to recorded ffprobe JSON for
    Eric's real sample files.
-4. v0.2 session B: pre-flight report + batch queue UI.
-5. v0.2 session C: CLI + end-to-end validation (Linux for pipeline
+5. v0.2 session C: runner UI controls + end-to-end validation (Linux for pipeline
    correctness; Eric's Windows box for 3090 Ti throughput truth and
    TV playback acceptance).
 
