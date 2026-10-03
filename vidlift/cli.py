@@ -13,6 +13,7 @@ import sys
 from . import __version__
 from .plan import PlanError, build_batch_plan
 from .probe import ProbeError, probe_and_classify
+from .run import MissingToolError, RunError, find_tools, run_file
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -165,6 +166,66 @@ def _cmd_plan(files: list[str], *, target: str, gbph: float, output_dir: str | N
     return 0
 
 
+def _cmd_run(
+    file_path: str,
+    *,
+    target: str,
+    gbph: float,
+    output_dir: str | None,
+    ffmpeg: str | None,
+    ffprobe: str | None,
+    log_dir: str | None,
+) -> int:
+    """Drive one file through the runner and print its state.
+
+    Exit codes: 0 verified run, 1 run/verification failure,
+    2 missing tool (a setup problem, not a media problem).
+    """
+    try:
+        tools = find_tools(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    except MissingToolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        result = run_file(
+            file_path,
+            target=target,
+            gb_per_hour=gbph,
+            output_dir=output_dir,
+            tools=tools,
+            log_dir=log_dir,
+        )
+    except (ProbeError, PlanError, RunError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        state = getattr(exc, "state", None)
+        if state is not None:
+            if state.log is not None:
+                print(f"run log: {state.log.path}", file=sys.stderr)
+                for line in state.log.tail(6):
+                    print(f"  {line}", file=sys.stderr)
+            if state.manifest_path:
+                print(f"run manifest: {state.manifest_path}", file=sys.stderr)
+        return 1
+    state = result.state
+    print(f"input: {state.file_path}")
+    print(f"output: {result.plan.output_path}")
+    verdict = "verified" if result.verification.ok else "failed"
+    print(f"verification: {verdict}")
+    if state.engine_simulated:
+        print(
+            "engine: STUB (no Real-ESRGAN pass; output is a real re-encode "
+            "of the prepared source, not an AI upscale)"
+        )
+    print(f"log: {state.log.path if state.log else 'none'}")
+    print(f"manifest: {result.manifest_path}")
+    print("phases:")
+    for phase in state.phases:
+        duration = phase.duration_seconds
+        duration_s = f"{duration:.2f}s" if duration is not None else "running"
+        print(f"  {phase.name}: {duration_s}")
+    return 0 if result.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vidlift",
@@ -204,6 +265,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         help="directory for planned outputs (default: beside each input)",
     )
+    run_parser = sub.add_parser(
+        "run", help="run one file end-to-end through the runner pipeline"
+    )
+    run_parser.add_argument(
+        "file", metavar="FILE", help="the single video file to run"
+    )
+    run_parser.add_argument(
+        "--target",
+        choices=["720p"],
+        default="720p",
+        help="output frame target (default: 720p)",
+    )
+    run_parser.add_argument(
+        "--gbph",
+        type=float,
+        default=1.5,
+        help="target gigabytes per hour (default: 1.5)",
+    )
+    run_parser.add_argument(
+        "--output-dir",
+        help="directory for the output file (default: beside the input)",
+    )
+    run_parser.add_argument(
+        "--ffmpeg",
+        help="explicit ffmpeg path (else VIDLIFT_FFMPEG, then PATH)",
+    )
+    run_parser.add_argument(
+        "--ffprobe",
+        help="explicit ffprobe path (else VIDLIFT_FFPROBE, then PATH)",
+    )
+    run_parser.add_argument(
+        "--log-dir",
+        help="directory for run logs/manifests (default: INPUT_DIR/.vidlift-runs)",
+    )
     sub.add_parser("gui", help="open the VidLift planning workbench")
     return parser
 
@@ -219,6 +314,16 @@ def main(argv: list[str] | None = None) -> int:
             target=args.target,
             gbph=args.gbph,
             output_dir=args.output_dir,
+        )
+    if args.command == "run":
+        return _cmd_run(
+            args.file,
+            target=args.target,
+            gbph=args.gbph,
+            output_dir=args.output_dir,
+            ffmpeg=args.ffmpeg,
+            ffprobe=args.ffprobe,
+            log_dir=args.log_dir,
         )
     if args.command == "gui":
         from .gui import main as gui_main

@@ -24,19 +24,26 @@ formal license is attached; nothing here is intended for distribution.
 - The batch pre-flight planner: `vidlift plan FILE...` turns probe
   data into target geometry, bitrate/size estimates, output names,
   subtitle notes, and honest expectations before a long upscale run.
+- The single-file runner: `vidlift run FILE` drives one file
+  end-to-end (probe, plan, prepare, upscale, encode, verify) with
+  full observability: a run log with every command line, phase
+  timings, last-activity timestamps, explicit missing-tool errors,
+  output verification, and a per-run artifact manifest. The upscale
+  phase uses a stub engine today (the real file-first engine adapter
+  is deferred until bluray-to-mp4 ships it); manifests record
+  `engine_simulated: true` so nothing overclaims.
 - The PyQt planning workbench: `vidlift gui` gives the same planner a
   batch-table interface with drag/drop, output-folder selection, and
   selected-file details.
 - The documentation suite under [docs/](docs/).
 
-What does NOT exist yet: the actual VidLift encode/upscale runner. The
-sibling bluray-to-mp4 pipeline now has a validated DVD AI-upscale path,
-so VidLift is moving into the v0.2 planning, UI, and runner layers that
-will consume that core.
+What does NOT exist yet: the real AI upscale inside the runner (stub
+engine today), the batch queue, and the UI controls that will attach
+to this runner.
 
 ## Quick start (what you can actually run today)
 
-Requires Python 3.12+ and ffprobe on PATH.
+Requires Python 3.12+ and ffprobe on PATH (ffmpeg too, for `run`).
 
 ```
 python -m venv .venv
@@ -44,6 +51,7 @@ python -m venv .venv
 .venv/bin/vidlift --version
 .venv/bin/vidlift probe some_movie.avi another_clip.mov
 .venv/bin/vidlift plan --target 720p --gbph 1.5 some_movie.avi
+.venv/bin/vidlift run some_movie.avi
 .venv/bin/vidlift gui
 ```
 
@@ -67,10 +75,15 @@ QT_QPA_PLATFORM=offscreen /tmp/vidlift-venv/bin/python -m pytest -q
 
 ## Planned shape (v0.2 and beyond)
 
+- Real engine adapter: when bluray-to-mp4 ships its file-first seam,
+  `vidlift.run.EngineAdapter` gets one implementation and the runner
+  changes zero lines. Sample-based source classification and a full
+  decode pass during verification come with it.
 - Per-file pre-flight report before any hours-long job: probe,
   classify, one tiny timed engine sample, then projected wall clock,
   projected output size, and an honest expectation string.
-- Batch queue with per-file status; the queue is the product.
+- Batch queue with per-file status over the proven single-file runner;
+  the queue is the product.
 - CLI for unattended runs, from day one (`vidlift-cli`): hours-long
   jobs must never depend on a GUI babysitter at 3 AM.
 - Output: 720p-frame HEVC MP4 (16:9 -> 1280x720, 4:3 -> 960x720),

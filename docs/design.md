@@ -166,7 +166,13 @@ timings).
    wiring; probe fixtures extended to recorded ffprobe JSON for
    Eric's real sample files.
 5. v0.2 session C: single-file CLI runner with the full
-   observability contract above, proven end-to-end.
+   observability contract above, proven end-to-end. Pipeline slice
+   shipped (`vidlift run FILE`: probe/plan/prepare/upscale/encode/
+   verify, log + manifest, explicit tool errors, output verification,
+   stub engine through the EngineAdapter seam with
+   `engine_simulated: true` in every manifest); what remains of
+   session C is the real engine adapter plus the deferred
+   sample-based classification and full decode-pass verification.
 6. v0.2 session D: batch queue over the proven runner; runner UI
    controls + end-to-end validation (Linux for pipeline correctness;
    Eric's Windows box for 3090 Ti throughput truth and TV playback

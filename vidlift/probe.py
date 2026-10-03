@@ -28,11 +28,13 @@ __all__ = [
     "FileReport",
     "MediaProbe",
     "ProbeError",
+    "Runner",
     "SubtitleInfo",
     "VideoInfo",
     "classify",
     "displayed_size",
     "probe_and_classify",
+    "probe_args",
     "probe_file",
     "parse_probe",
     "real_runner",
@@ -271,6 +273,20 @@ def parse_probe(path: str, text: str) -> MediaProbe:
     )
 
 
+def probe_args(path: str) -> list[str]:
+    """The exact ffprobe arguments used to probe one file.
+
+    Shared with the run pipeline so the runner's manifest can record
+    the probe command line without duplicating it here and there.
+    """
+    return [
+        "-v", "error",
+        "-show_format", "-show_streams",
+        "-of", "json",
+        path,
+    ]
+
+
 def probe_file(
     path: str,
     *,
@@ -284,13 +300,7 @@ def probe_file(
     """
     if not os.path.isfile(path):
         raise ProbeError(f"no such file: {path}")
-    args = [
-        "-v", "error",
-        "-show_format", "-show_streams",
-        "-of", "json",
-        path,
-    ]
-    code, stdout, stderr = runner(binary, args)
+    code, stdout, stderr = runner(binary, probe_args(path))
     if code != 0:
         detail = stderr.strip()[:300] or "no diagnostic output"
         raise ProbeError(f"ffprobe failed on {path}: {detail}")

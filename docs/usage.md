@@ -38,6 +38,27 @@ The planner reports:
 
 Use `--output-dir DIR` to send all planned MP4s to one folder.
 
+## Run One File
+
+The runner drives a single file end-to-end: probe, plan, prepare,
+upscale, encode, verify.
+
+```bash
+.venv/bin/vidlift run --output-dir /media/upscaled movie.avi
+```
+
+Each run writes its output MP4 (verified for existence, decodability,
+and planned geometry), a run log with every command line, and an
+artifact manifest (plan, commands, outputs, phase timings,
+verification result) into the run-log directory.
+
+Honest status: the upscale phase currently uses a stub engine, so the
+output is a real re-encode of the prepared source rather than an AI
+upscale. The bluray-to-mp4 file-first engine seam does not exist yet;
+when it ships, the same runner gains the real adapter with no
+pipeline changes. Missing ffmpeg/ffprobe are explicit setup errors
+naming the tool.
+
 ## Open The UI
 
 ```bash
@@ -50,7 +71,15 @@ The UI is a planner workbench. Add files or a folder, set the GB/hour target, ch
 
 ## Current Limits
 
-- No upscale/encode runner in this repo yet.
+- The runner's upscale phase is a stub (no Real-ESRGAN pass yet);
+  outputs are real re-encodes at the planned bitrate/geometry, and
+  manifests record `engine_simulated: true`.
+- Sample-based progressive/IVTC/interlace classification is deferred
+  until the real engine adapter; the probe's interlace flag drives
+  the deinterlace decision.
+- Verification checks existence, container decodability, and
+  geometry; a full decode pass is deferred with it.
+- Batch queue: not yet; the runner is single-file by design for now.
 - No OCR for image subtitles.
 - PAL speedup is reported, not corrected.
-- Chapters are not preserved in the planned MP4 output.
+- Chapters are not preserved in the MP4 output.
