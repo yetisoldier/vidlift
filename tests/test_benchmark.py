@@ -38,6 +38,15 @@ from vidlift.run import (
 )
 
 
+# ---- b-marker execution registry (suite-wide span; D1 companion) ----
+
+from _bcanary import EXECUTED_B, register_b
+
+
+def marker(name: str) -> None:
+    register_b(name)
+
+
 def make_media_file(tmp_path, name: str = "movie.avi") -> str:
     path = tmp_path / name
     path.write_text("")
@@ -384,10 +393,12 @@ class TestB6EtaHonesty:
     exact arithmetic under a cached bucket."""
 
     def test_no_cache_means_no_eta_ever(self):
+        marker("b6")
         plan = make_plan()
         assert estimate_eta(plan, estimates={}) is None
 
     def test_wrong_bucket_means_no_eta(self):
+        marker("b6")
         plan = make_plan()  # bucket 640x360
         other = make_result(bucket="854x480")
         estimates = {
@@ -396,6 +407,7 @@ class TestB6EtaHonesty:
         assert estimate_eta(plan, estimates=estimates) is None
 
     def test_cached_bucket_computes_exact_frames_times_constant(self):
+        marker("b6")
         plan = make_plan()  # 5400 s at 25 fps -> 135000 frames
         bench = make_result(seconds_per_frame=1.83)
         estimates = {estimate_key(bench.engine, bench.model, "640x360"): bench}
@@ -408,6 +420,7 @@ class TestB6EtaHonesty:
         assert eta["seconds_per_frame"] == 1.83
 
     def test_stub_sourced_eta_is_labeled_simulated(self):
+        marker("b6")
         plan = make_plan()
         stub_bench = make_result(simulated=True)  # StubEngine
         estimates = {
@@ -418,6 +431,7 @@ class TestB6EtaHonesty:
         assert eta["engine_simulated"] is True  # the label surfaces carry
 
     def test_engine_narrowing_skips_other_engines(self):
+        marker("b6")
         plan = make_plan()
         stub_bench = make_result(engine="StubEngine", simulated=True)
         estimates = {estimate_key("StubEngine", None, "640x360"): stub_bench}
@@ -425,12 +439,14 @@ class TestB6EtaHonesty:
         assert estimate_eta(plan, estimates=estimates, engine="StubEngine") is not None
 
     def test_unknown_duration_cannot_know(self):
+        marker("b6")
         plan = make_plan(duration="N/A")
         bench = make_result()
         estimates = {estimate_key(bench.engine, bench.model, "640x360"): bench}
         assert estimate_eta(plan, estimates=estimates) is None
 
     def test_attach_estimate_is_additive_on_the_plan(self):
+        marker("b6")
         plan = make_plan()
         attached = attach_estimate(plan, {})
         assert attached.eta_estimate is None  # no cache -> cannot know
@@ -513,3 +529,12 @@ class TestCliBenchmark:
         rc = cli.main(["benchmark", "--engine", "stub", str(path)])
         assert rc == 1
         assert "error:" in capsys.readouterr().err
+
+
+# ---- b6 execution canary (runs LAST in this file) -------------------------
+
+
+def test_b6_execution_canary_benchmark_boundary_tests_ran():
+    assert "b6" in EXECUTED_B, (
+        "b6 boundary tests did not execute this session"
+    )

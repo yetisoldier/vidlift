@@ -33,6 +33,7 @@ from vidlift.mcp_bridge import (
     Registry,
     validate_tool_args,
 )
+from vidlift.mcp_bridge.jobs import JobOutcome
 from vidlift.mcp_bridge.schemas import TOOL_SCHEMAS
 from vidlift.run import (
     EngineCancelled,
@@ -400,6 +401,81 @@ def test_t4_cancel_running_job_is_cooperative_cancelled(tmp_path):
     )
     # a cancel is not a failure: no error posing as one
     assert final["error"] is None or "cancel" in final["error"]
+
+
+# ---- t4 (D1 regression): the claim-window cancel race, both halves ---------
+
+
+def test_t4_claim_window_cancel_is_cooperative_never_swept(tmp_path):
+    marker("t4")
+    # The D1 shape, deterministically at the registry + executor seam.
+    # The claim transition itself registers the CancelFlag, so a
+    # cancel arriving in the old claim window now flips the LIVE flag
+    # ("cancelling") instead of sweeping the job closed behind the
+    # running pipeline's back ("cancelled"). The sweep path from the
+    # running state is unreachable; the executor closes the job.
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    registry = Registry(state)
+    record = registry.enqueue(
+        kind="run", paths=["/x/movie.avi"], options={}
+    )
+    registry.transition(record, "running")  # what _claim_next does
+    # OLD DEFECT: this returned "cancelled" with no flag ever set
+    assert registry.cancel(record.job_id) == "cancelling"
+    flag = registry.get_cancel_flag(record.job_id)
+    assert flag is not None and flag.is_set()
+    # the executor observes the flag and closes the job itself; the
+    # terminal close pops the flag (dead flag = closed job)
+    registry.transition(record, "cancelled")  # legal: running -> cancelled
+    assert registry.get_cancel_flag(record.job_id) is None
+    # honesty: registry and record agree, no contradiction is possible
+    assert record.state == "cancelled"
+
+
+def test_t4_raced_terminal_close_never_kills_the_worker(tmp_path):
+    marker("t4")
+    # Layers b + c proof: when a job's terminal state races the
+    # executor (closed by one path while the executor finishes ok),
+    # the worker LOGS the contradiction instead of raising RegistryError
+    # out of _run_job — and the next job still completes.
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    registry = Registry(state)
+    events: list[str] = []
+    served: list[str] = []
+
+    def racing_executor(record, services, cancel):
+        served.append(record.job_id)
+        if len(served) == 1:
+            # first job: simulate the race — the record is closed by
+            # another path while this executor is mid-run
+            registry.transition(record, "cancelled")  # running -> cancelled
+        return JobOutcome(ok=True)  # both executors finish ok
+
+    services = BridgeServices(
+        registry=registry, state_dir=state, log_event=events.append
+    )
+    executor = JobExecutor(services, executor_fn=racing_executor)
+    r1 = registry.enqueue(kind="run", paths=["/x/a.avi"], options={})
+    r2 = registry.enqueue(kind="run", paths=["/x/b.avi"], options={})
+    executor.start()
+
+    deadline = time.time() + 10
+    while time.time() < deadline and (
+        r1.state not in ("succeeded", "failed", "cancelled")
+        or r2.state not in ("succeeded", "failed", "cancelled")
+    ):
+        time.sleep(0.02)
+    executor.stop()
+
+    # the race close won for r1 (registry is the source of truth) and
+    # the success transition was LOGGED, never raised
+    assert r1.state == "cancelled", f"r1={r1.state}"
+    assert any("terminal state raced" in e for e in events), events
+    # THE point of D1: the worker survived and served the next job
+    assert r2.state == "succeeded", f"r2={r2.state}"
+
 
 
 # ---- t5: registry persistence + restart sweep ----------------------------------------

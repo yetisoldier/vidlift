@@ -41,6 +41,8 @@ from vidlift.run import (
 )
 from vidlift.tools_realesrgan import verify_model_artifacts
 
+from _bcanary import register_b
+
 # ---- b0 execution canary state -------------------------------------------
 
 _EXPECTED_B_TESTS = {"b0", "b1", "b2", "b3", "b4", "b5", "b9", "b10", "b11"}
@@ -50,6 +52,7 @@ _EXECUTED_B_TESTS: set[str] = set()
 def marker(name: str) -> None:
     """Provable execution: the canary requires every b-test to land."""
     _EXECUTED_B_TESTS.add(name)
+    register_b(name)  # suite-wide span (the canary-span fix)
 
 
 # ---- fixtures and fakes -----------------------------------------------------

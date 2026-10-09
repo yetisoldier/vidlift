@@ -377,11 +377,30 @@ class JobExecutor:
                 self._wake.wait(timeout=0.2)
                 self._wake.clear()
                 continue
-            self._run_job(job)
+            try:
+                self._run_job(job)
+            except Exception as exc:
+                # The D1 lesson (layer c): the single worker thread
+                # must NEVER die on one job's bug — log and keep
+                # serving, or every later job starves queued with no
+                # diagnostic.
+                log_event = getattr(self.services, "log_event", None)
+                if log_event is not None:
+                    log_event(
+                        f"worker survived job {job.job_id} failure: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
 
     def _run_job(self, record: JobRecord) -> None:
-        cancel_flag = CancelFlag()
-        self.registry.set_cancel_flag(record.job_id, cancel_flag)
+        # The D1 fix (layer a): the registry created and registered
+        # this job's CancelFlag at the claim transition, so a running
+        # job ALWAYS has a live flag — a cancel can never land in the
+        # old claim window against "no live owner". The defensive
+        # create covers direct-API callers that bypass the executor.
+        cancel_flag = self.registry.get_cancel_flag(record.job_id)
+        if cancel_flag is None:
+            cancel_flag = CancelFlag()
+            self.registry.set_cancel_flag(record.job_id, cancel_flag)
         log_event = getattr(self.services, "log_event", None)
         if log_event is not None:
             log_event(f"job {record.job_id} ({record.kind}) running")
@@ -396,7 +415,6 @@ class JobExecutor:
         except Exception as exc:  # a worker must never die on a job bug
             outcome = JobOutcome(ok=False, error=f"{type(exc).__name__}: {exc}")
         finally:
-            self.registry.set_cancel_flag(record.job_id, None)
             record.clear_live()
         record.ok = outcome.ok
         record.output_path = outcome.output_path
@@ -407,12 +425,23 @@ class JobExecutor:
         record.engine_note = outcome.engine_note
         record.result = outcome.result
         record.touch()
-        if outcome.cancelled:
-            self.registry.transition(record, "cancelled")
-        elif outcome.ok:
-            self.registry.transition(record, "succeeded")
-        else:
-            self.registry.transition(record, "failed")
+        # The D1 fix (layer b): a raced terminal state must never
+        # raise out of the worker. The registry stays the source of
+        # truth; the contradiction is LOGGED, never silent.
+        try:
+            if outcome.cancelled:
+                self.registry.transition(record, "cancelled")
+            elif outcome.ok:
+                self.registry.transition(record, "succeeded")
+            else:
+                self.registry.transition(record, "failed")
+        except RegistryError as exc:
+            if log_event is not None:
+                log_event(
+                    f"job {record.job_id} terminal state raced "
+                    f"(registry says {record.state}, executor outcome "
+                    f"{'cancelled' if outcome.cancelled else ('ok' if outcome.ok else 'failed')}): {exc}"
+                )
         if log_event is not None:
             log_event(
                 f"job {record.job_id} ({record.kind}) {record.state}"

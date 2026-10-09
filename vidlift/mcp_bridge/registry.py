@@ -201,6 +201,10 @@ class Registry:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._jobs: dict[str, JobRecord] = {}
+        # Claim-time CancelFlag registration (the D1 fix): the running
+        # transition creates the flag under the same lock as the state
+        # itself, so a running job ALWAYS has a live cancel flag.
+        self._cancel_flags: dict = {}
         self.load()
 
     # -- lifecycle ---------------------------------------------------------
@@ -282,10 +286,28 @@ class Registry:
         return record
 
     def transition(self, record: JobRecord, new_state: str) -> None:
-        """Enforced state machine + atomic persist."""
+        """Enforced state machine + atomic persist.
+
+        The D1 fix (layer a): the ``running`` transition creates and
+        registers the job's CancelFlag under the same lock that
+        enforces the state — the flag exists the instant the job is
+        running, so a cancel can never land in the old claim window
+        against "no live owner". Terminal transitions pop the flag
+        (the close is what makes it dead).
+        """
         with self._lock:
             record.transition(new_state)
+            if new_state == "running":
+                from .jobs import CancelFlag  # deferred: jobs imports registry
+                self._cancel_flags[record.job_id] = CancelFlag()
+            elif new_state in TERMINAL_STATES:
+                self._cancel_flags.pop(record.job_id, None)
         self.save()
+
+    def get_cancel_flag(self, job_id: str):
+        """The claim-time registered CancelFlag for a running job
+        (None before claim or after the job closes)."""
+        return self._cancel_flags.get(job_id)
 
     # -- queue views -----------------------------------------------------------
 
@@ -353,11 +375,12 @@ class Registry:
         if record.state == "queued":
             self.transition(record, "cancelled")
             return "cancelled"
-        # running: the flag flip happens through the executor-owned
-        # CancelFlag the registry holds a reference to (set on start,
-        # cleared on finish). A second cancel while one is already in
-        # flight is the state_conflict (Section 7): reported, not silent.
-        cancel_flag = getattr(self, "_cancel_flags", {}).get(job_id)
+        # running: the flag flip happens through the claim-time
+        # CancelFlag the registry holds a reference to (created at the
+        # running transition, popped at the terminal close). A second
+        # cancel while one is already in flight is the state_conflict
+        # (Section 7): reported, not silent.
+        cancel_flag = self._cancel_flags.get(job_id)
         if cancel_flag is not None:
             if cancel_flag.is_set():
                 return "conflict"
@@ -365,16 +388,14 @@ class Registry:
             record.last_activity_at = time.time()
             self.save()
             return "cancelling"
-        # no live owner (should not happen while running): sweep it
+        # Unreachable since claim-time registration (a running job
+        # always has a live flag); kept as last-resort defense with the
+        # same honest sweep semantics.
         self.transition(record, "cancelled")
         return "cancelled"
 
     def set_cancel_flag(self, job_id: str, flag) -> None:
-        flags = getattr(self, "_cancel_flags", None)
-        if flags is None:
-            flags = {}
-            self._cancel_flags = flags
         if flag is None:
-            flags.pop(job_id, None)
+            self._cancel_flags.pop(job_id, None)
         else:
-            flags[job_id] = flag
+            self._cancel_flags[job_id] = flag

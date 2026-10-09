@@ -50,6 +50,15 @@ from vidlift.run import (
 )
 
 
+# ---- b-marker execution registry (suite-wide span; D1 companion) ----
+
+from _bcanary import EXECUTED_B, register_b
+
+
+def marker(name: str) -> None:
+    register_b(name)
+
+
 def make_media_file(tmp_path, name: str = "movie.avi") -> str:
     path = tmp_path / name
     path.write_text("")
@@ -866,6 +875,7 @@ class TestFailOpen:
     def test_b7_fail_open_end_to_end_completes_with_honest_manifest(
         self, tmp_path
     ):
+        marker("b7")
         # the OCR-babysit lesson as a test: the engine dies mid-run
         # with the gate-M reason; the run COMPLETES, the output is the
         # synchronized re-encode (verify stage green), and the manifest
@@ -913,6 +923,7 @@ class TestFailOpen:
     def test_b7_fail_open_note_flows_to_state_and_manifest_identically(
         self, tmp_path
     ):
+        marker("b7")
         reason = "no usable frame clock on prepared file /x/y: neither parses"
         path = make_media_file(tmp_path)
         engine = FakeEngine(UpscaleError(reason))
@@ -1022,6 +1033,7 @@ class TestFullDecodeVerification:
     failure fails verification."""
 
     def test_decode_command_shape_is_pinned(self):
+        marker("b12")
         tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
         cmd = build_decode_command(tools, "/out/movie.vidlift.720p.hevc.mp4")
         assert cmd == [
@@ -1032,6 +1044,7 @@ class TestFullDecodeVerification:
         ]
 
     def test_full_decode_runs_on_happy_path_and_passes(self, tmp_path):
+        marker("b12")
         result, runner = run_happy(tmp_path)
         assert result.verification.full_decode_ok is True
         # the decode command was both recorded and executed via the seam
@@ -1042,6 +1055,7 @@ class TestFullDecodeVerification:
         assert ("ffmpeg", tuple(decode_cmds[0][1:])) in runner.commands
 
     def test_full_decode_failure_fails_verification(self, tmp_path):
+        marker("b12")
         path = make_media_file(tmp_path)
         runner = FakeRunner(probe_payload(), decode_exit=1)
         tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
@@ -1060,6 +1074,7 @@ class TestFullDecodeVerification:
         assert manifest["verification"]["ok"] is False
 
     def test_full_decode_skipped_when_geometry_mismatch(self, tmp_path):
+        marker("b12")
         # decode is only worth running on otherwise-good outputs
         path = make_media_file(tmp_path)
         runner = FakeRunner(probe_payload(), output_geometry=(640, 360))
@@ -1076,6 +1091,7 @@ class TestFullDecodeVerification:
         assert decode_cmds == []  # the decode pass never ran
 
     def test_verify_output_full_decode_flag_off(self, tmp_path):
+        marker("b12")
         # the flag exists so future callers (bridge probes) can run the
         # cheap checks alone
         path = make_media_file(tmp_path)
@@ -1184,6 +1200,7 @@ class TestHighestBoundaryPromiseSweep:
     test each at the command/manifest boundary."""
 
     def test_b8_output_filename_promise_at_manifest_boundary(self, tmp_path):
+        marker("b8")
         result, _ = run_happy(tmp_path)
         # the promise: outputs are named <stem>.vidlift.720p.hevc.mp4
         assert Path(result.plan.output_path).name == (
@@ -1194,6 +1211,7 @@ class TestHighestBoundaryPromiseSweep:
         assert manifest["artifacts"]["output_path"] == result.plan.output_path
 
     def test_b8_geometry_promise_at_command_and_manifest(self, tmp_path):
+        marker("b8")
         result, runner = run_happy(tmp_path)
         # the promise: final geometry equals plan geometry; asserted on
         # the encode command line AND the manifest AND verification
@@ -1211,6 +1229,7 @@ class TestHighestBoundaryPromiseSweep:
         assert manifest["verification"]["geometry_ok"] is True
 
     def test_b8_audio_maps_from_the_original_file(self, tmp_path):
+        marker("b8")
         # the promise: audio comes from the ORIGINAL file, never the
         # video-only mezzanine — pinned on the encode command line
         result, _ = run_happy(tmp_path)
@@ -1223,6 +1242,7 @@ class TestHighestBoundaryPromiseSweep:
         assert "1:a:0" in enc  # audio stream is mapped from input 1
 
     def test_b8_manifest_honesty_fields_promise(self, tmp_path):
+        marker("b8")
         # the promise: every manifest states its engine and simulated
         # flag; a fail-open manifest states what shipped and why
         reason = "upscale mezzanine duration gate: mismatch"
@@ -1245,6 +1265,7 @@ class TestHighestBoundaryPromiseSweep:
         assert result.state.engine_note == run["engine_note"]
 
     def test_b8_fail_open_output_filename_promise(self, tmp_path):
+        marker("b8")
         # a fail-open run still produces the exact promised filename
         path = make_media_file(tmp_path)
         runner = FakeRunner(probe_payload())
@@ -1287,3 +1308,13 @@ class TestNoAutoTileEver:
         assert args.realesrgan == "/r/e"
         args2 = cli.build_parser().parse_args(["run", "movie.avi"])
         assert args2.engine == "auto"  # the default
+
+
+# ---- b7/b8/b12 execution canary (runs LAST in this file) -----------------
+
+
+def test_b7_b8_b12_execution_canary_run_boundary_tests_ran():
+    missing = {"b7", "b8", "b12"} - EXECUTED_B
+    assert not missing, (
+        f"run-file boundary tests did not execute: {sorted(missing)}"
+    )
