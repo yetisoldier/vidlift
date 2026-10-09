@@ -48,6 +48,7 @@ from .probe import (
 
 __all__ = [
     "EngineAdapter",
+    "EngineCancelled",
     "EngineResult",
     "FakeEngine",
     "MissingToolError",
@@ -66,6 +67,7 @@ __all__ = [
     "RunState",
     "StubEngine",
     "ToolBox",
+    "UpscaleError",
     "VideoToolError",
     "VerificationResult",
     "build_encode_command",
@@ -102,6 +104,26 @@ PHASE_ORDER = [
 
 class RunError(RuntimeError):
     """A run failed; ``phase`` on the attached state says where."""
+
+
+class UpscaleError(RunError):
+    """The engine's upscale stage failed; the runner fails OPEN (clause d).
+
+    Defined at the runner seam (design real-engine-adapter.md Section 5)
+    so ``run_file`` can catch it without importing a concrete engine
+    module, and re-exported by :mod:`vidlift.engine_ncnn`. Raising it
+    means: ship the synchronized original-resolution re-encode with the
+    reason stated verbatim in the manifest — never a desynced upscale,
+    never no output, never a silent AI-pass claim.
+    """
+
+
+class EngineCancelled(RunError):
+    """Cooperative cancel inside the engine; NOT a failure (clause d).
+
+    The runner records the run as cancelled (manifest outcome
+    ``cancelled``), never as a failed job.
+    """
 
 
 class MissingToolError(RunError):
@@ -202,12 +224,23 @@ def _subprocess_runner(binary: str, args: list[str]) -> tuple[int, str, str]:
 
 @dataclass
 class EngineResult:
-    """What the upscale engine reports back for the upscale phase."""
+    """What the upscale engine reports back for the upscale phase.
+
+    The v2 fields (``engine_model`` onward) carry the adapter's honesty
+    surface into manifest schema v2 (design real-engine-adapter.md
+    Section 11); they are additive and default to None/absent so stub
+    results and v1 consumers are unaffected.
+    """
 
     mezzanine_path: str
     frames_done: int = 0
     note: str | None = None
     simulated: bool = False
+    engine_model: str | None = None
+    engine_native_scale: int | None = None
+    frame_clock: dict | None = None
+    duration_gates: dict | None = None
+    model_hashes_verified: bool | None = None
 
 
 class EngineAdapter:
