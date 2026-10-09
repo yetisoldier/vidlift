@@ -36,19 +36,60 @@ is the real engine.
    telecine / genuine interlace) and the full decode pass during
    verification. Until then, the runner's stub makes honest
    re-encodes and never claims an AI pass it did not do.
-2. **Runner observability hardening.** The state contract exists from
+
+   **Real-engine acceptance criteria (ported from bluray-to-mp4,
+   binding).** Every clause gates the milestone; none is advisory.
+
+   a. Frame-clock discipline. Whatever reassembles or re-stamps
+      frames after the engine uses the probed clock (avg_frame_rate
+      with r_frame_rate fallback), never a default. A duration
+      sanity gate compares mezzanine vs source; deviation beyond
+      max(0.5 s, 0.01%) raises and fails open to a synchronized
+      original-resolution encode. Regression tests pin 23.976 /
+      25 / 29.97 inputs and the measured 15.05 s Mamma Mia drift
+      shape.
+   b. Explicit tiling, never auto. Tile size derives from input
+      extent (704 for the 640x360 class); a test asserts `-t 0`
+      can never appear in an engine command line. Model scale flag
+      matches the network's native scale; `-s 2` on an x4 network
+      is corruption, not downsampling.
+   c. Measured ETAs only. Plan time estimates come from a real
+      benchmark chunk on the current machine (item 3), never from
+      theory. No ETA rather than a projected one.
+   d. Fail open, never lie. A failed upscale stage may close a job,
+      but the manifest and final report state exactly what shipped
+      and why (engine used, engine_simulated, fail-open reason).
+      Ported from the OCR babysit lesson.
+   e. Diagnose from source frames first. Engine output defects are
+      triaged against the source pictures before the engine is
+      blamed (the v0.2.26 lesson: the defect was in the disc).
+   f. Boundary tests that actually run. GUI/PyQt tests must be
+      proven executed in the test env (no silent module skips);
+      every user-visible promise (output filename, final geometry,
+      sync, manifest claims) has one test at the highest boundary
+      it crosses. Ported from the v0.2.32 filename-handoff escape.
+   g. Model provenance. The adapter consumes the verified x2plus
+      ncnn artifacts from the bluray-to-mp4 repo
+      (packaging/tools/models/) rather than re-deriving them;
+      hashes checked at bundle time.
+2. **Full MCP bridge.** Local stdio MCP server exposing the whole
+   runner state contract (probe, plan, benchmark, run, status,
+   cancel, list, manifest) to AI agents, 1:1 onto the same pipeline
+   code the CLI/GUI use. Draft sketch: docs/designs/mcp-bridge.md.
+   Registered as `mcp.servers.vidlift` only after validation.
+3. **Runner observability hardening.** The state contract exists from
    day one (phase, log tail and path, last-activity timestamp,
    command lines, outputs, timings, verification, manifest, cancel).
    Still to add where the platform allows: child process and GPU
    activity reporting, and retry. Cancel exists at the engine seam.
-3. Add a tiny sample benchmark step so the plan can estimate
+4. Add a tiny sample benchmark step so the plan can estimate
    wall-clock time on the current machine.
-4. Build the batch queue on top of the proven single-file runner,
+5. Build the batch queue on top of the proven single-file runner,
    then wire UI start/cancel and per-file status to the same runner
    state.
-5. Validate against 2-3 real collection samples: XviD/DivX AVI,
+6. Validate against 2-3 real collection samples: XviD/DivX AVI,
    DVD MPEG-2 rip, and an odd MOV/MP4/WMV container.
-6. Package the Windows app after the runner path is proven.
+7. Package the Windows app after the runner path is proven.
 
 ## Packaging Discipline
 
