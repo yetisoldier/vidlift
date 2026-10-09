@@ -1,0 +1,380 @@
+"""The bridge's persisted job registry (mcp-bridge.md Section 6).
+
+One JSON file, ``$VIDLIFT_STATE_DIR/jobs.json``, holding every job the
+bridge has enqueued plus the benchmark cache table reference. JSON,
+not SQLite, deliberately: the registry is small (hundreds of records),
+human-inspectable, and its corrupt-file recovery story ("delete the
+file, history is gone, media outputs are unaffected") beats a database
+at this scale.
+
+Atomic writes: write-to-temp + ``os.replace`` under one lock — the
+registry is the bridge's only mutable shared state. State transitions
+are enforced HERE (Section 5.4), not by caller discipline:
+``queued -> running -> {succeeded, failed, cancelled}`` and
+``queued -> cancelled``; anything else is refused.
+
+Restart semantics: on startup the registry sweeps jobs found in
+``running`` state with no live thread owning them — the previous
+server died mid-run — and marks them ``failed`` with the binding
+restart error. Honest, never silently "succeeded", never silently
+dropped. Queued jobs across a restart resume automatically (the
+executor picks them up).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+
+__all__ = [
+    "JOBS_FILENAME",
+    "JobRecord",
+    "Registry",
+    "RESTART_ERROR",
+    "VALID_TRANSITIONS",
+]
+
+JOBS_FILENAME = "jobs.json"
+
+RESTART_ERROR = (
+    "server restarted during run; outcome unknown, see log"
+)
+
+# Allowed state machine (mcp-bridge.md Section 5.4), enforced in the
+# registry, not by caller discipline.
+VALID_TRANSITIONS: dict[str, set[str]] = {
+    "queued": {"running", "cancelled"},
+    "running": {"succeeded", "failed", "cancelled"},
+    # terminal states are terminal
+    "succeeded": set(),
+    "failed": set(),
+    "cancelled": set(),
+}
+
+TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+
+
+class RegistryError(RuntimeError):
+    """The registry is unusable or a transition is illegal."""
+
+
+class JobRecord:
+    """One job: run or benchmark (mcp-bridge.md Section 6)."""
+
+    def __init__(
+        self,
+        *,
+        job_id: str,
+        kind: str,
+        paths: list[str],
+        options: dict,
+        state: str = "queued",
+        submitted_at: float | None = None,
+        started_at: float | None = None,
+        finished_at: float | None = None,
+        last_activity_at: float | None = None,
+        output_path: str | None = None,
+        manifest_path: str | None = None,
+        log_path: str | None = None,
+        error: str | None = None,
+        ok: bool | None = None,
+        engine_simulated: bool | None = None,
+        engine_note: str | None = None,
+        result: dict | None = None,
+    ) -> None:
+        self.job_id = job_id
+        self.kind = kind  # "run" | "benchmark"
+        self.paths = list(paths)
+        self.options = dict(options)
+        self.state = state
+        self.submitted_at = (
+            submitted_at if submitted_at is not None else time.time()
+        )
+        self.started_at = started_at
+        self.finished_at = finished_at
+        self.last_activity_at = last_activity_at or self.submitted_at
+        self.output_path = output_path
+        self.manifest_path = manifest_path
+        self.log_path = log_path
+        self.error = error
+        self.ok = ok
+        self.engine_simulated = engine_simulated
+        self.engine_note = engine_note
+        self.result = result
+
+    # -- state machine ---------------------------------------------------
+
+    def transition(self, new_state: str) -> None:
+        allowed = VALID_TRANSITIONS.get(self.state, set())
+        if new_state not in allowed:
+            raise RegistryError(
+                f"illegal transition {self.state} -> {new_state} "
+                f"for job {self.job_id}"
+            )
+        self.state = new_state
+        self.last_activity_at = time.time()
+        if new_state == "running":
+            self.started_at = self.last_activity_at
+        if new_state in TERMINAL_STATES:
+            self.finished_at = self.last_activity_at
+
+    # -- live (in-memory, never persisted) ---------------------------------
+
+    def touch(self) -> None:
+        """Bump last-activity: called by the executor's tracked runner
+        seam on every external command a live job executes."""
+        self.last_activity_at = time.time()
+
+    def set_live(self, key: str, value) -> None:
+        if not hasattr(self, "_live"):
+            self._live = {}
+        self._live[key] = value
+
+    def get_live(self, key: str):
+        return getattr(self, "_live", {}).get(key)
+
+    def clear_live(self) -> None:
+        self._live = {}
+
+    # -- persistence ------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        return {
+            "job_id": self.job_id,
+            "kind": self.kind,
+            "paths": list(self.paths),
+            "options": dict(self.options),
+            "state": self.state,
+            "submitted_at": self.submitted_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "last_activity_at": self.last_activity_at,
+            "output_path": self.output_path,
+            "manifest_path": self.manifest_path,
+            "log_path": self.log_path,
+            "error": self.error,
+            "ok": self.ok,
+            "engine_simulated": self.engine_simulated,
+            "engine_note": self.engine_note,
+            "result": self.result,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "JobRecord":
+        return cls(
+            job_id=str(data["job_id"]),
+            kind=str(data.get("kind", "run")),
+            paths=list(data.get("paths", [])),
+            options=dict(data.get("options", {})),
+            state=str(data.get("state", "queued")),
+            submitted_at=data.get("submitted_at"),
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+            last_activity_at=data.get("last_activity_at"),
+            output_path=data.get("output_path"),
+            manifest_path=data.get("manifest_path"),
+            log_path=data.get("log_path"),
+            error=data.get("error"),
+            ok=data.get("ok"),
+            engine_simulated=data.get("engine_simulated"),
+            engine_note=data.get("engine_note"),
+            result=data.get("result"),
+        )
+
+
+class Registry:
+    """The persisted registry: load, enqueue, mutate, atomic save.
+
+    ``sweep_orphans()`` runs on startup (Section 6's restart rule).
+    The in-memory dict is the truth; ``save()`` writes it atomically
+    under one lock. A corrupt file raises on load (recovery: delete the
+    file; media outputs are unaffected — stated in the error).
+    """
+
+    def __init__(self, state_dir: str | Path) -> None:
+        self.path = Path(state_dir) / JOBS_FILENAME
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._jobs: dict[str, JobRecord] = {}
+        self.load()
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def load(self) -> None:
+        if not self.path.is_file():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RegistryError(
+                f"job registry at {self.path} is unreadable ({exc}); "
+                "delete the file to reset (job history only, media "
+                "outputs are unaffected)"
+            ) from exc
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        if not isinstance(jobs, list):
+            raise RegistryError(
+                f"job registry at {self.path} has no jobs list; delete "
+                "the file to reset"
+            )
+        for row in jobs:
+            record = JobRecord.from_dict(row)
+            self._jobs[record.job_id] = record
+
+    def save(self) -> None:
+        """Atomic write-to-temp + os.replace under the lock."""
+        with self._lock:
+            payload = json.dumps(
+                {
+                    "jobs": [record.to_dict() for record in self._jobs.values()],
+                },
+                indent=2,
+            ) + "\n"
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(self.path.parent), prefix=".jobs-", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                os.replace(tmp_name, self.path)
+            except OSError:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+
+    # -- job operations -------------------------------------------------------
+
+    def new_job_id(self) -> str:
+        return f"vl-{time.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+
+    def enqueue(
+        self,
+        *,
+        kind: str,
+        paths: list[str],
+        options: dict,
+    ) -> JobRecord:
+        record = JobRecord(
+            job_id=self.new_job_id(),
+            kind=kind,
+            paths=paths,
+            options=options,
+        )
+        with self._lock:
+            self._jobs[record.job_id] = record
+        self.save()
+        return record
+
+    def get(self, job_id: str) -> JobRecord | None:
+        return self._jobs.get(job_id)
+
+    def require(self, job_id: str) -> JobRecord:
+        record = self._jobs.get(job_id)
+        if record is None:
+            raise KeyError(job_id)
+        return record
+
+    def transition(self, record: JobRecord, new_state: str) -> None:
+        """Enforced state machine + atomic persist."""
+        with self._lock:
+            record.transition(new_state)
+        self.save()
+
+    # -- queue views -----------------------------------------------------------
+
+    def queued(self) -> list[JobRecord]:
+        return [
+            r for r in self._jobs.values()
+            if r.state == "queued"
+        ]
+
+    def queue_position(self, job_id: str) -> int | None:
+        """0-based position among queued jobs (submission order), None
+        once the job has started."""
+        record = self._jobs.get(job_id)
+        if record is None or record.state != "queued":
+            return None
+        queued = self.queued()
+        queued.sort(key=lambda r: r.submitted_at)
+        for position, item in enumerate(queued):
+            if item.job_id == job_id:
+                return position
+        return None
+
+    def running(self) -> list[JobRecord]:
+        return [r for r in self._jobs.values() if r.state == "running"]
+
+    def history(self) -> list[JobRecord]:
+        records = [
+            r for r in self._jobs.values() if r.state in TERMINAL_STATES
+        ]
+        records.sort(key=lambda r: r.finished_at or 0, reverse=True)
+        return records
+
+    # -- restart semantics ---------------------------------------------------
+
+    def sweep_orphans(self) -> list[JobRecord]:
+        """The Section-6 restart rule: jobs in ``running`` state with no
+        live thread owner are the previous server's corpses. They are
+        marked ``failed`` with the binding restart error — never
+        silently "succeeded", never silently dropped."""
+        swept: list[JobRecord] = []
+        for record in list(self._jobs.values()):
+            if record.state == "running":
+                record.error = RESTART_ERROR
+                record.ok = False
+                self.transition(record, "failed")  # running -> failed is legal
+                swept.append(record)
+        if swept:
+            self.save()
+        return swept
+
+    def cancel(self, job_id: str) -> str:
+        """Cooperative cancel semantics (Section 4.6). Returns one of
+        ``cancelling|cancelled|not-found|already-finished``.
+
+        - queued: removed without starting -> ``cancelled``.
+        - running: the executor's cancel flag flips; the job finishes
+          as cancelled on its own -> ``cancelling``.
+        - terminal or unknown: a reported non-event, never an exception.
+        """
+        record = self._jobs.get(job_id)
+        if record is None:
+            return "not-found"
+        if record.state in TERMINAL_STATES:
+            return "already-finished"
+        if record.state == "queued":
+            self.transition(record, "cancelled")
+            return "cancelled"
+        # running: the flag flip happens through the executor-owned
+        # CancelFlag the registry holds a reference to (set on start,
+        # cleared on finish). A second cancel while one is already in
+        # flight is the state_conflict (Section 7): reported, not silent.
+        cancel_flag = getattr(self, "_cancel_flags", {}).get(job_id)
+        if cancel_flag is not None:
+            if cancel_flag.is_set():
+                return "conflict"
+            cancel_flag.set()
+            record.last_activity_at = time.time()
+            self.save()
+            return "cancelling"
+        # no live owner (should not happen while running): sweep it
+        self.transition(record, "cancelled")
+        return "cancelled"
+
+    def set_cancel_flag(self, job_id: str, flag) -> None:
+        flags = getattr(self, "_cancel_flags", None)
+        if flags is None:
+            flags = {}
+            self._cancel_flags = flags
+        if flag is None:
+            flags.pop(job_id, None)
+        else:
+            flags[job_id] = flag

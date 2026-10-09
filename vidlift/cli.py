@@ -440,6 +440,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--work-dir",
         help="scratch directory for the benchmark slice (default: a temp dir)",
     )
+    mcp_parser = sub.add_parser(
+        "mcp-server",
+        help="run the VidLift MCP bridge as a stdio server (for MCP clients)",
+    )
+    mcp_parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="state directory for the job registry and benchmark cache",
+    )
     sub.add_parser("gui", help="open the VidLift planning workbench")
     return parser
 
@@ -484,6 +493,10 @@ def main(argv: list[str] | None = None) -> int:
         from .gui import main as gui_main
 
         return gui_main([])
+    if args.command == "mcp-server":
+        from .mcp_server import main as mcp_main
+
+        return mcp_main(["--state-dir", args.state_dir] if args.state_dir else [])
     parser.print_help()
     return 2
 

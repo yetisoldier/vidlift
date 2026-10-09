@@ -715,6 +715,7 @@ def run_file(
     log_dir: str | None = None,
     cancel: Callable[[], bool] | None = None,
     sample_classify: bool = True,
+    state_box: dict | None = None,
 ) -> RunResult:
     """Run one file through the full pipeline and return its state.
 
@@ -740,6 +741,13 @@ def run_file(
         tools = find_tools()
     run_cmd = command_runner or _subprocess_runner
     state = RunState(file_path=file_path)
+    if state_box is not None:
+        # The bridge's live-status seam: the state object IS the
+        # observability contract (its to_dict() is what status
+        # reports), so callers that watch a run while it executes
+        # receive the very object the runner mutates. Additive and
+        # optional; nothing else changes.
+        state_box["state"] = state
 
     base = Path(file_path)
     run_id = f"{base.stem}.{time.strftime('%Y%m%d-%H%M%S')}"
