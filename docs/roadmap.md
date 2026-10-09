@@ -18,7 +18,9 @@
   through the `EngineAdapter` seam because the bluray-to-mp4
   file-first entry point does not exist yet; manifests record
   `engine_simulated: true`. Real-engine integration is the next
-  milestone's work, not batch/UI.
+  milestone's work, not batch/UI. Binding design:
+  docs/designs/real-engine-adapter.md; sequencing and work packages:
+  docs/designs/sequencing-and-forge-brief.md.
 
 ## Next
 
@@ -75,7 +77,7 @@ is the real engine.
 2. **Full MCP bridge.** Local stdio MCP server exposing the whole
    runner state contract (probe, plan, benchmark, run, status,
    cancel, list, manifest) to AI agents, 1:1 onto the same pipeline
-   code the CLI/GUI use. Draft sketch: docs/designs/mcp-bridge.md.
+   code the CLI/GUI use. Binding spec: docs/designs/mcp-bridge.md.
    Registered as `mcp.servers.vidlift` only after validation.
 3. **Runner observability hardening.** The state contract exists from
    day one (phase, log tail and path, last-activity timestamp,
