@@ -917,6 +917,44 @@ def test_progress_seam_reports_per_chunk_frames(tmp_path):
     assert result.frames_done == 30
 
 
+def test_run_progress_kwarg_is_the_runner_seam_shape(tmp_path):
+    """Regression (found by the real-engine smoke run): run_file calls
+    engine.run(..., on_progress=record_progress) — the adapter must
+    accept the kwarg and chain it with any constructor callback. This
+    is the EXACT call shape the runner uses, driven end-to-end through
+    the fake seams."""
+    constructor_seen: list[tuple[int, int]] = []
+    kwarg_seen: list[tuple[int, int]] = []
+    prepared = tmp_path / "movie.prepared.mkv"
+    prepared.write_bytes(b"prepared-stub")
+    runner = EngineFakeRunner(prepared_duration=300.0, mezzanine_duration=300.0)
+    models, table = make_fixture_models(tmp_path / "models")
+    engine = NcnnVulkanEngine(
+        binary=str(make_fake_binary(tmp_path / "bin")),
+        models_dir=str(models),
+        artifacts=table,
+        runner=runner,
+        engine_runner=FakeEngineProcess(),
+        chunk_seconds=120,
+        on_progress=lambda done, total: constructor_seen.append((done, total)),
+    )
+    plan = make_plan(duration=300.0)
+    # the exact runner call: on_progress passed as a keyword argument
+    result = engine.run(
+        str(prepared),
+        plan,
+        ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        cancel=None,
+        on_progress=lambda done, total: kwarg_seen.append((done, total)),
+    )
+    assert result.frames_done == 30
+    # BOTH callbacks observed the per-chunk progress, and the adapter
+    # restored its constructor callback afterwards (no cross-run leak)
+    assert len(constructor_seen) == 3 and len(kwarg_seen) == 3
+    assert engine.on_progress is not None
+    assert constructor_seen == kwarg_seen == [(10, 7500), (20, 7500), (30, 7500)]
+
+
 def test_engine_stdout_progress_lines_parse_cheaply():
     calls: list[tuple[int, int]] = []
     engine = NcnnVulkanEngine(on_progress=lambda d, t: calls.append((d, t)))

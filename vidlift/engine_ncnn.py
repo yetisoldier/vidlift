@@ -538,8 +538,40 @@ class NcnnVulkanEngine(EngineAdapter):
         tools: ToolBox,
         *,
         cancel: Callable[[], bool] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> EngineResult:
-        """Run the real engine over the prepared file (design Sections 4-7)."""
+        """Run the real engine over the prepared file (design Sections 4-7).
+
+        ``on_progress`` is the runner's progress seam (``record_progress``);
+        it chains with any constructor-level callback so both the
+        runner's RunState and direct constructors (the bridge, tests)
+        observe frame progress.
+        """
+        original_progress = self.on_progress
+        if on_progress is not None:
+            if original_progress is None:
+                self.on_progress = on_progress
+            else:
+                def _chained(frames_done: int, frames_total: int) -> None:
+                    original_progress(frames_done, frames_total)
+                    on_progress(frames_done, frames_total)
+
+                self.on_progress = _chained
+        try:
+            return self._run_and_report(
+                prepared_path, plan, tools, cancel=cancel
+            )
+        finally:
+            self.on_progress = original_progress
+
+    def _run_and_report(
+        self,
+        prepared_path: str,
+        plan: PlannedFile,
+        tools: ToolBox,
+        *,
+        cancel: Callable[[], bool] | None = None,
+    ) -> EngineResult:
         binary = resolve_realesrgan(self._binary)
         models_dir = resolve_realesrgan_models(binary, self._models_dir)
         verify_model_artifacts(models_dir, self.spec.name, artifacts=self._artifacts)
