@@ -379,38 +379,59 @@ class VerificationResult:
 
 
 def build_prepare_command(
-    tools: ToolBox, plan: PlannedFile, prepared_path: str
+    tools: ToolBox,
+    plan: PlannedFile,
+    prepared_path: str,
+    *,
+    sample_chain=None,
 ) -> list[str]:
     """ffmpeg command writing the prepared source the engine contract needs.
 
     v0.2.19 filter chain, file-first: normalize to the square-pixel
     displayed size with setsar=1 (anamorphic safety; unknown SAR was
     already defaulted to square at probe time, never guessed), and
-    deinterlace only when the stream itself flagged interlace -- no
-    blind deinterlace, ever.
+    deinterlace by the P4 three-way classification
+    (vidlift/classify_sample.py) when the stream flagged interlace:
+    - progressive -> NO deinterlace at all, even when the flag lied;
+    - hard 3:2 telecine -> the reference IVTC chain
+      (fieldmatch+decimate) with output rate 24000/1001;
+    - genuine interlace -> bwdif at field rate (parity=auto + fps at
+      the doubled base rate, exact rational string);
+    - undecidable sample -> the flag-driven bwdif=mode=send_field
+      fallback (the pre-P4 behavior; the classification refines, it
+      never kills a run).
+    Unflagged sources never get any deinterlace filter.
 
-    Deliberately deferred until work package P4 (sequencing brief):
-    the 60-second sample inspection that classifies progressive /
-    hard 3:2 telecine / genuine interlace. Until it lands, the probe's
-    ``interlaced_flagged`` drives the bwdif decision. P4 changes the
-    prepare chain only, never the seam.
+    ``sample_chain`` is the :class:`vidlift.classify_sample.PrepareChain`
+    built from the idet verdict; None means the flag heuristic.
     """
     report = plan.report
     filters = [
         f"scale={report.displayed_width}:{report.displayed_height}",
         "setsar=1",
     ]
-    if report.interlaced_flagged:
+    output_rate = None
+    if sample_chain is not None:
+        filters.extend(sample_chain.filters)
+        if sample_chain.fps_filter:
+            filters.append(sample_chain.fps_filter)
+        output_rate = sample_chain.output_rate
+    elif report.interlaced_flagged:
         filters.append("bwdif=mode=send_field")
-    return [
+    cmd = [
         tools.ffmpeg,
         "-hide_banner", "-loglevel", "error", "-nostdin",
         "-i", report.path,
         "-vf", ",".join(filters),
         "-c:v", "ffv1",
         "-an",
-        "-y", prepared_path,
     ]
+    if output_rate:
+        # the telecine arm pins the container rate (v0.2.19 reference
+        # chain pins -r 24000/1001); an output option, so before -y
+        cmd += ["-r", output_rate]
+    cmd += ["-y", prepared_path]
+    return cmd
 
 
 def build_encode_command(
@@ -611,6 +632,7 @@ class RunState:
     progress: dict | None = None
     benchmark_constant: dict | None = None
     cancelled: bool = False
+    sample_verdict: dict | None = None
     verification: VerificationResult | None = None
     manifest_path: str | None = None
     finished_at: float | None = None
@@ -654,6 +676,7 @@ class RunState:
             "progress": self.progress,
             "benchmark_constant": self.benchmark_constant,
             "cancelled": self.cancelled,
+            "sample_verdict": self.sample_verdict,
             "verification": self.verification.to_dict() if self.verification else None,
             "manifest_path": self.manifest_path,
             "finished_at": self.finished_at,
@@ -691,6 +714,7 @@ def run_file(
     realesrgan_models: str | None = None,
     log_dir: str | None = None,
     cancel: Callable[[], bool] | None = None,
+    sample_classify: bool = True,
 ) -> RunResult:
     """Run one file through the full pipeline and return its state.
 
@@ -789,9 +813,63 @@ def run_file(
 
         # ---- prepare ----
         phase = begin_phase(PHASE_PREPARE)
+        sample_chain = None
+        sample_verdict = None
+        if plan.report.interlaced_flagged and sample_classify:
+            # P4: confirm the flag with a 60-second idet sample pass
+            # BEFORE filtering (v0.2.19 Section 3.3: classify first,
+            # deinterlace correctly; no blind deinterlace, ever). The
+            # command goes through the same seam (recorded, tail-able);
+            # an undecidable sample falls back to the flag heuristic.
+            from .classify_sample import (
+                chain_for,
+                classify_interlace_sample,
+                build_idet_command,
+            )
+
+            idet_cmd = build_idet_command(
+                tools.ffmpeg, file_path
+            )
+            state.commands.append(idet_cmd)
+            log(f"sample classify command: {' '.join(idet_cmd)}")
+            idet_result = run_cmd(idet_cmd[0], idet_cmd[1:])
+            state.touch()
+            sample_verdict = classify_interlace_sample(
+                file_path,
+                ffmpeg=tools.ffmpeg,
+                result=idet_result,
+            )
+            if sample_verdict.kind is not None:
+                sample_chain = chain_for(sample_verdict, report)
+                log(
+                    f"sample classification: {sample_verdict.kind} "
+                    f"({sample_verdict.detail})"
+                )
+            else:
+                log(
+                    "sample classification undecidable; using the "
+                    f"interlace flag heuristic: {sample_verdict.detail}"
+                )
+        elif plan.report.interlaced_flagged:
+            log("sample classification disabled; using the interlace flag heuristic")
+        state.sample_verdict = (
+            {
+                "kind": sample_verdict.kind,
+                "detail": sample_verdict.detail,
+                "single": sample_verdict.single,
+                "sample_seconds": sample_verdict.sample_seconds,
+            }
+            if sample_verdict is not None
+            else None
+        )
         prepared_path = str(log_root / f"{run_id}.prepared.mkv")
         state.prepared_path = prepared_path
-        run_command(PHASE_PREPARE, build_prepare_command(tools, plan, prepared_path))
+        run_command(
+            PHASE_PREPARE,
+            build_prepare_command(
+                tools, plan, prepared_path, sample_chain=sample_chain
+            ),
+        )
         if not os.path.isfile(prepared_path):
             raise RunError(f"prepare phase produced no file at {prepared_path}")
         end_phase(phase, note=f"prepared={prepared_path}")
@@ -991,6 +1069,7 @@ def _build_manifest(
             "duration_gates": state.duration_gates,
             "benchmark_constant": state.benchmark_constant,
             "cancelled": state.cancelled,
+            "sample_verdict": state.sample_verdict,
         },
         "tools": tools.to_dict(),
         "probe": {

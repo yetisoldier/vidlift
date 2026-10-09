@@ -115,6 +115,7 @@ class FakeRunner:
         encode_writes_output: bool = True,
         verify_exit: int = 0,
         decode_exit: int = 0,
+        idet_stderr: str = "",
     ) -> None:
         self.payload = payload
         self.output_geometry = output_geometry
@@ -123,16 +124,25 @@ class FakeRunner:
         self.encode_writes_output = encode_writes_output
         self.verify_exit = verify_exit
         self.decode_exit = decode_exit
+        self.idet_stderr = idet_stderr
         self.commands: list[tuple[str, tuple[str, ...]]] = []
 
     def __call__(self, binary: str, args: list[str]) -> tuple[int, str, str]:
         self.commands.append((binary, tuple(args)))
         # Order matters: the probe command contains BOTH -show_format and
-        # -show_streams; the verify command only -show_streams; the full
-        # decode pass writes to null ("-f null -"); and the
-        # verify/prepared/encode commands all end in a file path suffix.
+        # -show_streams; the verify command only -show_streams; the idet
+        # sample pass is "-vf idet" to null; the full decode pass writes
+        # to null without idet; and the verify/prepared/encode commands
+        # all end in a file path suffix.
         if "-show_format" in args:
             return 0, self.payload, ""
+        if "idet" in args:
+            return 0, "", self.idet_stderr or (
+                "[Parsed_idet] frame detection: TFF: 0 BFF: 0 "
+                "Progressive: 0 Undetermined: 0\n"
+                "[Parsed_idet] Single frame detection: TFF: 0 BFF: 0 "
+                "Progressive: 0 Undetermined: 0\n"
+            )
         if "-show_streams" in args:
             if self.verify_exit != 0:
                 return self.verify_exit, "", "verify boom"
