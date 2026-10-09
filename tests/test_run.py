@@ -28,6 +28,7 @@ from vidlift.run import (
     PHASE_UPSCALE,
     PHASE_VERIFY,
     EngineAdapter,
+    EngineCancelled,
     FakeEngine,
     MissingToolError,
     RunError,
@@ -36,7 +37,9 @@ from vidlift.run import (
     RunState,
     StubEngine,
     ToolBox,
+    UpscaleError,
     VideoToolError,
+    build_decode_command,
     build_encode_command,
     build_prepare_command,
     build_verification_command,
@@ -111,6 +114,7 @@ class FakeRunner:
         encode_exit: int = 0,
         encode_writes_output: bool = True,
         verify_exit: int = 0,
+        decode_exit: int = 0,
     ) -> None:
         self.payload = payload
         self.output_geometry = output_geometry
@@ -118,12 +122,14 @@ class FakeRunner:
         self.encode_exit = encode_exit
         self.encode_writes_output = encode_writes_output
         self.verify_exit = verify_exit
+        self.decode_exit = decode_exit
         self.commands: list[tuple[str, tuple[str, ...]]] = []
 
     def __call__(self, binary: str, args: list[str]) -> tuple[int, str, str]:
         self.commands.append((binary, tuple(args)))
         # Order matters: the probe command contains BOTH -show_format and
-        # -show_streams; the verify command only -show_streams; and the
+        # -show_streams; the verify command only -show_streams; the full
+        # decode pass writes to null ("-f null -"); and the
         # verify/prepared/encode commands all end in a file path suffix.
         if "-show_format" in args:
             return 0, self.payload, ""
@@ -134,6 +140,10 @@ class FakeRunner:
             return 0, json.dumps(
                 {"streams": [{"codec_type": "video", "width": w, "height": h}]}
             ), ""
+        if args and args[-1] == "-" and "null" in args:
+            if self.decode_exit != 0:
+                return self.decode_exit, "", "decode boom"
+            return 0, "", ""
         if args and args[-1].endswith(".prepared.mkv"):
             if self.prepare_exit == 0:
                 Path(args[-1]).write_bytes(b"prepared-stub")
@@ -310,13 +320,16 @@ class TestRunFilePhases:
     def test_happy_path_records_all_command_lines(self, tmp_path):
         result, runner = run_happy(tmp_path)
         commands = result.state.commands
-        assert len(commands) == 4  # probe, prepare, encode, verify
-        probe_cmd, prep_cmd, enc_cmd, ver_cmd = commands
+        assert len(commands) == 5  # probe, prepare, encode, verify, decode
+        probe_cmd, prep_cmd, enc_cmd, ver_cmd, dec_cmd = commands
         assert probe_cmd[0] == "ffprobe"
         assert probe_cmd[1:] == probe_args(result.state.file_path)
         assert prep_cmd[0] == "ffmpeg" and "setsar=1" in " ".join(prep_cmd)
         assert "libx265" in enc_cmd
         assert ver_cmd[0] == "ffprobe" and result.plan.output_path in ver_cmd
+        # the full decode pass (b12) decodes the encode output to null
+        assert dec_cmd[0] == "ffmpeg" and result.plan.output_path in dec_cmd
+        assert dec_cmd[dec_cmd.index("-f") + 1:] == ["null", "-"]
         # every command the state recorded is exactly what the seam received
         received = [[b, *list(a)] for b, a in runner.commands]
         for cmd in commands:
@@ -362,7 +375,7 @@ class TestRunFilePhases:
         assert manifest["verification"]["ok"] is True
         assert manifest["verification"]["actual_geometry"] == [1280, 720]
         assert manifest["artifacts"]["output_path"] == result.plan.output_path
-        assert len(manifest["commands"]) == 4
+        assert len(manifest["commands"]) == 5
         assert [p["name"] for p in manifest["phases"]] == [
             "probe", "plan", "prepare", "upscale", "encode", "verify",
         ]
@@ -770,3 +783,497 @@ class TestVerification:
         assert cmd[0] == tools.ffprobe
         assert plan.output_path in cmd
         assert "-show_streams" in cmd
+
+class TestEngineSelection:
+    """--engine {auto,stub,ncnn} resolution (design Section 5)."""
+
+    def test_auto_without_engine_tools_falls_to_stub_with_named_reason(
+        self, tmp_path, monkeypatch
+    ):
+        # the conftest guard points VIDLIFT_REALESRGAN_NCNN at a
+        # nonexistent path: auto must fall to the stub, note the reason
+        from vidlift.engine_ncnn import select_engine
+
+        engine, note = select_engine("auto")
+        assert type(engine).__name__ == "StubEngine"
+        assert note is not None and "auto: stub engine" in note
+        assert "not found" in note  # names what failed
+
+    def test_stub_request_forces_stub_no_probe(self):
+        from vidlift.engine_ncnn import select_engine
+
+        engine, note = select_engine("stub")
+        assert type(engine).__name__ == "StubEngine"
+        assert note is None
+
+    def test_ncnn_request_missing_binary_is_named_setup_error(self, monkeypatch):
+        from vidlift.engine_ncnn import select_engine
+
+        monkeypatch.setenv("VIDLIFT_REALESRGAN_NCNN", "/no/such/engine")
+        with pytest.raises(MissingToolError) as excinfo:
+            select_engine("ncnn")
+        assert excinfo.value.tool == "realesrgan-ncnn-vulkan"
+        assert "not found" in str(excinfo.value)
+
+    def test_unknown_request_is_refused(self):
+        from vidlift.engine_ncnn import select_engine
+
+        with pytest.raises(UpscaleError, match="unknown engine request"):
+            select_engine("turbo")
+
+    def test_run_file_default_engine_is_stub_with_note(self, tmp_path):
+        # run_file's default (engine=None, request auto) lands on the
+        # stub under the test guard, and the manifest says exactly why
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        result = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            log_dir=str(tmp_path / "runs"),
+        )
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        assert manifest["run"]["engine"] == "StubEngine"
+        assert manifest["run"]["engine_simulated"] is True
+        assert "auto: stub engine" in manifest["run"]["engine_note"]
+
+    def test_forced_stub_engine_flag_reaches_the_runner(self, tmp_path):
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        result = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            log_dir=str(tmp_path / "runs"), engine_request="stub",
+        )
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        assert manifest["run"]["engine"] == "StubEngine"
+        assert manifest["run"]["engine_simulated"] is True
+        assert manifest["run"]["engine_note"] == "stub engine (no Real-ESRGAN)"
+
+
+class TestFailOpen:
+    """b7 (clause d): a failing engine NEVER kills the job."""
+
+    def test_b7_fail_open_end_to_end_completes_with_honest_manifest(
+        self, tmp_path
+    ):
+        # the OCR-babysit lesson as a test: the engine dies mid-run
+        # with the gate-M reason; the run COMPLETES, the output is the
+        # synchronized re-encode (verify stage green), and the manifest
+        # states verbatim what shipped and why.
+        reason = "gate M: mezz 6838.0 vs prep 6853.1"
+        path = make_media_file(tmp_path)
+        engine = FakeEngine(UpscaleError(reason))
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        result = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            engine=engine, log_dir=str(tmp_path / "runs"),
+        )
+        state = result.state
+        # the run COMPLETED and verified
+        assert result.ok is True
+        assert state.current_phase == PHASE_DONE
+        assert state.verification is not None and state.verification.ok
+        assert [p.name for p in state.phases] == [
+            PHASE_PROBE, PHASE_PLAN, PHASE_PREPARE,
+            PHASE_UPSCALE, PHASE_ENCODE, PHASE_VERIFY,
+        ]
+        # the shipped output was encoded from the PREPARED file
+        assert state.mezzanine_path == state.prepared_path
+        # the engine was attempted and is named
+        assert state.engine_name == "FakeEngine"
+        # manifest v2 honesty fields, verbatim
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        run = manifest["run"]
+        assert run["fail_open"] is True
+        assert run["fail_open_reason"] == reason  # verbatim
+        assert run["engine_simulated"] is True  # shipped pixels are NOT AI
+        assert run["engine"] == "FakeEngine"  # names the attempted engine
+        assert run["engine_note"] == f"fail open: {reason}"
+        assert run["engine_model"] is None
+        assert run["ok"] is True
+        # the shipped output really is a real verified re-encode
+        assert manifest["verification"]["ok"] is True
+        assert manifest["verification"]["full_decode_ok"] is True
+        # the run log carries the red-level warning
+        log_text = Path(state.log.path).read_text()
+        assert "failing open" in log_text
+        assert reason in log_text
+
+    def test_b7_fail_open_note_flows_to_state_and_manifest_identically(
+        self, tmp_path
+    ):
+        reason = "no usable frame clock on prepared file /x/y: neither parses"
+        path = make_media_file(tmp_path)
+        engine = FakeEngine(UpscaleError(reason))
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        result = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            engine=engine, log_dir=str(tmp_path / "runs"),
+        )
+        state = result.state
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        # byte-identical flow-through (clause d at the boundary)
+        assert state.engine_note == manifest["run"]["engine_note"]
+        assert state.fail_open_reason == manifest["run"]["fail_open_reason"]
+        assert state.engine_simulated == manifest["run"]["engine_simulated"]
+
+    def test_fail_open_output_decodes_and_matches_plan(self, tmp_path):
+        # highest boundary (clause f): the fail-open OUTPUT itself —
+        # not just the manifest claim — is a real 720p file
+        path = make_media_file(tmp_path)
+        engine = FakeEngine(UpscaleError("engine exploded"))
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        result = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            engine=engine, log_dir=str(tmp_path / "runs"),
+        )
+        assert os.path.isfile(result.plan.output_path)
+        assert result.verification.geometry_ok is True
+        assert result.verification.full_decode_ok is True
+
+    def test_plain_runerror_from_engine_still_fails_the_run(self, tmp_path):
+        # fail-open covers ONLY UpscaleError; a plain RunError from a
+        # broken engine is a real failure (the stub's contract class)
+        path = make_media_file(tmp_path)
+        engine = FakeEngine(RunError("engine exploded"))
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        with pytest.raises(RunError, match="engine exploded") as excinfo:
+            run_file(
+                path, tools=tools, probe_runner=runner, command_runner=runner,
+                engine=engine, log_dir=str(tmp_path / "runs"),
+            )
+        state = excinfo.value.state  # type: ignore[attr-defined]
+        assert state.current_phase == PHASE_UPSCALE
+        assert state.fail_open is False
+        assert state.cancelled is False
+
+
+class TestEngineCancelOutcome:
+    """EngineCancelled is a cancellation, never a failure (clause d)."""
+
+    def test_cancel_in_engine_records_cancelled_outcome(self, tmp_path):
+        path = make_media_file(tmp_path)
+        engine = FakeEngine(EngineCancelled("cancelled during Real-ESRGAN chunk 1/2"))
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        with pytest.raises(EngineCancelled) as excinfo:
+            run_file(
+                path, tools=tools, probe_runner=runner, command_runner=runner,
+                engine=engine, log_dir=str(tmp_path / "runs"),
+            )
+        state = excinfo.value.state  # type: ignore[attr-defined]
+        assert state.cancelled is True
+        assert state.ok is False
+        assert state.current_phase == PHASE_UPSCALE
+        assert state.error is not None and "cancelled" in state.error
+        # the manifest records a cancellation outcome, not a failure
+        manifest = json.loads(Path(state.manifest_path).read_text())
+        assert manifest["run"]["outcome"] == "cancelled"
+        assert manifest["run"]["cancelled"] is True
+        assert manifest["run"]["ok"] is False
+        # and it still carries the honesty fields
+        assert manifest["run"]["engine"] == "FakeEngine"
+        assert "engine_simulated" in manifest["run"]
+
+    def test_stub_pre_frame_cancel_is_engine_cancelled_now(self, tmp_path):
+        # StubEngine's pre-frame cancel raised plain RunError before
+        # P2; the seam contract now raises EngineCancelled
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        with pytest.raises(EngineCancelled):
+            run_file(
+                path, tools=tools, probe_runner=runner, command_runner=runner,
+                log_dir=str(tmp_path / "runs"), cancel=lambda: True,
+            )
+
+    def test_cancel_writes_no_output_file(self, tmp_path):
+        path = make_media_file(tmp_path)
+        engine = FakeEngine(EngineCancelled("cancelled before extraction"))
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        with pytest.raises(EngineCancelled):
+            run_file(
+                path, tools=tools, probe_runner=runner, command_runner=runner,
+                engine=engine, log_dir=str(tmp_path / "runs"),
+            )
+        # a cancelled run never leaves a claimed-complete output
+        assert not os.path.isfile(
+            str(Path(path).with_name("movie.vidlift.720p.hevc.mp4"))
+        )
+
+
+class TestFullDecodeVerification:
+    """b12: the full decode pass runs on the encode output and its
+    failure fails verification."""
+
+    def test_decode_command_shape_is_pinned(self):
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        cmd = build_decode_command(tools, "/out/movie.vidlift.720p.hevc.mp4")
+        assert cmd == [
+            "ffmpeg",
+            "-v", "error", "-nostdin",
+            "-i", "/out/movie.vidlift.720p.hevc.mp4",
+            "-f", "null", "-",
+        ]
+
+    def test_full_decode_runs_on_happy_path_and_passes(self, tmp_path):
+        result, runner = run_happy(tmp_path)
+        assert result.verification.full_decode_ok is True
+        # the decode command was both recorded and executed via the seam
+        decode_cmds = [
+            c for c in result.state.commands if c[-1] == "-" and "null" in c
+        ]
+        assert len(decode_cmds) == 1
+        assert ("ffmpeg", tuple(decode_cmds[0][1:])) in runner.commands
+
+    def test_full_decode_failure_fails_verification(self, tmp_path):
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload(), decode_exit=1)
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        with pytest.raises(RunError, match="verification failed") as excinfo:
+            run_file(
+                path, tools=tools, probe_runner=runner, command_runner=runner,
+                log_dir=str(tmp_path / "runs"),
+            )
+        state = excinfo.value.state  # type: ignore[attr-defined]
+        assert state.verification is not None
+        assert state.verification.full_decode_ok is False
+        assert state.verification.geometry_ok is True  # got that far
+        assert "full decode failed" in state.verification.error
+        manifest = json.loads(Path(state.manifest_path).read_text())
+        assert manifest["verification"]["full_decode_ok"] is False
+        assert manifest["verification"]["ok"] is False
+
+    def test_full_decode_skipped_when_geometry_mismatch(self, tmp_path):
+        # decode is only worth running on otherwise-good outputs
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload(), output_geometry=(640, 360))
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        with pytest.raises(RunError, match="verification failed"):
+            run_file(
+                path, tools=tools, probe_runner=runner, command_runner=runner,
+                log_dir=str(tmp_path / "runs"),
+            )
+        decode_cmds = [
+            c for c in runner.commands if "-" in c[1] and c[0] == "ffmpeg"
+            and list(c[1])[-1] == "-"
+        ]
+        assert decode_cmds == []  # the decode pass never ran
+
+    def test_verify_output_full_decode_flag_off(self, tmp_path):
+        # the flag exists so future callers (bridge probes) can run the
+        # cheap checks alone
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        result = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            log_dir=str(tmp_path / "runs"),
+        )
+        plan = result.plan
+        # geometry-only verify (full_decode=False) skips the pass
+        fake = FakeRunner(probe_payload())
+        check = verify_output(
+            tools, plan, runner=fake, full_decode=False
+        )
+        assert check.ok is True
+        assert check.full_decode_ok is False
+        assert len(fake.commands) == 1  # only the ffprobe check ran
+
+
+class TestManifestSchemaV2:
+    """Schema v2 additive fields (design Section 11); v1 unchanged."""
+
+    def test_v1_fields_unchanged_byte_for_byte(self, tmp_path):
+        result, _ = run_happy(tmp_path)
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        run = manifest["run"]
+        # v1 core fields, present with the same meaning as ever
+        assert run["input_file"] == result.state.file_path
+        assert run["ok"] is True
+        assert run["engine_simulated"] is True
+        assert "started_at" in run and "finished_at" in run
+        assert "error" in run
+        assert manifest["tools"] == {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"}
+        assert manifest["probe"]["source_class"] == "xvid-divx-avi"
+        assert manifest["plan"]["output_geometry"] == [1280, 720]
+        assert "phases" in manifest and "commands" in manifest
+        assert "verification" in manifest and "artifacts" in manifest
+
+    def test_v2_fields_present_with_null_rule_on_stub(self, tmp_path):
+        # additive fields are present with the null/absent rule: the
+        # stub carries no model/clock/gates, and that is stated, not
+        # omitted silently
+        result, _ = run_happy(tmp_path)
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        run = manifest["run"]
+        assert run["engine_model"] is None
+        assert run["engine_native_scale"] is None
+        assert run["fail_open"] is False
+        assert run["fail_open_reason"] is None
+        assert run["frame_clock"] is None
+        assert run["model_hashes_verified"] is None
+        assert run["duration_gates"] is None
+        assert run["benchmark_constant"] is None
+        assert run["cancelled"] is False
+        assert run["outcome"] == "succeeded"
+
+    def test_state_to_dict_carries_v2_fields(self, tmp_path):
+        result, _ = run_happy(tmp_path)
+        data = result.state.to_dict()
+        for key in (
+            "engine_name", "engine_model", "engine_native_scale",
+            "fail_open", "fail_open_reason", "frame_clock",
+            "duration_gates", "model_hashes_verified", "progress",
+            "benchmark_constant", "cancelled",
+        ):
+            assert key in data, f"state.to_dict() lost v2 field {key}"
+
+
+class TestProgressPlumbing:
+    """RunState.progress fed by the adapter's on_progress seam."""
+
+    def test_stub_run_leaves_progress_null(self, tmp_path):
+        # the stub reports no frame work; progress stays honestly null
+        result, _ = run_happy(tmp_path)
+        assert result.state.progress is None
+
+    def test_engine_progress_lands_in_state(self, tmp_path):
+        seen: list[tuple[int, int]] = []
+
+        class ProgressEngine(StubEngine):
+            def run(self, prepared_path, plan, tools, *, cancel=None,
+                    on_progress=None):
+                if on_progress is not None:
+                    on_progress(120, 7500)
+                    on_progress(240, 7500)
+                seen.append(True)
+                return super().run(
+                    prepared_path, plan, tools, cancel=cancel,
+                    on_progress=on_progress,
+                )
+
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        result = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            engine=ProgressEngine(), log_dir=str(tmp_path / "runs"),
+        )
+        assert seen == [True]
+        assert result.state.progress == {"frames_done": 240, "frames_total": 7500}
+
+
+class TestHighestBoundaryPromiseSweep:
+    """b8 (clause f): the engine-touching user-visible promises, one
+    test each at the command/manifest boundary."""
+
+    def test_b8_output_filename_promise_at_manifest_boundary(self, tmp_path):
+        result, _ = run_happy(tmp_path)
+        # the promise: outputs are named <stem>.vidlift.720p.hevc.mp4
+        assert Path(result.plan.output_path).name == (
+            "movie.vidlift.720p.hevc.mp4"
+        )
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        assert manifest["plan"]["output_path"] == result.plan.output_path
+        assert manifest["artifacts"]["output_path"] == result.plan.output_path
+
+    def test_b8_geometry_promise_at_command_and_manifest(self, tmp_path):
+        result, runner = run_happy(tmp_path)
+        # the promise: final geometry equals plan geometry; asserted on
+        # the encode command line AND the manifest AND verification
+        plan = result.plan
+        enc = find_command(result.state.commands, "libx265")
+        vf = enc[enc.index("-vf") + 1]
+        assert vf == f"scale={plan.output_width}:{plan.output_height}:flags=lanczos"
+        assert result.verification.actual_geometry == (
+            (plan.output_width, plan.output_height)
+        )
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        assert manifest["verification"]["actual_geometry"] == [
+            plan.output_width, plan.output_height,
+        ]
+        assert manifest["verification"]["geometry_ok"] is True
+
+    def test_b8_audio_maps_from_the_original_file(self, tmp_path):
+        # the promise: audio comes from the ORIGINAL file, never the
+        # video-only mezzanine — pinned on the encode command line
+        result, _ = run_happy(tmp_path)
+        enc = find_command(result.state.commands, "libx265")
+        # first -i is the mezzanine; the second -i is the ORIGINAL
+        inputs = [enc[i + 1] for i, a in enumerate(enc) if a == "-i"]
+        assert len(inputs) == 2
+        assert inputs[0] == result.state.mezzanine_path
+        assert inputs[1] == result.state.file_path
+        assert "1:a:0" in enc  # audio stream is mapped from input 1
+
+    def test_b8_manifest_honesty_fields_promise(self, tmp_path):
+        # the promise: every manifest states its engine and simulated
+        # flag; a fail-open manifest states what shipped and why
+        reason = "upscale mezzanine duration gate: mismatch"
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        engine = FakeEngine(UpscaleError(reason))
+        result = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            engine=engine, log_dir=str(tmp_path / "runs"),
+        )
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        run = manifest["run"]
+        assert run["engine"] == "FakeEngine"
+        assert run["engine_simulated"] is True
+        assert run["fail_open"] is True
+        assert run["fail_open_reason"] == reason
+        # and the same fields on the state, byte-identical
+        assert result.state.fail_open_reason == run["fail_open_reason"]
+        assert result.state.engine_note == run["engine_note"]
+
+    def test_b8_fail_open_output_filename_promise(self, tmp_path):
+        # a fail-open run still produces the exact promised filename
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        engine = FakeEngine(UpscaleError("gate M: mezz 1.0 vs prep 6838.0"))
+        result = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            engine=engine, log_dir=str(tmp_path / "runs"),
+        )
+        assert Path(result.plan.output_path).name == (
+            "movie.vidlift.720p.hevc.mp4"
+        )
+        assert os.path.isfile(result.plan.output_path)
+
+
+class TestNoAutoTileEver:
+    """The explicit tiling prohibition at the runner boundary."""
+
+    def test_no_engine_command_ever_pairs_t0(self, tmp_path):
+        # the v0.2.23 seam-line lesson: -t 0 (driver auto-tile) can
+        # never appear in an engine command line. With the stub as the
+        # test/CI engine there are no engine commands at all, which is
+        # the strongest form of the guarantee; the b5 series pins the
+        # adapter side. Here we assert the stub path constructs no
+        # engine command with -t 0 and no encode/prepare command with it
+        # either (ffmpeg has no -t 0 pairing in our pinned commands).
+        result, runner = run_happy(tmp_path)
+        for command in result.state.commands:
+            for i, arg in enumerate(command):
+                if arg == "-t":
+                    assert command[i + 1] != "0", (
+                        f"-t 0 appeared in {command}"
+                    )
+
+    def test_cli_accepts_engine_flag(self):
+        args = cli.build_parser().parse_args(
+            ["run", "--engine", "ncnn", "--realesrgan", "/r/e", "movie.avi"]
+        )
+        assert args.engine == "ncnn"
+        assert args.realesrgan == "/r/e"
+        args2 = cli.build_parser().parse_args(["run", "movie.avi"])
+        assert args2.engine == "auto"  # the default

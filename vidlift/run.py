@@ -71,6 +71,7 @@ __all__ = [
     "VideoToolError",
     "VerificationResult",
     "build_encode_command",
+    "build_decode_command",
     "build_prepare_command",
     "build_verification_command",
     "ensure_output_dir",
@@ -265,6 +266,7 @@ class EngineAdapter:
         tools: ToolBox,
         *,
         cancel: Callable[[], bool] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> EngineResult:
         raise NotImplementedError(
             "no real engine adapter exists yet; the runner uses StubEngine "
@@ -294,10 +296,13 @@ class StubEngine(EngineAdapter):
         tools: ToolBox,
         *,
         cancel: Callable[[], bool] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> EngineResult:
         self.calls.append(prepared_path)
         if cancel is not None and cancel():
-            raise RunError("upscale cancelled before any frame was processed")
+            raise EngineCancelled(
+                "upscale cancelled before any frame was processed"
+            )
         mezzanine = Path(prepared_path).with_suffix(".upscaled.mkv")
         shutil.copyfile(prepared_path, mezzanine)
         return EngineResult(
@@ -315,7 +320,7 @@ class FakeEngine(StubEngine):
         super().__init__(note=note)
         self.error = error
 
-    def run(self, prepared_path, plan, tools, *, cancel=None):
+    def run(self, prepared_path, plan, tools, *, cancel=None, on_progress=None):
         self.calls.append(prepared_path)
         raise self.error
 
@@ -341,12 +346,19 @@ class RunLog:
 
 @dataclass
 class VerificationResult:
-    """Post-encode output verification: exists, decodes, geometry."""
+    """Post-encode output verification: exists, decodes, geometry.
+
+    ``decodes`` is the ffprobe container check; ``full_decode_ok`` is
+    the ffmpeg decode-every-frame pass (roadmap item 1 / b12) that
+    runs on otherwise-good outputs before the run may be called
+    verified.
+    """
 
     output_path: str
     ok: bool
     exists: bool = False
     decodes: bool = False
+    full_decode_ok: bool = False
     geometry_ok: bool = False
     actual_geometry: tuple[int, int] | None = None
     expected_geometry: tuple[int, int] | None = None
@@ -358,6 +370,7 @@ class VerificationResult:
             "ok": self.ok,
             "exists": self.exists,
             "decodes": self.decodes,
+            "full_decode_ok": self.full_decode_ok,
             "geometry_ok": self.geometry_ok,
             "actual_geometry": list(self.actual_geometry) if self.actual_geometry else None,
             "expected_geometry": list(self.expected_geometry) if self.expected_geometry else None,
@@ -376,11 +389,11 @@ def build_prepare_command(
     deinterlace only when the stream itself flagged interlace -- no
     blind deinterlace, ever.
 
-    Deliberately deferred (docs/design.md v0.2 session B): the
-    60-second sample inspection that classifies progressive / hard
-    3:2 telecine / genuine interlace. Until the real engine adapter
-    lands, the probe's ``interlaced_flagged`` drives the bwdif decision
-    and the sample-based classification is not implemented.
+    Deliberately deferred until work package P4 (sequencing brief):
+    the 60-second sample inspection that classifies progressive /
+    hard 3:2 telecine / genuine interlace. Until it lands, the probe's
+    ``interlaced_flagged`` drives the bwdif decision. P4 changes the
+    prepare chain only, never the seam.
     """
     report = plan.report
     filters = [
@@ -446,6 +459,25 @@ def build_encode_command(
     return cmd
 
 
+def build_decode_command(tools: ToolBox, output_path: str) -> list[str]:
+    """ffmpeg full-decode pass for the verify stage (roadmap item 1, b12).
+
+    ``ffmpeg -v error -i out -f null -`` decodes every frame of the
+    encode output; any decode error exits nonzero and fails
+    verification. This is the structural-integrity complement to the
+    ffprobe geometry check (cheap checks first, the full decode only
+    for otherwise-good outputs, because a 2-hour file costs minutes
+    here). ``-nostdin`` follows the codebase's uniform anti-TTY
+    discipline; the pinned command shape is otherwise exact.
+    """
+    return [
+        tools.ffmpeg,
+        "-v", "error", "-nostdin",
+        "-i", output_path,
+        "-f", "null", "-",
+    ]
+
+
 def build_verification_command(tools: ToolBox, output_path: str) -> list[str]:
     """ffprobe command run against the encode output to verify it."""
     return [tools.ffprobe, "-v", "error", "-show_streams", "-of", "json", output_path]
@@ -476,17 +508,18 @@ def verify_output(
     *,
     runner: Runner,
     command: list[str] | None = None,
+    decode_command: list[str] | None = None,
+    full_decode: bool = True,
 ) -> VerificationResult:
     """Verify the encode output exists, decodes, and matches plan geometry.
 
     "Decodes" here means ffprobe reads the output container and finds
     a video stream; the encode itself runs ffmpeg with ``-loglevel
     error``, so a nonzero encode exit is already a hard failure upstream.
-    A full decode pass (``ffmpeg -v error -i out -f null -``) is
-    deliberately deferred until the real engine adapter lands, because
-    the stub's outputs only need container/geometry honesty. Geometry
-    must match the plan exactly; a mismatch is a verification failure,
-    not a warning.
+    The full decode pass (``ffmpeg -v error -i out -f null -``, b12)
+    then decodes every frame of an otherwise-good output; its failure
+    fails verification. Geometry must match the plan exactly; a
+    mismatch is a verification failure, not a warning.
     """
     cmd = command if command is not None else build_verification_command(
         tools, plan.output_path
@@ -525,6 +558,20 @@ def verify_output(
             f"geometry mismatch: planned {expected[0]}x{expected[1]}, "
             f"got {actual[0]}x{actual[1]}"
         )
+        return result
+    if full_decode:
+        decode_cmd = decode_command if decode_command is not None else (
+            build_decode_command(tools, plan.output_path)
+        )
+        code, _out, err = runner(decode_cmd[0], decode_cmd[1:])
+        if code != 0:
+            result.ok = False
+            result.error = (
+                "full decode failed on the encode output: "
+                f"{(err or '').strip()[:200] or 'no diagnostic'}"
+            )
+            return result
+        result.full_decode_ok = True
     return result
 
 
@@ -551,8 +598,19 @@ class RunState:
     output_path: str | None = None
     prepared_path: str | None = None
     mezzanine_path: str | None = None
+    engine_name: str | None = None
     engine_note: str | None = None
     engine_simulated: bool = False
+    engine_model: str | None = None
+    engine_native_scale: int | None = None
+    fail_open: bool = False
+    fail_open_reason: str | None = None
+    frame_clock: dict | None = None
+    duration_gates: dict | None = None
+    model_hashes_verified: bool | None = None
+    progress: dict | None = None
+    benchmark_constant: dict | None = None
+    cancelled: bool = False
     verification: VerificationResult | None = None
     manifest_path: str | None = None
     finished_at: float | None = None
@@ -583,8 +641,19 @@ class RunState:
             "output_path": self.output_path,
             "prepared_path": self.prepared_path,
             "mezzanine_path": self.mezzanine_path,
+            "engine_name": self.engine_name,
             "engine_note": self.engine_note,
             "engine_simulated": self.engine_simulated,
+            "engine_model": self.engine_model,
+            "engine_native_scale": self.engine_native_scale,
+            "fail_open": self.fail_open,
+            "fail_open_reason": self.fail_open_reason,
+            "frame_clock": self.frame_clock,
+            "duration_gates": self.duration_gates,
+            "model_hashes_verified": self.model_hashes_verified,
+            "progress": self.progress,
+            "benchmark_constant": self.benchmark_constant,
+            "cancelled": self.cancelled,
             "verification": self.verification.to_dict() if self.verification else None,
             "manifest_path": self.manifest_path,
             "finished_at": self.finished_at,
@@ -617,6 +686,9 @@ def run_file(
     probe_runner: Runner | None = None,
     command_runner: Runner | None = None,
     engine: EngineAdapter | None = None,
+    engine_request: str = "auto",
+    realesrgan: str | None = None,
+    realesrgan_models: str | None = None,
     log_dir: str | None = None,
     cancel: Callable[[], bool] | None = None,
 ) -> RunResult:
@@ -628,8 +700,17 @@ def run_file(
     simulate tool effects). ``tools`` bypasses discovery for callers
     that already resolved binaries (the CLI does, honoring
     --ffmpeg/--ffprobe); leaving it None resolves via find_tools.
-    The engine defaults to :class:`StubEngine` because no real
-    file-first adapter exists yet.
+    ``engine`` bypasses selection for callers that already built an
+    adapter (tests, the bridge); otherwise ``engine_request`` selects:
+    ``auto`` (the default) uses the real ncnn engine when its binary,
+    models, and a lazy GPU probe frame succeed, else falls to the stub
+    with a note saying exactly why; ``stub`` forces the stub; ``ncnn``
+    forces the real engine and turns resolution failure into a named
+    missing-tool error. An :class:`UpscaleError` from the engine fails
+    OPEN (clause d): the run completes with a synchronized
+    original-resolution encode, the manifest stating what shipped and
+    why. :class:`EngineCancelled` closes the run as cancelled, never
+    as a failure.
     """
     if tools is None:
         tools = find_tools()
@@ -717,25 +798,85 @@ def run_file(
 
         # ---- upscale ----
         phase = begin_phase(PHASE_UPSCALE)
-        active_engine = engine or StubEngine()
-        engine_result = active_engine.run(prepared_path, plan, tools, cancel=cancel)
-        state.mezzanine_path = engine_result.mezzanine_path
-        state.engine_note = engine_result.note
-        state.engine_simulated = engine_result.simulated
+
+        def record_progress(frames_done: int, frames_total: int) -> None:
+            state.progress = {
+                "frames_done": frames_done,
+                "frames_total": frames_total,
+            }
+            state.touch()
+
+        mezzanine_for_encode: str | None = None
+        frames_done = 0
+        try:
+            if engine is not None:
+                active_engine = engine
+                selection_note: str | None = None
+            else:
+                from .engine_ncnn import select_engine
+
+                active_engine, selection_note = select_engine(
+                    engine_request,
+                    binary=realesrgan,
+                    models_dir=realesrgan_models,
+                )
+            state.engine_name = type(active_engine).__name__
+            if selection_note:
+                state.engine_note = selection_note
+            log(
+                f"engine selected: {state.engine_name}"
+                + (f" ({selection_note})" if selection_note else "")
+            )
+            engine_result = active_engine.run(
+                prepared_path, plan, tools,
+                cancel=cancel, on_progress=record_progress,
+            )
+        except UpscaleError as exc:
+            # FAIL OPEN (clause d): the job ships the synchronized
+            # original-resolution re-encode of the prepared file at
+            # planned bitrate/geometry -- a real, verified 720p HEVC
+            # file with NO AI pass -- and the manifest states exactly
+            # what shipped and why. Never a desynced upscale, never
+            # no output, never a silent AI-pass claim. (Selection-time
+            # UpscaleErrors fail open too: a substituted model is
+            # named as the reason, never run silently.)
+            log(f"WARNING: engine failed, failing open: {exc}")
+            if state.engine_name is None:
+                state.engine_name = "NcnnVulkanEngine"
+            state.fail_open = True
+            state.fail_open_reason = str(exc)
+            state.engine_note = f"fail open: {exc}"
+            state.engine_simulated = True  # shipped pixels are NOT AI
+            state.engine_model = None
+            state.engine_native_scale = None
+            state.mezzanine_path = prepared_path
+            mezzanine_for_encode = prepared_path
+        else:
+            state.mezzanine_path = engine_result.mezzanine_path
+            state.engine_note = selection_note or engine_result.note
+            state.engine_simulated = engine_result.simulated
+            state.engine_model = engine_result.engine_model
+            state.engine_native_scale = engine_result.engine_native_scale
+            state.frame_clock = engine_result.frame_clock
+            state.duration_gates = engine_result.duration_gates
+            state.model_hashes_verified = engine_result.model_hashes_verified
+            mezzanine_for_encode = engine_result.mezzanine_path
+            frames_done = engine_result.frames_done
         log(
-            f"engine: {type(active_engine).__name__}"
-            f"{' (simulated, no Real-ESRGAN pass)' if engine_result.simulated else ''}"
+            f"engine: {state.engine_name}"
+            f"{' (simulated, no Real-ESRGAN pass)' if state.engine_simulated else ''}"
         )
+        if state.fail_open:
+            log(f"fail open reason: {state.fail_open_reason}")
         end_phase(
             phase,
-            note=f"frames={engine_result.frames_done} "
-            f"mezzanine={engine_result.mezzanine_path}",
+            note=f"frames={frames_done} mezzanine={mezzanine_for_encode}",
         )
 
         # ---- encode ----
         phase = begin_phase(PHASE_ENCODE)
         run_command(
-            PHASE_ENCODE, build_encode_command(tools, plan, engine_result.mezzanine_path)
+            PHASE_ENCODE, build_encode_command(tools, plan, mezzanine_for_encode)
         )
         if not os.path.isfile(plan.output_path):
             raise RunError(f"encode phase produced no file at {plan.output_path}")
@@ -744,9 +885,14 @@ def run_file(
         # ---- verify ----
         phase = begin_phase(PHASE_VERIFY)
         verify_cmd = build_verification_command(tools, plan.output_path)
+        decode_cmd = build_decode_command(tools, plan.output_path)
         state.commands.append(verify_cmd)
+        state.commands.append(decode_cmd)
         log(f"verify command: {' '.join(verify_cmd)}")
-        verification = verify_output(tools, plan, runner=run_cmd, command=verify_cmd)
+        log(f"verify decode command: {' '.join(decode_cmd)}")
+        verification = verify_output(
+            tools, plan, runner=run_cmd, command=verify_cmd, decode_command=decode_cmd
+        )
         state.verification = verification
         state.touch()
         if verification.ok:
@@ -763,7 +909,7 @@ def run_file(
         state.finished_at = time.time()
         if not verification.ok:
             state.error = f"verification failed: {verification.error}"
-        manifest = _build_manifest(state, tools, report, plan, verification, active_engine)
+        manifest = _build_manifest(state, tools, report, plan, verification)
         manifest_path = log_root / f"{run_id}.manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         state.manifest_path = str(manifest_path)
@@ -778,6 +924,20 @@ def run_file(
             verification=verification,
             manifest_path=str(manifest_path),
         )
+    except EngineCancelled as exc:
+        # A cancel is NOT a failure (clause d): the state records the
+        # cancelled outcome, the manifest is written with
+        # outcome "cancelled", and EngineCancelled propagates so the
+        # caller (CLI/bridge) reports a cancel.
+        state.finished_at = time.time()
+        state.ok = False
+        state.cancelled = True
+        state.error = str(exc)
+        if state.log is not None:
+            log(f"cancelled in phase {state.current_phase}: {exc}")
+        exc.state = state  # type: ignore[attr-defined]
+        _write_failure_manifest(state, tools)
+        raise
     except (ProbeError, PlanError, VideoToolError, RunError) as exc:
         state.finished_at = time.time()
         state.ok = False
@@ -799,10 +959,17 @@ def _build_manifest(
     report: FileReport,
     plan: PlannedFile,
     verification: VerificationResult,
-    engine: EngineAdapter,
 ) -> dict:
     """Per-run artifact manifest (roadmap item 2): inputs, plan,
-    command lines, outputs, timings, verification."""
+    command lines, outputs, timings, verification.
+
+    Schema v2 (design real-engine-adapter.md Section 11) is ADDITIVE:
+    every v1 field is unchanged; the new engine-honesty fields state
+    exactly what shipped and why (clause d). ``engine`` names the
+    ATTEMPTED engine even under fail-open; ``engine_simulated``
+    describes the SHIPPED PIXELS (stub run: true; real engine clean
+    pass: false; real engine fail-open: true + ``fail_open_reason``).
+    """
     return {
         "vidlift_version": _vidlift_version(),
         "run": {
@@ -811,9 +978,19 @@ def _build_manifest(
             "finished_at": state.finished_at,
             "ok": state.ok,
             "error": state.error,
-            "engine": type(engine).__name__,
+            "outcome": "succeeded" if state.ok else "failed",
+            "engine": state.engine_name,
             "engine_simulated": state.engine_simulated,
             "engine_note": state.engine_note,
+            "engine_model": state.engine_model,
+            "engine_native_scale": state.engine_native_scale,
+            "fail_open": state.fail_open,
+            "fail_open_reason": state.fail_open_reason,
+            "frame_clock": state.frame_clock,
+            "model_hashes_verified": state.model_hashes_verified,
+            "duration_gates": state.duration_gates,
+            "benchmark_constant": state.benchmark_constant,
+            "cancelled": state.cancelled,
         },
         "tools": tools.to_dict(),
         "probe": {
@@ -867,7 +1044,19 @@ def _write_failure_manifest(state: RunState, tools: ToolBox) -> None:
                 "finished_at": state.finished_at,
                 "ok": False,
                 "error": state.error,
+                "outcome": "cancelled" if state.cancelled else "failed",
                 "error_phase": state.current_phase,
+                "engine": state.engine_name,
+                "engine_simulated": state.engine_simulated,
+                "engine_note": state.engine_note,
+                "engine_model": state.engine_model,
+                "engine_native_scale": state.engine_native_scale,
+                "fail_open": state.fail_open,
+                "fail_open_reason": state.fail_open_reason,
+                "frame_clock": state.frame_clock,
+                "model_hashes_verified": state.model_hashes_verified,
+                "duration_gates": state.duration_gates,
+                "cancelled": state.cancelled,
             },
             "tools": tools.to_dict() if tools else None,
             "artifacts": {

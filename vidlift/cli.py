@@ -175,6 +175,9 @@ def _cmd_run(
     ffmpeg: str | None,
     ffprobe: str | None,
     log_dir: str | None,
+    engine: str,
+    realesrgan: str | None,
+    realesrgan_models: str | None,
 ) -> int:
     """Drive one file through the runner and print its state.
 
@@ -194,6 +197,9 @@ def _cmd_run(
             output_dir=output_dir,
             tools=tools,
             log_dir=log_dir,
+            engine_request=engine,
+            realesrgan=realesrgan,
+            realesrgan_models=realesrgan_models,
         )
     except (ProbeError, PlanError, RunError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -211,11 +217,22 @@ def _cmd_run(
     print(f"output: {result.plan.output_path}")
     verdict = "verified" if result.verification.ok else "failed"
     print(f"verification: {verdict}")
-    if state.engine_simulated:
+    if state.fail_open:
+        # The final report states exactly what shipped and why (clause d):
+        # a fail-open run is a completed, verified re-encode with NO AI
+        # pass, and the summary never lets that pass unmentioned.
+        print(
+            "engine: FAILED OPEN - no AI pass shipped; output is a real "
+            "re-encode of the prepared source"
+        )
+        print(f"fail-open reason: {state.fail_open_reason}")
+    elif state.engine_simulated:
         print(
             "engine: STUB (no Real-ESRGAN pass; output is a real re-encode "
             "of the prepared source, not an AI upscale)"
         )
+    if state.engine_note:
+        print(f"engine note: {state.engine_note}")
     print(f"log: {state.log.path if state.log else 'none'}")
     print(f"manifest: {result.manifest_path}")
     print("phases:")
@@ -299,6 +316,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-dir",
         help="directory for run logs/manifests (default: INPUT_DIR/.vidlift-runs)",
     )
+    run_parser.add_argument(
+        "--engine",
+        choices=["auto", "stub", "ncnn"],
+        default="auto",
+        help=(
+            "upscale engine: auto = real ncnn engine when it resolves and a "
+            "GPU probe frame succeeds, else the stub with a note; "
+            "stub = force the honest no-AI stub; ncnn = force the real "
+            "engine (missing tools become named setup errors)"
+        ),
+    )
+    run_parser.add_argument(
+        "--realesrgan",
+        help="explicit realesrgan-ncnn-vulkan path (else VIDLIFT_REALESRGAN_NCNN, then bundled)",
+    )
+    run_parser.add_argument(
+        "--realesrgan-models",
+        help="explicit model dir (else VIDLIFT_REALESRGAN_MODELS, then models/ beside the binary)",
+    )
     sub.add_parser("gui", help="open the VidLift planning workbench")
     return parser
 
@@ -324,6 +360,9 @@ def main(argv: list[str] | None = None) -> int:
             ffmpeg=args.ffmpeg,
             ffprobe=args.ffprobe,
             log_dir=args.log_dir,
+            engine=args.engine,
+            realesrgan=args.realesrgan,
+            realesrgan_models=args.realesrgan_models,
         )
     if args.command == "gui":
         from .gui import main as gui_main

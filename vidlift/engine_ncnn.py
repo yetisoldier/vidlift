@@ -52,6 +52,7 @@ from .run import (
     EngineAdapter,
     EngineCancelled,
     EngineResult,
+    MissingToolError,
     ToolBox,
     UpscaleError,
 )
@@ -71,8 +72,10 @@ __all__ = [
     "PNGExtent",
     "duration_gate",
     "gate_tolerance",
+    "gpu_probe_frame",
     "probe_duration_seconds",
     "probe_frame_clock",
+    "select_engine",
     "tile_argument",
 ]
 
@@ -304,6 +307,175 @@ class EngineInvocation:
     chunk_index: int
     input_frames: int
     tile: int
+
+
+# Lazy "can this machine even run it" probe cache (design Section 5):
+# one probe frame per (binary, models_dir) per process — auto selection
+# must not pay the probe cost for every run in a long-lived bridge.
+_PROBE_CACHE: dict[tuple[str, str], tuple[bool, str]] = {}
+
+
+def _tiny_png(size: int = 64) -> bytes:
+    """A minimal valid solid-gray RGB PNG the real engine can decode.
+
+    Written byte-by-byte (signature, IHDR, one zlib IDAT of filter-0
+    scanlines, IEND) because PIL is deliberately not a dependency and
+    the probe must run inside any packaged environment.
+    """
+    import zlib
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            len(data).to_bytes(4, "big")
+            + tag
+            + data
+            + (zlib.crc32(tag + data) & 0xFFFFFFFF).to_bytes(4, "big")
+        )
+
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + bytes([120]) * (size * 3) for _ in range(size))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(raw, 6))
+        + chunk(b"IEND", b"")
+    )
+
+
+def gpu_probe_frame(
+    binary: str,
+    models_dir: str,
+    *,
+    spec: ModelSpec | None = None,
+    timeout_s: float = 180.0,
+    run_fn=subprocess.run,
+    workspace: Path | None = None,
+) -> tuple[bool, str]:
+    """Run one REAL tiny frame through the engine and verify its output.
+
+    The auto-selection gate (design Section 5, the sibling's "can this
+    machine even run it" pattern): the binary must decode the probe
+    PNG, run the model, and emit the EXACT native-scale output geometry
+    (64x64 -> 128x128 at scale 2). Cached per process per
+    (binary, models_dir). Never raises — every failure is
+    ``(False, reason)`` so auto selection can fall to the stub with
+    the reason recorded (design r1: a bad binary fails here, not
+    mid-run). """
+    spec = spec or MODEL_TABLE["live-action"]
+    key = (str(binary), str(models_dir))
+    if key in _PROBE_CACHE:
+        return _PROBE_CACHE[key]
+    tmp: Path | None = None
+    ok, reason = False, ""
+    try:
+        if workspace is None:
+            import tempfile
+
+            tmp = Path(tempfile.mkdtemp(prefix="vidlift-engine-probe-"))
+        else:
+            tmp = workspace
+        # The engine requires input/output of the SAME type (file+file or
+        # dir+dir); the real chunk flow is dir+dir, so the probe mirrors it.
+        in_dir = tmp / "in"
+        out_dir = tmp / "out"
+        in_dir.mkdir(exist_ok=True)
+        out_dir.mkdir(exist_ok=True)
+        (in_dir / "probe.png").write_bytes(_tiny_png())
+        cmd = [
+            binary,
+            "-i", str(in_dir),
+            "-o", str(out_dir),
+            "-s", str(spec.native_scale),
+            "-t", str(tile_argument(64)),
+            "-m", str(models_dir),
+            "-n", spec.name,
+            "-f", "png",
+        ]
+        try:
+            proc = run_fn(cmd, capture_output=True, text=True, timeout=timeout_s)
+        except Exception as exc:  # OSError, TimeoutExpired, driver hangs
+            ok, reason = False, f"probe frame could not run: {type(exc).__name__}: {exc}"
+        else:
+            if proc.returncode != 0:
+                tail = (getattr(proc, "stderr", "") or "").strip()[-200:]
+                ok, reason = (
+                    False,
+                    f"probe frame exited {proc.returncode}: {tail or 'no diagnostic'}",
+                )
+            else:
+                out_png = out_dir / "probe.png"
+                size = _png_size(out_png) if out_png.is_file() else None
+                expected = 64 * spec.native_scale
+                if size is None:
+                    ok, reason = False, "probe frame produced no output PNG"
+                elif (size.width, size.height) != (expected, expected):
+                    ok, reason = (
+                        False,
+                        f"probe frame geometry {size.width}x{size.height} "
+                        f"is not the exact {expected}x{expected} native-scale result",
+                    )
+                else:
+                    ok, reason = True, (
+                        f"probe frame ok (64x64 -> {expected}x{expected})"
+                    )
+    finally:
+        if tmp is not None and workspace is None:
+            shutil.rmtree(tmp, ignore_errors=True)
+    _PROBE_CACHE[key] = (ok, reason)
+    return _PROBE_CACHE[key]
+
+
+def select_engine(
+    request: str = "auto",
+    *,
+    binary: str | None = None,
+    models_dir: str | None = None,
+    tools: ToolBox | None = None,
+) -> tuple[EngineAdapter, str | None]:
+    """Resolve the ``--engine {auto,stub,ncnn}`` request (design Section 5).
+
+    - ``stub``: the passthrough stub, forced.
+    - ``ncnn``: forces the real engine; a resolution failure raises the
+      named :class:`MissingToolError` (a setup problem), and a hash
+      mismatch raises :class:`UpscaleError` (the run then fails open
+      honestly per Section 9).
+    - ``auto`` (the default): ncnn when the binary + models resolve AND
+      the lazy GPU probe frame succeeds; anything else falls to the
+      stub with a note saying exactly why (design r1: a bad binary
+      fails the probe, never the run).
+
+    Returns ``(engine, note)`` — ``note`` is the auto-fallback reason
+    for the manifest's ``engine_note`` when auto lands on the stub.
+    """
+    from .run import StubEngine
+
+    if request == "stub":
+        return StubEngine(), None
+    if request == "ncnn":
+        binary_path = resolve_realesrgan(binary)
+        models = resolve_realesrgan_models(binary_path, models_dir)
+        verify_model_artifacts(models, MODEL_TABLE["live-action"].name)
+        return (
+            NcnnVulkanEngine(binary=binary_path, models_dir=models),
+            None,
+        )
+    if request == "auto":
+        try:
+            binary_path = resolve_realesrgan(binary)
+            models = resolve_realesrgan_models(binary_path, models_dir)
+            verify_model_artifacts(models, MODEL_TABLE["live-action"].name)
+            ok, reason = gpu_probe_frame(binary_path, models)
+            if not ok:
+                note = f"auto: stub engine ({reason})"
+                return StubEngine(note=note), note
+            return (
+                NcnnVulkanEngine(binary=binary_path, models_dir=models),
+                None,
+            )
+        except (MissingToolError, UpscaleError) as exc:
+            note = f"auto: stub engine ({exc})"
+            return StubEngine(note=note), note
+    raise UpscaleError(f"unknown engine request: {request!r}")
 
 
 class NcnnVulkanEngine(EngineAdapter):
