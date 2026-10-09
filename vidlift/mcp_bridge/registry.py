@@ -312,10 +312,15 @@ class Registry:
     # -- queue views -----------------------------------------------------------
 
     def queued(self) -> list[JobRecord]:
-        return [
-            r for r in self._jobs.values()
-            if r.state == "queued"
-        ]
+        # The N1 fix: snapshot under the lock. The worker thread calls
+        # this from _claim_next while the MCP message loop enqueues;
+        # an unlocked iteration raised RuntimeError mid-enqueue and
+        # killed the single worker (D1's consequence class).
+        with self._lock:
+            return [
+                r for r in self._jobs.values()
+                if r.state == "queued"
+            ]
 
     def queue_position(self, job_id: str) -> int | None:
         """0-based position among queued jobs (submission order), None
@@ -331,12 +336,21 @@ class Registry:
         return None
 
     def running(self) -> list[JobRecord]:
-        return [r for r in self._jobs.values() if r.state == "running"]
+        # Same N1 class: snapshot under the lock (status tool calls
+        # this from the message-loop thread while enqueues land).
+        with self._lock:
+            return [
+                r for r in self._jobs.values()
+                if r.state == "running"
+            ]
 
     def history(self) -> list[JobRecord]:
-        records = [
-            r for r in self._jobs.values() if r.state in TERMINAL_STATES
-        ]
+        # Same N1 class: snapshot under the lock, sort the snapshot.
+        with self._lock:
+            records = [
+                r for r in self._jobs.values()
+                if r.state in TERMINAL_STATES
+            ]
         records.sort(key=lambda r: r.finished_at or 0, reverse=True)
         return records
 

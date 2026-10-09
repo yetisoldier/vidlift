@@ -370,24 +370,26 @@ class JobExecutor:
         return None
 
     def _worker_loop(self) -> None:
+        # The N1 amendment to layer c: the guard must cover the CLAIM
+        # path too, not just _run_job — any bug anywhere in the loop
+        # body kills the single worker and silently starves the queue.
         while not self._stopping:
-            job = self._claim_next()
-            if job is None:
-                # bounded idle poll; a new enqueue shortens the latency
-                self._wake.wait(timeout=0.2)
-                self._wake.clear()
-                continue
             try:
+                job = self._claim_next()
+                if job is None:
+                    # bounded idle poll; a new enqueue shortens latency
+                    self._wake.wait(timeout=0.2)
+                    self._wake.clear()
+                    continue
                 self._run_job(job)
             except Exception as exc:
-                # The D1 lesson (layer c): the single worker thread
-                # must NEVER die on one job's bug — log and keep
-                # serving, or every later job starves queued with no
-                # diagnostic.
+                # The D1/N1 lesson: the single worker thread must NEVER
+                # die on any per-iteration bug — log and keep serving,
+                # or every later job starves queued with no diagnostic.
                 log_event = getattr(self.services, "log_event", None)
                 if log_event is not None:
                     log_event(
-                        f"worker survived job {job.job_id} failure: "
+                        f"worker survived loop failure: "
                         f"{type(exc).__name__}: {exc}"
                     )
 

@@ -478,6 +478,45 @@ def test_t4_raced_terminal_close_never_kills_the_worker(tmp_path):
 
 
 
+# ---- t4 (N1 regression): unlocked queued() iteration under concurrent enqueue
+
+
+def test_t4_concurrent_enqueue_during_claim_iteration_never_raises(tmp_path):
+    marker("t4")
+    # N1: queued() iterated self._jobs.values() unlocked while enqueue
+    # inserted under the lock from the message-loop thread; a landing
+    # enqueue raised RuntimeError and killed the single worker. The
+    # readers now snapshot under the lock, so this hammer must be clean.
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    registry = Registry(state)
+    for i in range(200):
+        registry.enqueue(kind="run", paths=[f"/x/{i}.avi"], options={})
+
+    errors: list[str] = []
+    done = threading.Event()
+
+    def enqueuer():
+        for n in range(400):
+            registry.enqueue(kind="run", paths=[f"/y/{n}.avi"], options={})
+        done.set()
+
+    thread = threading.Thread(target=enqueuer)
+    thread.start()
+    # on the unfixed code this reproduced within ~0.02s of hammering
+    while not done.is_set():
+        try:
+            registry.queued()
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            break
+    thread.join(timeout=5)
+    assert not errors, f"unlocked iteration raised: {errors}"
+    # the queue survived intact: 200 seeded + 400 enqueued, all present
+    assert len(registry.queued()) == 600
+
+
+
 # ---- t5: registry persistence + restart sweep ----------------------------------------
 
 
