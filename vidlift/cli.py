@@ -243,6 +243,72 @@ def _cmd_run(
     return 0 if result.ok else 1
 
 
+def _cmd_benchmark(
+    file_path: str,
+    *,
+    duration: float,
+    engine_request: str,
+    ffmpeg: str | None,
+    ffprobe: str | None,
+    realesrgan: str | None,
+    realesrgan_models: str | None,
+    log_dir: str | None,
+) -> int:
+    """Measure one benchmark slice and print its provenance (roadmap 4).
+
+    Exit codes: 0 measured, 1 measurement failure, 2 missing tool.
+    """
+    try:
+        tools = find_tools(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    except MissingToolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        from .engine_ncnn import select_engine
+
+        engine, _note = select_engine(
+            engine_request, binary=realesrgan, models_dir=realesrgan_models
+        )
+    except MissingToolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    from .benchmark import BenchmarkCacheError, run_benchmark
+
+    try:
+        result = run_benchmark(
+            file_path,
+            tools=tools,
+            engine=engine,
+            slice_seconds=duration,
+            workdir=log_dir,
+        )
+    except (BenchmarkCacheError, ProbeError, PlanError, RunError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"sample: {file_path}")
+    print(f"engine: {result.engine}")
+    if result.model:
+        print(
+            f"model: {result.model} (native scale {result.native_scale})"
+        )
+    print(f"geometry bucket: {result.geometry_bucket}")
+    print(f"slice: {result.duration_sliced_s:g} s, {result.frames} frames")
+    print(f"engine phase wall time: {result.wall_seconds:.3f} s")
+    print(f"seconds per frame: {result.seconds_per_frame:.6f}")
+    # provenance FIRST-CLASS: a stub benchmark is machinery timing and
+    # the summary says so, never letting the number pose as an AI pass
+    if result.engine_simulated:
+        print("engine_simulated: true")
+        print(f"note: stub numbers; not an AI-pass measurement.")
+    else:
+        print("engine_simulated: false")
+    for note in result.notes:
+        print(f"note: {note}")
+    print(f"measured at: {result.measured_at:.0f}")
+    print("cache: benchmark constant recorded for this engine+geometry bucket")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vidlift",
@@ -335,6 +401,45 @@ def build_parser() -> argparse.ArgumentParser:
         "--realesrgan-models",
         help="explicit model dir (else VIDLIFT_REALESRGAN_MODELS, then models/ beside the binary)",
     )
+    benchmark_parser = sub.add_parser(
+        "benchmark",
+        help="measure one sample slice to pin an ETA constant for this machine",
+    )
+    benchmark_parser.add_argument(
+        "file", metavar="FILE", help="a real sample video file on this machine"
+    )
+    benchmark_parser.add_argument(
+        "--duration",
+        type=float,
+        default=30,
+        help="slice length in seconds, clamped to [10, 120] (default: 30)",
+    )
+    benchmark_parser.add_argument(
+        "--engine",
+        choices=["auto", "stub", "ncnn"],
+        default="auto",
+        help="engine to benchmark through (default: auto)",
+    )
+    benchmark_parser.add_argument(
+        "--realesrgan",
+        help="explicit realesrgan-ncnn-vulkan path",
+    )
+    benchmark_parser.add_argument(
+        "--realesrgan-models",
+        help="explicit model dir",
+    )
+    benchmark_parser.add_argument(
+        "--ffmpeg",
+        help="explicit ffmpeg path (else VIDLIFT_FFMPEG, then PATH)",
+    )
+    benchmark_parser.add_argument(
+        "--ffprobe",
+        help="explicit ffprobe path (else VIDLIFT_FFPROBE, then PATH)",
+    )
+    benchmark_parser.add_argument(
+        "--work-dir",
+        help="scratch directory for the benchmark slice (default: a temp dir)",
+    )
     sub.add_parser("gui", help="open the VidLift planning workbench")
     return parser
 
@@ -363,6 +468,17 @@ def main(argv: list[str] | None = None) -> int:
             engine=args.engine,
             realesrgan=args.realesrgan,
             realesrgan_models=args.realesrgan_models,
+        )
+    if args.command == "benchmark":
+        return _cmd_benchmark(
+            args.file,
+            duration=args.duration,
+            engine_request=args.engine,
+            ffmpeg=args.ffmpeg,
+            ffprobe=args.ffprobe,
+            realesrgan=args.realesrgan,
+            realesrgan_models=args.realesrgan_models,
+            log_dir=args.work_dir,
         )
     if args.command == "gui":
         from .gui import main as gui_main

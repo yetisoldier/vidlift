@@ -9,7 +9,7 @@ consumes this plan.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .probe import (
@@ -25,6 +25,7 @@ __all__ = [
     "BatchPlan",
     "PlanError",
     "PlannedFile",
+    "attach_estimate",
     "build_batch_plan",
     "build_file_plan",
     "estimate_video_bitrate_kbps",
@@ -62,6 +63,11 @@ class PlannedFile:
     expectation: str
     subtitle_note: str
     process_verdict: str
+    # P3 additive (attach_estimate): measured ETA mapping from the
+    # benchmark cache, None when no constant exists for this geometry
+    # bucket. Additive with a default, so every existing constructor
+    # call and consumer is unaffected.
+    eta_estimate: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -218,3 +224,27 @@ def build_batch_plan(
             for report in reports
         ]
     )
+
+
+def attach_estimate(
+    plan: PlannedFile,
+    estimates: dict,
+    *,
+    estimate_fn=None,
+) -> PlannedFile:
+    """Return ``plan`` with a measured wall-clock estimate attached (P3).
+
+    The one additive seam the design pins (real-engine-adapter.md
+    Section 2): UI/CLI/MCP render measured ETAs from the benchmark
+    cache without the planner ever growing ETA math. ``estimates`` is
+    the dict ``load_estimates`` returns; ``estimate_fn`` defaults to
+    :func:`vidlift.benchmark.estimate_eta` (injected to keep plan.py
+    import-free of the benchmark/runner layers). The estimate mapping
+    rides in ``PlannedFile.eta_estimate`` (None when no measured
+    constant exists for this geometry bucket — no ETA rather than a
+    projected one, clause c). No existing plan math changes.
+    """
+    if estimate_fn is None:
+        from .benchmark import estimate_eta as estimate_fn
+    eta = estimate_fn(plan, estimates=estimates)
+    return replace(plan, eta_estimate=eta)
