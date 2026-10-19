@@ -8,10 +8,13 @@ architecture.md forbids). Where this module deviates from or narrows
 the sibling, the deviation is stated in a comment citing the design
 section. Binding design: ``docs/designs/real-engine-adapter.md``.
 
-Implements roadmap "Next" item 1 acceptance clauses verbatim:
-  a. frame-clock discipline (strict avg -> r -> FAIL resolution, never
-     a default) + duration sanity gates P and M with the
-     max(0.5 s, 0.01%) tolerance and the unknown-reference refusal;
+Implements roadmap "Next" item 1 acceptance clauses verbatim
+(clause a's clock discipline is SUPERSEDED by the v0.4.0 decode-truth
+stamp below; the max(0.5 s, 0.01%) duration gates survive as gate P
+and gate M's demoted record):
+  a. frame-clock discipline (never a default) + duration sanity
+     gates P and M with the max(0.5 s, 0.01%) tolerance and the
+     unknown-reference refusal;
   b. explicit tiling derived from the MEASURED frame extent
      (extent+64, ceil to 64, floor 512); ``-t 0`` is unreachable;
   d. ``UpscaleError`` (fail open) and ``EngineCancelled`` (a cancel,
@@ -19,20 +22,45 @@ Implements roadmap "Next" item 1 acceptance clauses verbatim:
   g. model artifacts consumed with sha256 verified at first use per
      process, BEFORE any frame is extracted.
 
-Chunk flow (design Section 7): extract wall-time-addressed PNG frames
-per chunk (``-ss/-t`` on the PREPARED file — VidLift's prepare phase
-already normalized frames, so extraction is a decode+copy; the sibling
-applied its prepare filter here because ITS input was the raw rip),
-run the engine once per chunk, reassemble each chunk's output frames
-into an ffv1 segment stamped with the prepared file's probed clock
-(the exact rational string, never a default), concat the segments,
-gate the mezzanine duration against the prepared duration, and hand
-the runner the mezzanine path. The workdir is kept on failure/cancel
-for clause-e triage and deleted on success.
+Chunk flow (design Section 7): extract frame-index-addressed PNG
+frames per chunk, run the engine once per chunk, reassemble each
+chunk's output frames into an ffv1 segment stamped with the DERIVED
+clock, concat the segments, gate the mezzanine (exact frame count +
+clock vs the shipped-audio extent), and hand the runner the
+mezzanine path. The workdir is kept on failure/cancel for clause-e
+triage (with a per-chunk resume checkpoint) and deleted on success.
+
+v0.4.0 (binding design: docs/designs/v0.4.0-decode-truth-chunking.md,
+the port of bluray-to-mp4's v0.2.33 frame-exact chunking and v0.2.34
+derived-stamp-rate field lessons, read-only reference):
+
+- The stamp clock is DERIVED from decode-truth — the prepared file's
+  decode-counted frame total over the shipped audio's measured extent
+  — snapped to a canonical rate or refused pre-GPU. Container
+  r/avg_frame_rate fields are diagnostic-only, never stamp inputs
+  (design B.2; the .34 lesson: a consistently lying clock family passes
+  every metadata gate).
+- Chunks are addressed by FRAME INDEX (``select='between(n,a,b)```
+  with ``-vsync 0``), never by ``-ss/-t`` wall-time windows; every
+  chunk asserts its exact frame count in and out (design B.3; the .33
+  lesson: timestamp addressing drifts, index addressing cannot).
+- The mezzanine is gated twice: exact frame equality against the
+  prepared total, and duration against the SHIPPED-AUDIO extent at
+  max(2.0 s, 0.1%) (design B.4). Old gates P/M stay as records; gate M
+  is demoted to a diagnostic (its prepared-duration reference cannot
+  see a consistent lie).
+- A rejected mezzanine is RETAINED (renamed ``.rejected-<ts>``) with a
+  diagnostic JSON, never deleted (design B.5).
+- Long steps emit step labels + heartbeats through ``on_step`` so the
+  runner's state stays observably alive (design B.6).
+- A per-chunk checkpoint (``chunk_state.json``) lets an interrupted
+  run skip completed GPU chunks on retry — params and total-frames
+  proven equal, or the workdir is deleted wholesale (design B.7).
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import shlex
@@ -63,18 +91,28 @@ from .tools_realesrgan import (
 )
 
 __all__ = [
+    "AudioExtent",
+    "CANONICAL_RATES",
     "CHUNK_SECONDS",
+    "CLOCK_GATE_TOLERANCE_FRACTION",
+    "CLOCK_GATE_TOLERANCE_SECONDS",
+    "MIN_AUDIO_EXTENT_SECONDS",
     "MIN_CHUNK_SECONDS",
+    "SNAP_TOLERANCE_FRACTION",
     "EngineInvocation",
     "MODEL_TABLE",
     "ModelSpec",
     "NcnnVulkanEngine",
     "PNGExtent",
+    "derive_stamp_clock",
     "duration_gate",
     "gate_tolerance",
+    "probe_audio_extent_seconds",
+    "probe_frame_count",
     "gpu_probe_frame",
     "probe_duration_seconds",
     "probe_frame_clock",
+    "snap_to_canonical_rate",
     "select_engine",
     "tile_argument",
 ]
@@ -90,6 +128,271 @@ Runner = Callable[[str, list[str]], "tuple[int, str, str]"]
 CHUNK_SECONDS = 120  # default; >= 10; env override: VIDLIFT_CHUNK_SECONDS
 MIN_CHUNK_SECONDS = 10
 
+# Derived-stamp snap set (v0.4.0 design B.2; port of bluray-to-mp4
+# v0.2.34 §1.2, read-only reference). The stamp clock is DERIVED from
+# decode-truth (prepared frame count / shipped-audio extent) and snapped
+# to one of these canonical tokens; container r/avg fields are
+# diagnostic-only, never derivation inputs. 50 and 60000/1001 stay in
+# the set because bwdif's field-rate arm produces genuine 50/59.94
+# prepared files, and those must snap, not refuse.
+CANONICAL_RATES = (
+    "24000/1001",
+    "24",
+    "25",
+    "30000/1001",
+    "50",
+    "60000/1001",
+)
+
+# Nearest-neighbor snap tolerance: 0.1% relative, with a 1e-9 ulp guard
+# so float renderings of the canonical rationals sit on the correct
+# side of the boundary (inclusive; port of v0.2.34 §1.2 verbatim).
+SNAP_TOLERANCE_FRACTION = 0.001
+
+# Duration-denominator sanity minimums (v0.4.0 design B.2; port of
+# v0.2.34 §1.1(3)): an extent under 10 s or a stream-vs-format skew
+# over 25% is a broken probe, not a stamp source.
+MIN_AUDIO_EXTENT_SECONDS = 10.0
+MAX_AUDIO_PROVENANCE_SKEW_FRACTION = 0.25
+
+# Clock gate (B.4): mezzanine vs the shipped-audio extent at
+# max(2.0 s, 0.1%) — kills rate-class desync (25% apart) with two
+# orders of magnitude of headroom, passes legit lead-in/out skew
+# (seconds) with 5x headroom (port of v0.2.34 §3 constants).
+CLOCK_GATE_TOLERANCE_SECONDS = 2.0
+CLOCK_GATE_TOLERANCE_FRACTION = 0.001
+
+# Decode-count probe heartbeat cadence (B.6): the step seam re-fires
+# at this interval while the minutes-long -count_frames pass runs, so
+# last_activity_at advances and the status names the running step.
+PROBE_HEARTBEAT_SECONDS = 5.0
+
+# Per-chunk resume checkpoint (B.7): written in the engine workdir,
+# atomically, after every completed chunk.
+CHUNK_STATE_FILENAME = "chunk_state.json"
+
+
+def _canonical_rate_value(token: str) -> float:
+    num, sep, den = token.partition("/")
+    if sep:
+        return float(num) / float(den)
+    return float(num)
+
+
+def snap_to_canonical_rate(derived: float) -> tuple[str, bool]:
+    """Nearest canonical token within 0.1% relative (B.2; .34 §1.2).
+
+    Returns ``(token, snapped)``. Nearest-neighbor FIRST, then the
+    inclusive tolerance check — the 23.976-vs-24 windows overlap, so
+    "nearest wins" is the disambiguation that keeps boundary rates
+    deterministic. Unsnappable -> ``(nearest_token, False)``; callers
+    raise the named refusal (never a default, never a guess).
+    """
+    derived = float(derived)
+    nearest = min(
+        CANONICAL_RATES,
+        key=lambda token: abs(derived - _canonical_rate_value(token)),
+    )
+    canonical = _canonical_rate_value(nearest)
+    tolerance = canonical * (SNAP_TOLERANCE_FRACTION + 1e-9)
+    return nearest, abs(derived - canonical) <= tolerance
+
+
+@dataclass(frozen=True)
+class AudioExtent:
+    """The measured shipped-audio extent and its provenance (B.2).
+
+    The encode maps ``1:a:0`` from the SOURCE file (run.py
+    build_encode_command), so the stamp denominator is the source's
+    first audio stream duration when usable, else its format duration.
+    BOTH figures ride along when both exist: the two-provenance
+    denominator rule derives against each and requires the same snap
+    token (the Karen snap-band defense).
+    """
+
+    seconds: float | None  # the chosen extent (stream preferred)
+    source: str  # "stream" | "format"
+    stream_seconds: float | None = None
+    format_seconds: float | None = None
+
+
+def probe_audio_extent_seconds(
+    source_path: str, *, ffprobe: str, runner: Runner
+) -> AudioExtent:
+    """Measure the shipped-audio extent from the SOURCE file (B.2).
+
+    ``a:0`` exactly matches the encode's ``-map 1:a:0`` — if audio
+    selection ever becomes configurable, this ordinal MUST follow the
+    encode map or the derived clock is silently wrong (pinned at both
+    seams; B.10 risk 6). Sanity minimums port v0.2.34 §1.1(3):
+    missing, <= 0, or < 10 s refuses; a stream-vs-format skew > 25%
+    refuses (a broken probe, not a stamp source). Refusal raises the
+    named :class:`UpscaleError` -> fail-open, pre-GPU.
+    """
+    stream_seconds: float | None = None
+    code, stdout, _stderr = runner(
+        ffprobe,
+        [
+            "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=duration",
+            "-of", "csv=p=0",
+            source_path,
+        ],
+    )
+    if code == 0:
+        for line in stdout.strip().splitlines():
+            try:
+                value = float(line.strip())
+            except ValueError:
+                continue
+            if value > 0:
+                stream_seconds = value
+                break
+    format_seconds = probe_duration_seconds(
+        source_path, ffprobe=ffprobe, runner=runner
+    )
+    if stream_seconds is not None and stream_seconds <= 0:
+        stream_seconds = None  # a non-positive tag is absent, not a source
+    if format_seconds is not None and format_seconds <= 0:
+        format_seconds = None
+    if stream_seconds is None and format_seconds is None:
+        raise UpscaleError(
+            f"no usable audio extent on source {source_path}: neither the "
+            "a:0 stream duration nor the format duration exists; refusing "
+            "to derive a stamp clock from nothing"
+        )
+    if stream_seconds is not None and format_seconds is not None:
+        larger = max(stream_seconds, format_seconds)
+        skew = abs(stream_seconds - format_seconds) / larger
+        if skew > MAX_AUDIO_PROVENANCE_SKEW_FRACTION:
+            raise UpscaleError(
+                f"audio extent provenance skew on {source_path}: a:0 stream "
+                f"reports {stream_seconds:.3f}s, format reports "
+                f"{format_seconds:.3f}s ({skew * 100:.1f}% apart, over the "
+                f"{MAX_AUDIO_PROVENANCE_SKEW_FRACTION * 100:.0f}% sanity "
+                "maximum); a broken probe is not a stamp source"
+            )
+    chosen = stream_seconds if stream_seconds is not None else format_seconds
+    assert chosen is not None  # guarded above
+    if chosen < MIN_AUDIO_EXTENT_SECONDS:
+        raise UpscaleError(
+            f"audio extent on source {source_path} is unusable as a stamp "
+            f"denominator: {chosen:.3f}s is under the "
+            f"{MIN_AUDIO_EXTENT_SECONDS:g} s sanity minimum"
+        )
+    return AudioExtent(
+        seconds=chosen,
+        source="stream" if stream_seconds is not None else "format",
+        stream_seconds=stream_seconds,
+        format_seconds=format_seconds,
+    )
+
+
+def derive_stamp_clock(
+    *,
+    source_path: str,
+    prepared_total_frames: int,
+    audio: AudioExtent,
+    prepared_duration: float | None,
+    container_clock: dict | None,
+) -> dict:
+    """Derive the stamp token from decode-truth, never container fields
+    (B.2; port of bluray-to-mp4 v0.2.34 §1, adapted to VidLift's shape).
+
+    Numerator: ``prepared_total_frames`` — measured on the PREPARED file
+    AFTER any prepare transform (IVTC decimate, bwdif field rate), so
+    the stamp matches the frames actually being reassembled. Do not
+    "simplify" this back to source-side counting; a preparer that
+    changes the frame count is safe only because the numerator is
+    post-transform.
+
+    Denominator: the shipped audio's measured extent (the encode maps
+    ``1:a:0`` from the source). Provenance checks, in order:
+    (1) two-provenance rule — when the source carries BOTH a usable
+    a:0 stream extent and a format duration, each derivation must snap
+    to the same canonical token (the 23.976-vs-24 band is exactly
+    where a few-tenths-percent audio lie lands);
+    (2) cross-check against the prepared file's own measured format
+    duration (N / prepared_duration) — under-reported audio moves the
+    audio-derived snap while the prepared-derived figure stays in the
+    true family, and disagreement across provenance is the signature
+    (the Karen snap-band finding, ported as a first-class gate);
+    (3) all available provenances must agree on one token; container
+    r/avg fields stay diagnostic-only, never derivation inputs.
+
+    Unsnappable primary -> a named refusal quoting the derived rate,
+    both operands, and the nearest candidate — raised BEFORE any chunk
+    extraction (fail-open in seconds, never hours). Returns the
+    frame-clock provenance dict for the manifest (schema v2 additive).
+    """
+    frames = int(prepared_total_frames)
+    primary_seconds = audio.seconds
+    assert primary_seconds is not None  # probe_audio_extent_seconds guards
+    derived_raw = frames / primary_seconds
+    token, snapped = snap_to_canonical_rate(derived_raw)
+    if not snapped:
+        raise UpscaleError(
+            f"derived stamp rate {derived_raw:.6f} fps "
+            f"({frames} frames / {primary_seconds:.3f}s audio extent on "
+            f"{source_path}) does not snap to any canonical rate; nearest "
+            f"candidate {token!r} is outside the 0.1% tolerance; refusing "
+            "to stamp a mezzanine from an unsnappable clock"
+        )
+
+    cross_provenance: list[dict] = []
+    checks: list[tuple[str, float]] = []
+    if audio.stream_seconds is not None:
+        checks.append(("audio_stream_extent", audio.stream_seconds))
+    if audio.format_seconds is not None:
+        checks.append(("source_format_duration", audio.format_seconds))
+    if prepared_duration is not None and float(prepared_duration) > 0:
+        checks.append(("prepared_format_duration", float(prepared_duration)))
+
+    for name, seconds in checks:
+        derived = frames / seconds
+        candidate, candidate_snapped = snap_to_canonical_rate(derived)
+        cross_provenance.append(
+            {
+                "provenance": name,
+                "seconds": seconds,
+                "derived_fps": derived,
+                "snapped": candidate_snapped,
+                "token": candidate if candidate_snapped else None,
+            }
+        )
+        # An unsnappable secondary provenance is a diagnostic, not a
+        # refusal: the 25% skew sanity gate (probe_audio_extent_seconds)
+        # already refuses gross disagreement, and the primary + prepared
+        # evidence still anchor the token. A snappable secondary that
+        # snaps DIFFERENTLY is the lie signature -> refuse (rules 1-2).
+        if candidate_snapped and candidate != token:
+            raise UpscaleError(
+                f"cross-provenance snap disagreement: the audio-derived "
+                f"rate snaps to {token!r} ({frames} frames / "
+                f"{primary_seconds:.3f}s {audio.source} audio extent), but "
+                f"the {name} derivation ({frames} frames / {seconds:.3f}s = "
+                f"{derived:.6f} fps) snaps to {candidate!r}; a consistently "
+                "lying clock family cannot be told apart from a broken "
+                "probe here, so the mezzanine is refused rather than "
+                "stamped from one provenance alone"
+            )
+
+    container = container_clock or {}
+    return {
+        "value": token,  # the canonical token; never a container string
+        "source": "derived",
+        "derived_raw": derived_raw,
+        "snapped": True,
+        "audio_extent_s": primary_seconds,
+        "audio_source": audio.source,
+        "prepared_total_frames": frames,
+        # diagnostic-only container fields (B.2; .34 §1.4): the
+        # declared clock family, recorded — never derivation inputs
+        "container_avg_frame_rate": container.get("avg_frame_rate_raw"),
+        "container_r_frame_rate": container.get("r_frame_rate_raw"),
+        "cross_provenance": cross_provenance,
+    }
 # Duration gate tolerance (clause a; port of v0.2.27's measured values):
 # frame-scale container rounding plus a tiny proportional allowance,
 # rejecting any viewer-visible accumulation. The old max(5 s, 2%) gate
@@ -169,6 +472,17 @@ def duration_gate(
     return record
 
 
+def clock_gate_tolerance(reference_s: float) -> float:
+    """max(2.0 s, 0.1%) — the mezzanine-vs-audio clock gate tolerance
+    (B.4; port of v0.2.34 §3 constants, kept verbatim: kills rate-class
+    desync (25% apart) with two orders of magnitude of headroom, passes
+    legit lead-in/out skew (seconds) with 5x headroom)."""
+    return max(
+        CLOCK_GATE_TOLERANCE_SECONDS,
+        CLOCK_GATE_TOLERANCE_FRACTION * float(reference_s),
+    )
+
+
 def _positive_rate(raw: str) -> float | None:
     """Parse an ffprobe rational like '24000/1001' into a positive fps."""
     if not isinstance(raw, str) or not raw:
@@ -202,7 +516,11 @@ def probe_frame_clock(
     file it will actually re-stamp. The clock is carried as the exact
     rational STRING ffprobe reported — float re-rendering is how drift
     gets invented — plus a parsed ``fps`` used only for frame-count
-    math (never for re-stamping).
+    math (never for re-stamping). v0.4.0 (design B.2): the container
+    fields are DEMOTED to diagnostics — the stamp authority is the
+    decode-truth derivation (:func:`derive_stamp_clock`); this probe
+    stays to record the declared clock family for the diagnostic
+    record (both raw fields ride along additively).
     """
     code, stdout, stderr = runner(
         ffprobe,
@@ -225,6 +543,10 @@ def probe_frame_clock(
             f"no usable frame clock on prepared file {prepared_path}: "
             "no video stream"
         )
+    raw_fields = {
+        "avg_frame_rate": video.avg_frame_rate_raw,
+        "r_frame_rate": video.r_frame_rate_raw,
+    }
     for source, raw in (
         ("avg_frame_rate", video.avg_frame_rate_raw),
         ("r_frame_rate", video.r_frame_rate_raw),
@@ -235,6 +557,10 @@ def probe_frame_clock(
                 "value": raw,  # the exact rational string, byte-identical
                 "source": source,
                 "fps": rate,
+                # diagnostic-only raw fields (B.2): the declared clock
+                # family, recorded — never a derivation input
+                "avg_frame_rate_raw": raw_fields["avg_frame_rate"],
+                "r_frame_rate_raw": raw_fields["r_frame_rate"],
             }
     raise UpscaleError(
         f"no usable frame clock on prepared file {prepared_path}: neither "
@@ -255,6 +581,69 @@ def probe_duration_seconds(
         return parse_probe(path, stdout).duration_seconds
     except Exception:
         return None
+
+
+def probe_frame_count(path: str, *, ffprobe: str, runner: Runner) -> tuple[int, bool]:
+    """The authoritative decode-counted frame total (v0.4.0 design B.1;
+    port of bluray-to-mp4 v0.2.33 §2.1, read-only reference).
+
+    Two passes through the seam. The slow ``-count_frames`` decode pass
+    is AUTHORITATIVE: it counts what the file actually decodes to, not
+    what its container claims. A full FFV1 decode-count costs minutes on
+    a feature-length prepared file — accepted and stated honestly: it
+    is one-time, pre-GPU, and orders of magnitude cheaper than the GPU
+    hours it protects. The fast ``nb_frames`` metadata pass is the
+    fallback ONLY when the decode pass is unusable, and its use is
+    returned as ``frame_count_from_metadata=True`` so no manifest can
+    pose a metadata count as a decoded one. Neither pass usable -> a
+    named :class:`UpscaleError` routed to fail-open (never a silent
+    metadata degrade — that is the lie vector returning through a
+    performance door).
+    """
+    fast: int | None = None
+    code, stdout, _stderr = runner(
+        ffprobe,
+        [
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=nb_frames",
+            "-of", "json",
+            path,
+        ],
+    )
+    if code == 0:
+        try:
+            streams = json.loads(stdout).get("streams") or [{}]
+            raw = streams[0].get("nb_frames")
+            if raw is not None and int(raw) > 0:
+                fast = int(raw)
+        except (ValueError, TypeError, IndexError, json.JSONDecodeError):
+            fast = None
+    code, stdout, _stderr = runner(
+        ffprobe,
+        [
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-count_frames",
+            "-show_entries", "stream=nb_read_frames",
+            "-of", "csv=p=0",
+            path,
+        ],
+    )
+    if code == 0:
+        for line in reversed(stdout.strip().splitlines()):
+            try:
+                value = int(line.strip())
+            except ValueError:
+                continue
+            if value > 0:
+                return value, False  # decode-truth, authoritative
+    if fast is not None:
+        return fast, True  # metadata fallback, flagged
+    raise UpscaleError(
+        f"frame count could not be probed on {path}: neither the "
+        "decode-count pass nor the metadata pass reported a usable total"
+    )
 
 
 @dataclass(frozen=True)
@@ -498,6 +887,7 @@ class NcnnVulkanEngine(EngineAdapter):
         runner: Runner | None = None,
         engine_runner: Callable[[str, list[str]], int] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        on_step: Callable[[str], None] | None = None,
         popen_factory=subprocess.Popen,
     ) -> None:
         spec = MODEL_TABLE.get(profile)
@@ -525,6 +915,7 @@ class NcnnVulkanEngine(EngineAdapter):
         self.runner = runner
         self.engine_runner = engine_runner
         self.on_progress = on_progress
+        self.on_step = on_step
         self.popen_factory = popen_factory
         self.invocations: list[EngineInvocation] = []
         self.log_lines: list[str] = []
@@ -539,13 +930,18 @@ class NcnnVulkanEngine(EngineAdapter):
         *,
         cancel: Callable[[], bool] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        on_step: Callable[[str], None] | None = None,
     ) -> EngineResult:
         """Run the real engine over the prepared file (design Sections 4-7).
 
         ``on_progress`` is the runner's progress seam (``record_progress``);
         it chains with any constructor-level callback so both the
         runner's RunState and direct constructors (the bridge, tests)
-        observe frame progress.
+        observe frame progress. ``on_step`` (v0.4.0 design B.6) is the
+        step-label seam (``record_step``): the adapter fires a label at
+        the start of each long step and as the decode-count probes'
+        heartbeat, so ``last_activity_at`` stays true during the
+        previously-blind windows; it chains the same way.
         """
         original_progress = self.on_progress
         if on_progress is not None:
@@ -557,12 +953,23 @@ class NcnnVulkanEngine(EngineAdapter):
                     on_progress(frames_done, frames_total)
 
                 self.on_progress = _chained
+        original_step = self.on_step
+        if on_step is not None:
+            if original_step is None:
+                self.on_step = on_step
+            else:
+                def _chained_step(label: str) -> None:
+                    original_step(label)
+                    on_step(label)
+
+                self.on_step = _chained_step
         try:
             return self._run_and_report(
                 prepared_path, plan, tools, cancel=cancel
             )
         finally:
             self.on_progress = original_progress
+            self.on_step = original_step
 
     def _run_and_report(
         self,
@@ -585,14 +992,14 @@ class NcnnVulkanEngine(EngineAdapter):
                 f"prepared file duration could not be probed "
                 f"({prepared_path}); refusing to upscale blind"
             )
-        clock = probe_frame_clock(
-            prepared_path, ffprobe=tools.ffprobe, runner=runner
-        )
-
         # Gate P: prepared must match the SOURCE duration within
         # tolerance — catches a prepare-phase bug (a future IVTC that
         # forgot decimate, a bwdif/fps mismatch) before hours are spent.
-        # An unknown source duration refuses (v0.2.29 rule).
+        # An unknown source duration refuses (v0.2.29 rule). v0.4.0
+        # (design B.4): gate P KEEPS its refusal behavior (a prepare-
+        # phase clock bug must still abort pre-GPU); the record now
+        # labels its reference what it is — a FORMAT duration, a
+        # sanity reference, never a stamp authority.
         gate_p = duration_gate(
             label="prepare_vs_source",
             reference_s=plan.report.duration_seconds,
@@ -600,38 +1007,187 @@ class NcnnVulkanEngine(EngineAdapter):
             actual_name="prepared",
             reference_name="source",
         )
+        gate_p["prepare_vs_source"]["reference_kind"] = "format_duration"
+
+        # B.1: the authoritative decode-counted total, BEFORE any GPU
+        # work. The step label keeps the state observably alive through
+        # a minutes-long FFV1 decode-count (B.6).
+        self._step("prepared-count-probe")
+        prepared_total_frames, frames_from_metadata = (
+            self._probe_frame_count_alive(
+                str(prepared_path), tools=tools, label="prepared-count-probe"
+            )
+        )
+
+        # B.2 denominator: the shipped audio's measured extent, probed
+        # on the SOURCE file's a:0 — the exact stream the encode maps
+        # (-map 1:a:0). If audio selection ever becomes configurable,
+        # this ordinal MUST follow the encode map or the derived clock
+        # is silently wrong (B.10 risk 6, pinned at both seams).
+        audio = probe_audio_extent_seconds(
+            plan.report.path, ffprobe=tools.ffprobe, runner=runner
+        )
+
+        # The prepared file's declared clock: DIAGNOSTIC-ONLY (B.2;
+        # .34 §1.4). The v0.3.0 adapter treated these container fields
+        # as the stamp authority — the lie vector this port retires.
+        # An unusable declared clock is recorded as None, never a
+        # refusal: decode-truth does not need the container's opinion.
+        container_clock = self._container_clock_diagnostic(
+            str(prepared_path), tools=tools
+        )
+
+        # B.2: derive the stamp from decode-truth, snap, cross-check
+        # provenance — every refusal on this path is pre-GPU (fail-open
+        # in seconds, never hours).
+        stamp = derive_stamp_clock(
+            source_path=plan.report.path,
+            prepared_total_frames=prepared_total_frames,
+            audio=audio,
+            prepared_duration=prepared_duration,
+            container_clock=container_clock,
+        )
+        self._log(
+            f"stamp derived: {stamp['value']} from {prepared_total_frames} "
+            f"decoded frames / {stamp['audio_extent_s']:.3f}s "
+            f"{stamp['audio_source']} audio extent (container declared "
+            f"{container_clock['value'] if container_clock else 'nothing usable'})"
+        )
 
         output = Path(prepared_path).with_suffix(".upscaled.mkv")
         workdir = _workdir_for(prepared_path)
-        frames_done = self._run_chunks(
-            prepared_path=str(prepared_path),
-            prepared_duration=prepared_duration,
-            clock=clock,
-            tools=tools,
-            binary=binary,
-            models_dir=models_dir,
-            workdir=workdir,
-            output=output,
-            cancel=cancel,
-        )
+        diagnostic = {
+            "source_path": plan.report.path,
+            "prepared_path": str(prepared_path),
+            "prepared_total_frames": prepared_total_frames,
+            "frame_count_from_metadata": frames_from_metadata,
+            "audio_extent_s": stamp["audio_extent_s"],
+            "audio_source": stamp["audio_source"],
+            "derived_rate_raw": stamp["derived_raw"],
+            "derived_rate_snapped": stamp["value"],
+            "stamp_fps": stamp["value"],
+            "container_r_frame_rate": stamp["container_r_frame_rate"],
+            "container_avg_frame_rate": stamp["container_avg_frame_rate"],
+            "cross_provenance": stamp["cross_provenance"],
+            "clock_tolerance_s": clock_gate_tolerance(
+                float(stamp["audio_extent_s"])
+            ),
+        }
 
-        # Gate M: mezzanine must match the PREPARED duration — the Mamma
-        # Mia gate (the 15.050 s drift sailed under the old 2% gate).
-        mezzanine_duration = probe_duration_seconds(
-            str(output), ffprobe=tools.ffprobe, runner=runner
-        )
-        if mezzanine_duration is None:
-            raise UpscaleError(
-                f"upscale mezzanine duration could not be probed ({output}); "
-                "refusing to encode a possibly desynced upscale"
+        gates = dict(gate_p)
+        frame_gates: dict | None = None
+        resume_info: dict = {"checkpoint_used": False, "chunks_reused": 0}
+        frames_done = 0
+        try:
+            frames_done, chunk_context, resume_info = self._run_chunks(
+                prepared_path=str(prepared_path),
+                prepared_total_frames=prepared_total_frames,
+                stamp=stamp,
+                tools=tools,
+                binary=binary,
+                models_dir=models_dir,
+                workdir=workdir,
+                output=output,
+                cancel=cancel,
             )
-        gate_m = duration_gate(
-            label="mezzanine_vs_prepared",
-            reference_s=prepared_duration,
-            actual_s=mezzanine_duration,
-            actual_name="mezzanine",
-            reference_name="prepared",
-        )
+            diagnostic.update(chunk_context)
+
+            # B.4 gate 1 — exact frame equality: decode-count the
+            # mezzanine (same helper, same honest cost) and require
+            # integer equality with the prepared total. Non-emptiness
+            # (the v0.3.0 assertion) cannot see a chunk that silently
+            # dropped or duplicated frames; exact counts can.
+            self._step("gate-frames-probe")
+            mezzanine_frames, _ = self._probe_frame_count_alive(
+                str(output), tools=tools, label="gate-frames-probe"
+            )
+            frame_gates = {
+                "mezzanine_vs_prepared": {
+                    "expected": prepared_total_frames,
+                    "actual": mezzanine_frames,
+                    "ok": mezzanine_frames == prepared_total_frames,
+                }
+            }
+            diagnostic["mezzanine_frame_count"] = mezzanine_frames
+            if mezzanine_frames != prepared_total_frames:
+                raise UpscaleError(
+                    "mezzanine_vs_prepared frame gate: mezzanine decodes "
+                    f"to {mezzanine_frames} frames, the prepared file has "
+                    f"{prepared_total_frames}; exact equality required, "
+                    "refusing a miscounted mezzanine"
+                )
+
+            # B.4 gate 2 — clock vs the SHIPPED-AUDIO extent (the same
+            # provenance that derived the stamp), max(2.0 s, 0.1%).
+            # The old gate M reference (prepared format duration)
+            # cannot see a consistently lying clock family; the audio
+            # that reaches the MP4 is the axis viewers experience.
+            self._step("gate-clock-probe")
+            mezzanine_duration = probe_duration_seconds(
+                str(output), ffprobe=tools.ffprobe, runner=runner
+            )
+            if mezzanine_duration is None:
+                raise UpscaleError(
+                    f"upscale mezzanine duration could not be probed "
+                    f"({output}); refusing to encode a possibly desynced "
+                    "upscale"
+                )
+            diagnostic["mezzanine_duration_s"] = mezzanine_duration
+            audio_extent_s = float(stamp["audio_extent_s"])
+            tolerance = clock_gate_tolerance(audio_extent_s)
+            deviation = abs(mezzanine_duration - audio_extent_s)
+            clock_ok = deviation <= tolerance
+            gates["mezzanine_vs_audio"] = {
+                "mezzanine_s": mezzanine_duration,
+                "audio_s": audio_extent_s,
+                "audio_source": stamp["audio_source"],
+                "tolerance_s": tolerance,
+                "ok": clock_ok,
+            }
+            if not clock_ok:
+                raise UpscaleError(
+                    "mezzanine_vs_audio clock gate: mezzanine "
+                    f"{mezzanine_duration:.3f}s vs shipped-audio "
+                    f"{audio_extent_s:.3f}s ({stamp['audio_source']} "
+                    f"extent; off by {deviation:.3f}s, tolerance "
+                    f"{tolerance:.3f}s); refusing a desynced upscale"
+                )
+
+            # Gate M, demoted to a diagnostic (B.4): still recorded with
+            # its measured values and ok flag (manifest compat), never
+            # a refusal — the audio-extent clock gate above is the
+            # authority this port installs.
+            gate_m_tolerance = gate_tolerance(prepared_duration)
+            gates["mezzanine_vs_prepared"] = {
+                "mezzanine_s": mezzanine_duration,
+                "prepared_s": prepared_duration,
+                "tolerance_s": gate_m_tolerance,
+                "ok": abs(mezzanine_duration - prepared_duration)
+                <= gate_m_tolerance,
+                "diagnostic_only": True,
+            }
+        except EngineCancelled:
+            raise
+        except UpscaleError as exc:
+            # B.5: a mezzanine that exists at failure time is RETAINED
+            # (renamed, never deleted) with a diagnostic JSON naming
+            # every operand of the derivation; the amended message
+            # carries both paths verbatim into the runner's fail-open
+            # log and manifest — no runner signature change.
+            retained = self._retain_rejected_mezzanine(
+                output, diagnostic, str(exc)
+            )
+            if retained is not None:
+                retained_path, diagnostic_path = retained
+                amended = UpscaleError(
+                    f"{exc}; rejected mezzanine retained at "
+                    f"{retained_path}; diagnostic at {diagnostic_path}"
+                )
+                amended.rejected_mezzanine = (  # type: ignore[attr-defined]
+                    {"path": retained_path, "diagnostic_path": diagnostic_path}
+                )
+                raise amended from exc
+            raise
 
         # Success: workdir deleted (retention contract); the sibling's
         # frame-dir peak stays ~1-2 GB because in/out died per chunk.
@@ -643,8 +1199,10 @@ class NcnnVulkanEngine(EngineAdapter):
             simulated=False,
             engine_model=self.spec.name,
             engine_native_scale=self.spec.native_scale,
-            frame_clock={"value": clock["value"], "source": clock["source"]},
-            duration_gates={**gate_p, **gate_m},
+            frame_clock=stamp,
+            duration_gates=gates,
+            frame_gates=frame_gates,
+            resume=resume_info,
             model_hashes_verified=True,
         )
 
@@ -661,13 +1219,109 @@ class NcnnVulkanEngine(EngineAdapter):
 
     @staticmethod
     def _expected_frames(duration: float | None, clock: dict) -> int:
-        """ceil(prepared_duration x rate) — the progress/ETA denominator."""
+        """Deprecated v0.3.0 estimate (ceil(duration x container fps))
+        — RETIRED by v0.4.0 B.3/E15: the progress denominator is the
+        decode-counted ``prepared_total_frames``. Kept one release as a
+        thin compatibility shim for external callers; never used by the
+        chunk flow."""
         if duration is None:
             return 0
         return max(1, math.ceil(float(duration) * float(clock["fps"])))
 
     def _log(self, text: str) -> None:
         self.log_lines.append(text)
+
+    def _step(self, label: str) -> None:
+        """One labeled long-step boundary (B.6): logged through the
+        adapter's own log and fired through the ``on_step`` seam
+        (``record_step`` sets state.progress["step"] and touches the
+        state), so the bridge's status names WHAT is running during the
+        previously-blind windows."""
+        self._log(f"step: {label}")
+        if self.on_step is not None:
+            self.on_step(label)
+
+    def _probe_frame_count_alive(
+        self, path: str, *, tools: ToolBox, label: str
+    ) -> tuple[int, bool]:
+        """B.1's decode-count probe with B.6's heartbeat: a full FFV1
+        decode-count runs minutes on a feature-length file, so it runs
+        on a worker thread while the step label re-fires every
+        ``PROBE_HEARTBEAT_SECONDS`` — the state's last_activity stays
+        true, the window never reads as frozen."""
+        runner = self._seam_runner()
+        box: dict = {}
+
+        def _work() -> None:
+            try:
+                box["value"] = probe_frame_count(
+                    path, ffprobe=tools.ffprobe, runner=runner
+                )
+            except BaseException as exc:  # surfaced after the join
+                box["error"] = exc
+
+        thread = threading.Thread(
+            target=_work, daemon=True, name=f"vidlift-{label}"
+        )
+        thread.start()
+        while thread.is_alive():
+            thread.join(timeout=PROBE_HEARTBEAT_SECONDS)
+            if thread.is_alive():
+                self._step(label)  # heartbeat touch
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
+
+    def _container_clock_diagnostic(
+        self, prepared_path: str, *, tools: ToolBox
+    ) -> dict | None:
+        """The prepared file's DECLARED container clock — diagnostic
+        only (B.2; .34 §1.4). Never raises: a container that cannot
+        even declare a clock is recorded as None in the provenance
+        record; decode-truth does not need the container's opinion."""
+        try:
+            return probe_frame_clock(
+                prepared_path,
+                ffprobe=tools.ffprobe,
+                runner=self._seam_runner(),
+            )
+        except UpscaleError:
+            return None
+
+    def _retain_rejected_mezzanine(
+        self, output: Path, diagnostic: dict, error: str
+    ) -> tuple[str, str] | None:
+        """B.5: retain a rejected mezzanine — RENAME, never delete —
+        plus its diagnostic JSON. Returns (retained_path,
+        diagnostic_path), or None when no mezzanine file exists or the
+        filesystem refuses the retention (the original error still
+        propagates either way; retention is best-effort, deletion is
+        forbidden)."""
+        if not output.is_file():
+            return None
+        ts = time.strftime("%Y%m%dT%H%M%S")
+        name = output.name
+        if name.endswith(".upscaled.mkv"):
+            retained = output.with_name(
+                name[: -len(".upscaled.mkv")] + f".rejected-{ts}.mkv"
+            )
+        else:
+            retained = output.with_name(f"{name}.rejected-{ts}.mkv")
+        diagnostic_path = retained.with_name(
+            retained.name[: -len(".mkv")] + ".diagnostic.json"
+        )
+        try:
+            output.rename(retained)
+            payload = dict(diagnostic)
+            payload["error"] = error
+            diagnostic_path.write_text(
+                json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            self._log(f"rejected-mezzanine retention failed: {exc}")
+            return None
+        self._log(f"rejected mezzanine retained at {retained}")
+        return str(retained), str(diagnostic_path)
 
     @staticmethod
     def _cancelled(cancel) -> bool:
@@ -784,32 +1438,99 @@ class NcnnVulkanEngine(EngineAdapter):
         self,
         *,
         prepared_path: str,
-        prepared_duration: float,
-        clock: dict,
+        prepared_total_frames: int,
+        stamp: dict,
         tools: ToolBox,
         binary: str,
         models_dir: str,
         workdir: Path,
         output: Path,
         cancel=None,
-    ) -> int:
+    ) -> tuple[int, dict, dict]:
         """Extract -> engine -> reassemble per chunk; concat; returns
-        total output frames (design Section 7)."""
-        total_seconds = max(1.0, float(prepared_duration))
+        (total output frames, chunk diagnostic context, resume info)
+        (design Section 7 + v0.4.0 B.3/B.7).
+
+        B.3: chunks are addressed by FRAME INDEX over the
+        decode-counted total — ``F = max(1, round(chunk_seconds x
+        stamp_fps))`` frames per full chunk, ``ceil(N / F)`` chunks,
+        each chunk's ``[first, first+count)`` extracted with
+        ``select='between(n,a,b)'`` + ``-vsync 0`` (no muxer dup/drop
+        toward an implied clock; PNG naming starts at 1 so the extent
+        probe stays untouched). ``-ss/-t`` wall-time addressing is
+        RETIRED: container-timestamp windows do not land on frame
+        boundaries and per-window jitter accumulates into
+        feature-length drift (.33 §1). Every chunk asserts its EXACT
+        frame count in and out — a chunk that silently drops or
+        duplicates a frame cannot assemble a partial mezzanine.
+        """
+        stamp_fps = _canonical_rate_value(str(stamp["value"]))
         chunk_seconds = max(MIN_CHUNK_SECONDS, int(self._chunk_seconds))
-        chunks = max(1, math.ceil(total_seconds / chunk_seconds))
-        frames_total = self._expected_frames(prepared_duration, clock)
+        frames_per_chunk = max(1, round(chunk_seconds * stamp_fps))
+        total_frames = int(prepared_total_frames)
+        chunks = max(1, math.ceil(total_frames / frames_per_chunk))
+        expected_per_chunk = [
+            min(frames_per_chunk, total_frames - idx * frames_per_chunk)
+            for idx in range(chunks)
+        ]
         workdir.mkdir(parents=True, exist_ok=True)
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.exists():
             output.unlink()
 
+        # B.7: per-chunk resume. The checkpoint is proven against THIS
+        # invocation — params (model/scale/chunk_seconds), prepared
+        # path, total frames, and stamp token, all re-derived fresh —
+        # before ANY segment is trusted. Any mismatch, missing file,
+        # wrong size, or truncated duration (probed cheaply; must sit
+        # within one frame-time of count/stamp) deletes the workdir
+        # WHOLESALE and starts clean. No partial trust, ever.
+        checkpoint_params = {
+            "model": self.spec.name,
+            "scale": self.spec.native_scale,
+            "chunk_seconds": chunk_seconds,
+        }
+        reused = self._load_checkpoint(
+            workdir=workdir,
+            prepared_path=str(prepared_path),
+            prepared_total_frames=total_frames,
+            stamp_token=str(stamp["value"]),
+            stamp_fps=stamp_fps,
+            params=checkpoint_params,
+            tools=tools,
+        )
+        resume_info = {
+            "checkpoint_used": bool(reused),
+            "chunks_reused": len(reused) if reused else 0,
+        }
+        completed: dict[int, dict] = {
+            int(entry["idx"]): entry for entry in (reused or [])
+        }
+
         segments: list[Path] = []
         frames_done = 0
+        completed_records: list[dict] = []
+        if reused:
+            for entry in sorted(completed.values(), key=lambda e: int(e["idx"])):
+                segments.append(Path(str(entry["segment"])))
+                frames_done += int(entry["count"])
+            # seed the checkpoint's completed list with the reused
+            # entries so a LATER failure still records every completed
+            # chunk (resumed chunks must not fall out of the checkpoint)
+            completed_records = [dict(entry) for entry in sorted(
+                completed.values(), key=lambda e: int(e["idx"])
+            )]
+            self._log(
+                f"resume: reusing {len(reused)} completed chunk(s) from "
+                f"{CHUNK_STATE_FILENAME}"
+            )
         try:
             for idx in range(chunks):
-                start = idx * chunk_seconds
-                length = min(chunk_seconds, total_seconds - start)
+                if idx in completed:
+                    continue  # B.7: checkpoint-proven completed chunk
+                first = idx * frames_per_chunk
+                count = expected_per_chunk[idx]
+                last = first + count - 1
                 chunk = workdir / f"chunk_{idx:04d}"
                 in_dir = chunk / "in"
                 out_dir = chunk / "out"
@@ -822,19 +1543,27 @@ class NcnnVulkanEngine(EngineAdapter):
                     segment.unlink()
 
                 try:
-                    # Extraction (design Section 4.1): wall-time addressing
-                    # on the PREPARED file, identity filter — frames are
-                    # already normalized by the runner's prepare phase;
-                    # extraction never re-stamps. (The sibling applied its
-                    # prepare filter here because its input was raw.)
+                    # Extraction (B.3): FRAME-INDEX addressing on the
+                    # prepared file. ``select='between(n,first,last)'``
+                    # is the only addressing that cannot drift;
+                    # ``-vsync 0`` forbids the muxer from dup/dropping
+                    # toward an implied clock; ``-start_number 1``
+                    # keeps the existing PNG naming and the
+                    # frame_00000001.png extent probe untouched. No
+                    # ``-ss``/``-t``: those address container
+                    # timestamps — the drift generator .33 retired.
+                    # (Prefix-decode cost grows with chunk index;
+                    # accepted and stated; the hybrid-seek mitigation
+                    # is explicitly deferred out of this milestone.)
                     self._ffmpeg(
                         [
                             tools.ffmpeg,
                             "-y", "-hide_banner", "-nostdin",
-                            "-ss", f"{start:g}",
-                            "-t", f"{length:g}",
                             "-i", prepared_path,
                             "-an", "-sn",
+                            "-vf", f"select='between(n,{first},{last})'",
+                            "-vsync", "0",
+                            "-start_number", "1",
                             str(in_dir / "frame_%08d.png"),
                         ],
                         label=f"frame extraction chunk {idx + 1}/{chunks}",
@@ -842,9 +1571,13 @@ class NcnnVulkanEngine(EngineAdapter):
                         cancel=cancel,
                     )
                     input_frames = _count_pngs(in_dir)
-                    if not input_frames:
+                    # B.3 assertion, port of .33 §2.4 verbatim in rule:
+                    # exact count in, exact count out.
+                    if input_frames != count:
                         raise UpscaleError(
-                            f"no frames extracted for chunk {idx + 1}/{chunks}"
+                            f"chunk {idx + 1}/{chunks} extraction count "
+                            f"mismatch: expected {count} frames "
+                            f"[{first}, {last}], extracted {input_frames}"
                         )
                     extent_png = _png_size(in_dir / "frame_00000001.png")
                     frame_extent = extent_png.extent if extent_png else 0
@@ -884,22 +1617,23 @@ class NcnnVulkanEngine(EngineAdapter):
                         )
                     )
                     output_frames = _count_pngs(out_dir)
-                    if not output_frames:
+                    if output_frames != count:
                         raise UpscaleError(
-                            f"no upscaled frames produced for chunk "
-                            f"{idx + 1}/{chunks}"
+                            f"chunk {idx + 1}/{chunks} engine output "
+                            f"count mismatch: expected {count} frames, "
+                            f"engine produced {output_frames}"
                         )
 
-                    # Reassembly (clause a): the probed prepared clock
-                    # stamps the segment — the exact rational string,
-                    # never a default. The segment filter degenerates to
-                    # setsar=1 at scale == 2 (design Section 3 geometry
-                    # note; the sibling's rule kept verbatim).
+                    # Reassembly: the DERIVED stamp token (B.2) stamps
+                    # the segment — the canonical token, never a
+                    # container string, never a default. The segment
+                    # filter degenerates to setsar=1 at scale == 2
+                    # (design Section 3 geometry note).
                     self._ffmpeg(
                         [
                             tools.ffmpeg,
                             "-y", "-hide_banner", "-nostdin",
-                            "-framerate", clock["value"],
+                            "-framerate", str(stamp["value"]),
                             "-i", str(out_dir / "frame_%08d.png"),
                             "-an",
                             "-vf", "setsar=1",
@@ -912,10 +1646,30 @@ class NcnnVulkanEngine(EngineAdapter):
                         cancel=cancel,
                     )
                     segments.append(segment)
-                    frames_done += output_frames
+                    frames_done += count
+                    completed_records.append(
+                        {
+                            "idx": idx,
+                            "count": count,
+                            "segment": str(segment),
+                            "segment_size": segment.stat().st_size,
+                        }
+                    )
+                    self._write_checkpoint(
+                        workdir=workdir,
+                        prepared_path=str(prepared_path),
+                        prepared_total_frames=total_frames,
+                        stamp_token=str(stamp["value"]),
+                        stamp_fps=stamp_fps,
+                        chunk_frames=frames_per_chunk,
+                        params=checkpoint_params,
+                        completed=sorted(
+                            completed_records, key=lambda r: r["idx"]
+                        ),
+                    )
                     if self.on_progress is not None:
                         self.on_progress(
-                            min(frames_done, frames_total), frames_total
+                            min(frames_done, total_frames), total_frames
                         )
                 except EngineCancelled:
                     # Partial chunk dirs are cleaned on cancel; completed
@@ -927,6 +1681,9 @@ class NcnnVulkanEngine(EngineAdapter):
                     shutil.rmtree(in_dir, ignore_errors=True)
                     shutil.rmtree(out_dir, ignore_errors=True)
 
+            # B.6: concat is one long external command over every
+            # segment; the step label keeps the window observable.
+            self._step("concat")
             if len(segments) == 1:
                 shutil.move(str(segments[0]), str(output))
             else:
@@ -960,15 +1717,141 @@ class NcnnVulkanEngine(EngineAdapter):
                 pass
             raise
         except Exception as exc:
-            try:
-                if output.exists():
-                    output.unlink()
-            except OSError:
-                pass
+            # B.5: a mezzanine that exists at failure time is RETAINED
+            # by the caller (_run_and_report) — never deleted here.
+            # Pre-mezzanine failures leave no output file; the kept
+            # workdir (design Section 7) and the B.7 checkpoint cover
+            # triage and resume.
             if isinstance(exc, UpscaleError):
                 raise
             raise UpscaleError(str(exc)) from exc
-        return frames_done
+        chunk_context = {
+            "chunk_frames": frames_per_chunk,
+            "chunks": chunks,
+            "expected_per_chunk": expected_per_chunk,
+        }
+        return frames_done, chunk_context, resume_info
+
+    def _write_checkpoint(
+        self,
+        *,
+        workdir: Path,
+        prepared_path: str,
+        prepared_total_frames: int,
+        stamp_token: str,
+        stamp_fps: float,
+        chunk_frames: int,
+        params: dict,
+        completed: list[dict],
+    ) -> None:
+        """B.7: write ``chunk_state.json`` atomically (temp + replace,
+        fsynced) after each completed chunk. The GPU hours live in the
+        chunk engine processes; this file is what a retried run
+        inherits. Best-effort: a checkpoint that cannot be written
+        costs resume, never the run."""
+        state = {
+            "stamp_fps": stamp_token,
+            "prepared_path": prepared_path,
+            "prepared_total_frames": prepared_total_frames,
+            "chunk_frames": chunk_frames,
+            "completed": completed,
+            "params": params,
+        }
+        path = workdir / CHUNK_STATE_FILENAME
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(workdir), prefix=".chunk-state-", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(state, indent=2) + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp_name, path)
+            except OSError:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        except OSError as exc:
+            self._log(f"checkpoint write failed (resume lost): {exc}")
+
+    def _load_checkpoint(
+        self,
+        *,
+        workdir: Path,
+        prepared_path: str,
+        prepared_total_frames: int,
+        stamp_token: str,
+        stamp_fps: float,
+        params: dict,
+        tools: ToolBox,
+    ) -> list[dict] | None:
+        """B.7: validate ``chunk_state.json`` against THIS invocation.
+
+        Cheap parts only (the design's trust model): params, prepared
+        path, decode-counted total, and stamp token must match the
+        fresh invocation EXACTLY; then each recorded segment must
+        exist with its recorded size and probe a duration within ONE
+        FRAME-TIME of ``count / stamp_fps`` (a kill-mid-segment write
+        leaves a truncated file; the B.4 gates remain the real
+        tripwire, so this integrity check is deliberately cheap, not
+        cryptographic). ANY failure — mismatch, missing file, wrong
+        size, truncated duration — deletes the workdir WHOLESALE and
+        returns None (clean restart). No partial trust.
+        """
+        path = workdir / CHUNK_STATE_FILENAME
+        if not path.is_file():
+            return None
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            shutil.rmtree(workdir, ignore_errors=True)
+            return None
+        mismatch = (
+            state.get("prepared_path") != prepared_path
+            or int(state.get("prepared_total_frames") or -1)
+            != prepared_total_frames
+            or state.get("stamp_fps") != stamp_token
+            or state.get("params") != params
+        )
+        if mismatch:
+            # stale cache by construction: delete wholesale, start clean
+            shutil.rmtree(workdir, ignore_errors=True)
+            workdir.mkdir(parents=True, exist_ok=True)
+            return None
+        completed = state.get("completed")
+        if not isinstance(completed, list) or not completed:
+            shutil.rmtree(workdir, ignore_errors=True)
+            workdir.mkdir(parents=True, exist_ok=True)
+            return None
+        frame_time = 1.0 / max(stamp_fps, 1e-9)
+        for entry in completed:
+            try:
+                segment = Path(str(entry["segment"]))
+                count = int(entry["count"])
+                size = int(entry["segment_size"])
+            except (KeyError, TypeError, ValueError):
+                shutil.rmtree(workdir, ignore_errors=True)
+                workdir.mkdir(parents=True, exist_ok=True)
+                return None
+            if not segment.is_file() or segment.stat().st_size != size:
+                shutil.rmtree(workdir, ignore_errors=True)
+                workdir.mkdir(parents=True, exist_ok=True)
+                return None
+            duration = probe_duration_seconds(
+                str(segment), ffprobe=tools.ffprobe, runner=self._seam_runner()
+            )
+            expected_duration = count / max(stamp_fps, 1e-9)
+            if (
+                duration is None
+                or abs(duration - expected_duration) > frame_time
+            ):
+                shutil.rmtree(workdir, ignore_errors=True)
+                workdir.mkdir(parents=True, exist_ok=True)
+                return None
+        return completed
 
 
 def _workdir_for(prepared_path: str) -> Path:
