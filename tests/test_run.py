@@ -59,6 +59,9 @@ def marker(name: str) -> None:
     register_b(name)
 
 
+from vidlift.engine_ncnn import NcnnVulkanEngine  # v0.4.0 R-series
+
+
 def make_media_file(tmp_path, name: str = "movie.avi") -> str:
     path = tmp_path / name
     path.write_text("")
@@ -76,6 +79,7 @@ def probe_payload(
     audio: list[dict] | None = None,
     subtitles: list[dict] | None = None,
     container: str = "avi",
+    duration: str = "5400.0",
 ) -> str:
     """Canned ffprobe JSON for one SD file (the common XviD case)."""
     if audio is None:
@@ -100,7 +104,7 @@ def probe_payload(
     return json.dumps(
         {
             "streams": streams,
-            "format": {"format_name": container, "duration": "5400.0"},
+            "format": {"format_name": container, "duration": duration},
         }
     )
 
@@ -1165,23 +1169,28 @@ class TestProgressPlumbing:
     """RunState.progress fed by the adapter's on_progress seam."""
 
     def test_stub_run_leaves_progress_null(self, tmp_path):
-        # the stub reports no frame work; progress stays honestly null
+        # the stub reports no frame work: no frames_done/frames_total
+        # ever appear; v0.4.0 adds step labels, so "no frame work" is
+        # pinned as the absence of the frame counters, not a null dict
         result, _ = run_happy(tmp_path)
-        assert result.state.progress is None
+        assert result.state.progress is None or (
+            "frames_done" not in (result.state.progress or {})
+            and "frames_total" not in (result.state.progress or {})
+        )
 
     def test_engine_progress_lands_in_state(self, tmp_path):
         seen: list[tuple[int, int]] = []
 
         class ProgressEngine(StubEngine):
             def run(self, prepared_path, plan, tools, *, cancel=None,
-                    on_progress=None):
+                    on_progress=None, on_step=None):
                 if on_progress is not None:
                     on_progress(120, 7500)
                     on_progress(240, 7500)
                 seen.append(True)
                 return super().run(
                     prepared_path, plan, tools, cancel=cancel,
-                    on_progress=on_progress,
+                    on_progress=on_progress, on_step=on_step,
                 )
 
         path = make_media_file(tmp_path)
@@ -1192,7 +1201,12 @@ class TestProgressPlumbing:
             engine=ProgressEngine(), log_dir=str(tmp_path / "runs"),
         )
         assert seen == [True]
-        assert result.state.progress == {"frames_done": 240, "frames_total": 7500}
+        progress = result.state.progress or {}
+        assert progress["frames_done"] == 240
+        assert progress["frames_total"] == 7500
+        # v0.4.0: the step label rides the same dict (B.6) and survives
+        # the frame-progress merge — never replacing it
+        assert progress.get("step")
 
 
 class TestHighestBoundaryPromiseSweep:
@@ -1308,6 +1322,186 @@ class TestNoAutoTileEver:
         assert args.realesrgan == "/r/e"
         args2 = cli.build_parser().parse_args(["run", "movie.avi"])
         assert args2.engine == "auto"  # the default
+
+
+# ---- v0.4.0 R-series: decode-truth gates + heartbeat + manifest (B.9) ------
+
+
+class TestV04GatesAndHeartbeat:
+    """R1-R3 (design B.9): the new gates route through the UNCHANGED
+    fail-open path; the heartbeat keeps status honest during long
+    commands; the manifest's v2 additive fields are present on
+    success and on gate-trip fail-open."""
+
+    def _ncnn_engine(self, tmp_path, *, mezzanine_duration):
+        """A real NcnnVulkanEngine over decode-truth fake seams whose
+        mezzanine trips the clock gate (a coherent small fixture:
+        7500 decoded frames, 300 s, 25 fps). The fake seams come from
+        the engine boundary module (same suite, same rootdir imports)."""
+        import importlib
+
+        engine_tests = importlib.import_module("test_engine_ncnn")
+        EngineFakeRunner = engine_tests.EngineFakeRunner
+        FakeEngineProcess = engine_tests.FakeEngineProcess
+        make_fake_binary = engine_tests.make_fake_binary
+        make_fixture_models = engine_tests.make_fixture_models
+
+        prepared_root = tmp_path / "engine"
+        prepared_root.mkdir(exist_ok=True)
+        models, table = make_fixture_models(prepared_root / "models")
+        runner = EngineFakeRunner(
+            prepared_duration=300.0,
+            mezzanine_duration=mezzanine_duration,
+            prepared_frames=7500,
+            audio_stream_duration=300.0,
+            source_format_duration=300.0,
+        )
+        engine = NcnnVulkanEngine(
+            binary=str(make_fake_binary(prepared_root / "bin")),
+            models_dir=str(models),
+            artifacts=table,
+            runner=runner,
+            engine_runner=FakeEngineProcess(),
+            chunk_seconds=120,
+        )
+        return engine, runner
+
+    def test_r1_clock_gate_trip_fails_open_with_retention_in_reason(
+        self, tmp_path
+    ):
+        marker("r1")
+        engine, _runner = self._ncnn_engine(
+            tmp_path, mezzanine_duration=450.0
+        )
+        path = make_media_file(tmp_path, "gate-trip.avi")
+        payload = probe_payload(duration="300.0")
+        runner = FakeRunner(payload)
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        result = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            engine=engine, log_dir=str(tmp_path / "runs"),
+        )
+        state = result.state
+        # the UNCHANGED fail-open contract: the run completed and
+        # verified; the shipped output is the synchronized re-encode
+        assert result.ok is True
+        assert state.fail_open is True
+        assert state.engine_simulated is True
+        assert "mezzanine_vs_audio" in state.fail_open_reason
+        # the reason names the retention paths verbatim (B.5)
+        assert "rejected mezzanine retained at" in state.fail_open_reason
+        assert "diagnostic at" in state.fail_open_reason
+        # B.8: the manifest carries the retained-reject paths
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        run = manifest["run"]
+        assert run["fail_open"] is True
+        assert run["fail_open_reason"] == state.fail_open_reason
+        assert run["rejected_mezzanine"] == state.rejected_mezzanine
+        assert run["rejected_mezzanine"]["path"].endswith(".rejected-") or (
+            ".rejected-" in run["rejected_mezzanine"]["path"]
+        )
+        # the retained artifacts exist on disk
+        assert Path(state.rejected_mezzanine["path"]).is_file()
+        assert Path(state.rejected_mezzanine["diagnostic_path"]).is_file()
+        # and the v2 additive fields are present (None on this path)
+        assert run["frame_gates"] is None
+        assert run["resume"] is None
+
+    def test_r3_manifest_v2_additive_fields_on_success_and_fail_open(
+        self, tmp_path
+    ):
+        marker("r3")
+        # success path (stub engine): the additive keys exist with the
+        # null rule — the stub carries none of them
+        result, _runner = run_happy(tmp_path)
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        run = manifest["run"]
+        assert "frame_gates" in run and run["frame_gates"] is None
+        assert "resume" in run and run["resume"] is None
+        assert "rejected_mezzanine" in run
+        assert run["rejected_mezzanine"] is None
+        # state.to_dict() carries the same fields (the bridge contract)
+        data = result.state.to_dict()
+        for key in ("frame_gates", "resume", "rejected_mezzanine"):
+            assert key in data
+
+        # and on a clean engine success they are POPULATED
+        engine, _runner2 = self._ncnn_engine(
+            tmp_path, mezzanine_duration=300.0
+        )
+        path = make_media_file(tmp_path, "clean-engine.avi")
+        payload = probe_payload(duration="300.0")
+        runner = FakeRunner(payload)
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        result2 = run_file(
+            path, tools=tools, probe_runner=runner, command_runner=runner,
+            engine=engine, log_dir=str(tmp_path / "runs2"),
+        )
+        manifest2 = json.loads(Path(result2.manifest_path).read_text())
+        run2 = manifest2["run"]
+        assert run2["engine_simulated"] is False
+        assert run2["frame_gates"]["mezzanine_vs_prepared"]["ok"] is True
+        assert run2["frame_gates"]["mezzanine_vs_prepared"]["expected"] == 7500
+        assert run2["resume"] == {
+            "checkpoint_used": False, "chunks_reused": 0,
+        }
+        assert run2["frame_clock"]["source"] == "derived"
+        assert run2["frame_clock"]["value"] == "25"
+        assert run2["duration_gates"]["mezzanine_vs_audio"]["ok"] is True
+
+    def test_r2_status_during_long_encode_shows_activity_and_step(
+        self, tmp_path, monkeypatch
+    ):
+        marker("r2")
+        import threading
+        import time as _time
+
+        import vidlift.run as run_module
+
+        monkeypatch.setattr(run_module, "HEARTBEAT_TOUCH_SECONDS", 0.05)
+        monkeypatch.setattr(run_module, "HEARTBEAT_LOG_SECONDS", 10.0)
+        encode_entered = threading.Event()
+
+        class SlowEncodeRunner(FakeRunner):
+            def __call__(self, binary, args):
+                if "libx265" in args:
+                    encode_entered.set()
+                    _time.sleep(0.3)  # long enough for the shrunk pump
+                return super().__call__(binary, args)
+
+        path = make_media_file(tmp_path)
+        runner = SlowEncodeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        state_box: dict = {}
+
+        def _run():
+            run_file(
+                path, tools=tools, probe_runner=runner, command_runner=runner,
+                log_dir=str(tmp_path / "runs"), state_box=state_box,
+            )
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        assert encode_entered.wait(timeout=5)
+        activity_samples: list[float] = []
+        step_samples: list[str] = []
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            state = state_box.get("state")
+            if state is not None:
+                if state.progress and state.progress.get("step"):
+                    step_samples.append(state.progress["step"])
+                activity_samples.append(state.last_activity_at)
+            if not thread.is_alive():
+                break
+            _time.sleep(0.03)
+        thread.join(timeout=10)
+        # R2: the status payload's step names the encode while it runs
+        assert "encode" in step_samples
+        # and last_activity_at ADVANCED during the long encode (the
+        # v0.3.0 blind window read as frozen)
+        assert len(activity_samples) >= 2
+        assert activity_samples[-1] > activity_samples[0]
 
 
 # ---- b7/b8/b12 execution canary (runs LAST in this file) -----------------

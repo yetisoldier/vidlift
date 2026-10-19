@@ -588,6 +588,13 @@ def test_t6_sentinel_note_and_flag_flow_byte_identical(tmp_path):
             super().__init__(note="sentinel note")
             self.simulated = True
 
+        def run(self, prepared_path, plan, tools, *, cancel=None,
+                on_progress=None, on_step=None):
+            return super().run(
+                prepared_path, plan, tools, cancel=cancel,
+                on_progress=on_progress, on_step=on_step,
+            )
+
     server.services.engine = SentinelEngine()
     _r, _e, payload = call(server, "run", {"paths": [path]})
     job_id = payload["jobs"][0]["job_id"]
@@ -611,11 +618,13 @@ def test_t6_eta_null_without_measured_constant_even_with_progress(tmp_path):
     path = make_media_file(tmp_path)
 
     class ProgressEngine(StubEngine):
-        def run(self, prepared_path, plan, tools, *, cancel=None, on_progress=None):
+        def run(self, prepared_path, plan, tools, *, cancel=None,
+                on_progress=None, on_step=None):
             if on_progress is not None:
                 on_progress(100, 7500)
             return super().run(
-                prepared_path, plan, tools, cancel=cancel, on_progress=on_progress
+                prepared_path, plan, tools, cancel=cancel,
+                on_progress=on_progress, on_step=on_step,
             )
 
     server.services.engine = ProgressEngine()
@@ -661,6 +670,45 @@ def test_t7_stub_benchmark_labeled_simulated_with_notes(tmp_path):
 
 
 # ---- t8: error codes -----------------------------------------------------------------------
+
+
+def test_t8_r4_count_frames_probe_maps_to_upscale_phase():
+    """R4 (design B.9): the bridge's infer_phase maps the v0.4.0
+    decode-count probe commands (``-count_frames``) to the upscale
+    phase — the B.1 prepared-count probe and the B.4 mezzanine gates
+    run inside the engine adapter."""
+    marker("t8")
+    from vidlift.mcp_bridge.jobs import infer_phase
+
+    assert (
+        infer_phase(
+            "ffprobe",
+            [
+                "-v", "error", "-select_streams", "v:0", "-count_frames",
+                "-show_entries", "stream=nb_read_frames", "-of",
+                "csv=p=0", "/x/movie.prepared.mkv",
+            ],
+        )
+        == "upscale"
+    )
+    assert (
+        infer_phase(
+            "ffprobe",
+            [
+                "-v", "error", "-select_streams", "v:0", "-count_frames",
+                "-show_entries", "stream=nb_read_frames", "-of",
+                "csv=p=0", "/x/movie.prepared.upscaled.mkv",
+            ],
+        )
+        == "upscale"
+    )
+    # and the pre-existing mappings are unchanged
+    assert infer_phase("ffmpeg", ["-i", "x", "-c:v", "libx265", "y.mp4"]) == (
+        "encode"
+    )
+    assert infer_phase(
+        "ffprobe", ["-show_format", "-show_streams", "x"]
+    ) == "probe"
 
 
 def test_t8_invalid_input_rejected_with_code(tmp_path):
