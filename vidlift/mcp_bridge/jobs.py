@@ -36,6 +36,7 @@ __all__ = [
     "CancelFlag",
     "JobExecutor",
     "JobOutcome",
+    "infer_phase",
 ]
 
 
@@ -83,6 +84,36 @@ class JobOutcome:
         self.result = result
 
 
+def infer_phase(binary: str, args: list[str]) -> str | None:
+    """Map one executed command to the runner phase that owns it —
+    honest inference from seam facts, never a claim the runner did
+    not make. The phase enum is the runner's own (probe | prepare |
+    upscale | encode | verify).
+
+    v0.4.0 (design B.6): the decode-count probe shapes (they carry
+    ``-count_frames``) map to ``upscale`` — the engine adapter's B.1
+    prepared-count probe and B.4 mezzanine gates run inside the
+    upscale phase."""
+    joined = " ".join(args)
+    if "-count_frames" in args:
+        return "upscale"  # B.1/B.4 decode-count probes (v0.4.0)
+    if "-show_format" in args and "-show_streams" in args:
+        return "probe"
+    if "idet" in args:
+        return "prepare"  # the sample pass runs in the prepare phase
+    if "libx265" in args:
+        return "encode"
+    if args and str(args[-1]) == "-" and "null" in args:
+        return "verify"
+    if "-show_streams" in args and "-show_format" not in args:
+        return "verify"
+    if "realesrgan" in binary or "realesrgan" in joined:
+        return "upscale"
+    if args and str(args[-1]).endswith(".prepared.mkv"):
+        return "prepare"
+    return None
+
+
 def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutcome:
     """One queued run job, one file, through the REAL runner seam."""
     from ..plan import PlanError
@@ -100,27 +131,6 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
 
     base_command_runner = services.command_runner
     base_probe_runner = services.probe_runner
-    def infer_phase(binary: str, args: list[str]) -> str | None:
-        """Map one executed command to the runner phase that owns it —
-        honest inference from seam facts, never a claim the runner did
-        not make. The phase enum is the runner's own (probe | prepare |
-        upscale | encode | verify)."""
-        joined = " ".join(args)
-        if "-show_format" in args and "-show_streams" in args:
-            return "probe"
-        if "idet" in args:
-            return "prepare"  # the sample pass runs in the prepare phase
-        if "libx265" in args:
-            return "encode"
-        if args and str(args[-1]) == "-" and "null" in args:
-            return "verify"
-        if "-show_streams" in args and "-show_format" not in args:
-            return "verify"
-        if "realesrgan" in binary or "realesrgan" in joined:
-            return "upscale"
-        if args and str(args[-1]).endswith(".prepared.mkv"):
-            return "prepare"
-        return None
 
     # The live-status seam (run_file's state_box): the runner hands the
     # executor the very RunState object it mutates, so the bridge's

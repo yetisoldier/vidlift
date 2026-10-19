@@ -6,6 +6,13 @@ BEFORE dispatch: unknown fields are rejected, types are checked
 present. The schemas double as the ``inputSchema`` surface
 ``tools/list`` reports, so the registered shapes ARE the validated
 shapes — one source of truth (the v0.2.32 lesson).
+
+v0.4.0 note (design B.6): ``status``'s payload already carries the
+runner's whole ``progress`` dict (it flows through
+``RunState.to_dict()``); the runner's step labels and heartbeat make
+that field MEAN something during the previously-blind windows
+(concat, gate probes, encode, verify). No schema change was needed —
+this module documents that fact instead of inventing a new field.
 """
 
 from __future__ import annotations
@@ -134,7 +141,9 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "status": (
         "The full runner observability contract for one job: state, phase, "
         "log tail, commands, phase timings, engine honesty fields, "
-        "verification, measured ETA (null unless measured)."
+        "verification, measured ETA (null unless measured). During long "
+        "steps the payload's runner progress carries a 'step' label and "
+        "last_activity_at advances (v0.4.0 heartbeat)."
     ),
     "cancel": (
         "Cooperative cancel. Queued jobs are removed without starting; "

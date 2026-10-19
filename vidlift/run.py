@@ -32,6 +32,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -77,6 +78,7 @@ __all__ = [
     "ensure_output_dir",
     "find_tools",
     "run_file",
+    "run_with_heartbeat",
     "verify_output",
 ]
 
@@ -223,6 +225,73 @@ def _subprocess_runner(binary: str, args: list[str]) -> tuple[int, str, str]:
     return result.returncode, result.stdout, result.stderr
 
 
+# v0.4.0 (design B.6): heartbeat cadence for long phases — the pump
+# polls/touches at HEARTBEAT_TOUCH_SECONDS and writes a log line at
+# most every HEARTBEAT_LOG_SECONDS, so the log tail alone disproves
+# "stuck" during a 65-minute encode or a 10-minute full decode.
+# Module-level constants so tests can shrink the cadence without
+# touching any call site.
+HEARTBEAT_TOUCH_SECONDS = 5.0
+HEARTBEAT_LOG_SECONDS = 30.0
+
+
+def run_with_heartbeat(
+    run_cmd: Runner,
+    binary: str,
+    args: list[str],
+    *,
+    touch: Callable[[], None],
+    log_line: Callable[[str], None] | None = None,
+    phase_name: str = "",
+    on_touch: Callable[[float], None] | None = None,
+    touch_seconds: float | None = None,
+    log_seconds: float | None = None,
+) -> tuple[int, str, str]:
+    """B.6: one blocking seam call pumped on a worker thread.
+
+    A poll loop (not signal/callback machinery — the B.10(4) risk
+    discipline): the seam call runs on a daemon thread while the pump
+    joins in short slices, touching the state every
+    ``HEARTBEAT_TOUCH_SECONDS`` and writing one throttled
+    ``phase <name>: heartbeat t=<n>s`` log line per
+    ``HEARTBEAT_LOG_SECONDS`` so a long encode or full decode never
+    reads as a frozen ``last_activity_at``. ``on_touch(elapsed)`` lets
+    the caller record an elapsed-time progress hint. Short commands
+    never enter this path (the callers opt in per long command)."""
+    touch_s = (
+        HEARTBEAT_TOUCH_SECONDS if touch_seconds is None else touch_seconds
+    )
+    log_s = HEARTBEAT_LOG_SECONDS if log_seconds is None else log_seconds
+    started = time.time()
+    box: dict = {}
+
+    def _work() -> None:
+        try:
+            box["result"] = run_cmd(binary, args)
+        except BaseException as exc:  # surfaced after the join
+            box["error"] = exc
+
+    thread = threading.Thread(
+        target=_work, daemon=True, name="vidlift-heartbeat"
+    )
+    thread.start()
+    next_log = started + log_s
+    while thread.is_alive():
+        thread.join(timeout=touch_s)
+        if thread.is_alive():
+            touch()
+            elapsed = time.time() - started
+            if on_touch is not None:
+                on_touch(elapsed)
+            if log_line is not None and time.time() >= next_log:
+                prefix = f"phase {phase_name}: " if phase_name else ""
+                log_line(f"{prefix}heartbeat t={elapsed:.0f}s")
+                next_log = time.time() + log_s
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
 @dataclass
 class EngineResult:
     """What the upscale engine reports back for the upscale phase.
@@ -242,6 +311,14 @@ class EngineResult:
     frame_clock: dict | None = None
     duration_gates: dict | None = None
     model_hashes_verified: bool | None = None
+    # v0.4.0 additive fields (design B.8, manifest schema v2):
+    # exact frame-gate record, per-chunk resume facts, and the
+    # retained rejected-mezzanine paths when a gate trip fired after
+    # reassembly. All optional/None so stub results and older
+    # consumers are unaffected.
+    frame_gates: dict | None = None
+    resume: dict | None = None
+    rejected_mezzanine: dict | None = None
 
 
 class EngineAdapter:
@@ -267,6 +344,7 @@ class EngineAdapter:
         *,
         cancel: Callable[[], bool] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        on_step: Callable[[str], None] | None = None,
     ) -> EngineResult:
         raise NotImplementedError(
             "no real engine adapter exists yet; the runner uses StubEngine "
@@ -297,6 +375,7 @@ class StubEngine(EngineAdapter):
         *,
         cancel: Callable[[], bool] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        on_step: Callable[[str], None] | None = None,
     ) -> EngineResult:
         self.calls.append(prepared_path)
         if cancel is not None and cancel():
@@ -320,7 +399,8 @@ class FakeEngine(StubEngine):
         super().__init__(note=note)
         self.error = error
 
-    def run(self, prepared_path, plan, tools, *, cancel=None, on_progress=None):
+    def run(self, prepared_path, plan, tools, *, cancel=None, on_progress=None,
+            on_step=None):
         self.calls.append(prepared_path)
         raise self.error
 
@@ -531,6 +611,7 @@ def verify_output(
     command: list[str] | None = None,
     decode_command: list[str] | None = None,
     full_decode: bool = True,
+    decode_runner: Runner | None = None,
 ) -> VerificationResult:
     """Verify the encode output exists, decodes, and matches plan geometry.
 
@@ -584,7 +665,11 @@ def verify_output(
         decode_cmd = decode_command if decode_command is not None else (
             build_decode_command(tools, plan.output_path)
         )
-        code, _out, err = runner(decode_cmd[0], decode_cmd[1:])
+        # v0.4.0 (B.6): the runner may route the minutes-long full
+        # decode through its heartbeat pump; the default stays the
+        # plain blocking runner for every other caller.
+        decode_run = decode_runner if decode_runner is not None else runner
+        code, _out, err = decode_run(decode_cmd[0], decode_cmd[1:])
         if code != 0:
             result.ok = False
             result.error = (
@@ -638,6 +723,14 @@ class RunState:
     finished_at: float | None = None
     ok: bool | None = None
     error: str | None = None
+    # v0.4.0 additive (design B.8): frame gates, resume facts, and the
+    # retained rejected-mezzanine paths (set when a gate trip fired
+    # after reassembly; carried from the engine either through a
+    # successful EngineResult or through the UpscaleError's
+    # ``rejected_mezzanine`` attribute on the fail-open path).
+    frame_gates: dict | None = None
+    resume: dict | None = None
+    rejected_mezzanine: dict | None = None
 
     def touch(self) -> None:
         self.last_activity_at = time.time()
@@ -682,6 +775,9 @@ class RunState:
             "finished_at": self.finished_at,
             "ok": self.ok,
             "error": self.error,
+            "frame_gates": self.frame_gates,
+            "resume": self.resume,
+            "rejected_mezzanine": self.rejected_mezzanine,
         }
 
 
@@ -773,10 +869,27 @@ def run_file(
         phase.finished_at = time.time()
         log(f"phase {phase.name}: done{(' ' + note) if note else ''}")
 
-    def run_command(phase_name: str, command: list[str]) -> None:
+    def run_command(
+        phase_name: str, command: list[str], *, heartbeat: bool = False,
+        on_touch: Callable[[float], None] | None = None,
+    ) -> None:
         state.commands.append(list(command))
         log(f"{phase_name} command: {' '.join(command)}")
-        code, stdout, stderr = run_cmd(command[0], command[1:])
+        if heartbeat:
+            # B.6: long commands opt in — encode and the full-decode
+            # verify can run tens of minutes; the pump keeps the
+            # state's last_activity true and the log tail alive.
+            code, stdout, stderr = run_with_heartbeat(
+                run_cmd,
+                command[0],
+                command[1:],
+                touch=state.touch,
+                log_line=log,
+                phase_name=phase_name,
+                on_touch=on_touch,
+            )
+        else:
+            code, stdout, stderr = run_cmd(command[0], command[1:])
         state.touch()
         if code != 0:
             raise VideoToolError(phase_name, command, code, stderr or stdout)
@@ -886,10 +999,23 @@ def run_file(
         phase = begin_phase(PHASE_UPSCALE)
 
         def record_progress(frames_done: int, frames_total: int) -> None:
-            state.progress = {
-                "frames_done": frames_done,
-                "frames_total": frames_total,
-            }
+            # B.6: merge, never replace — the "step" label set by
+            # record_step must survive frame-progress updates.
+            progress = dict(state.progress or {})
+            progress.update(
+                {"frames_done": frames_done, "frames_total": frames_total}
+            )
+            state.progress = progress
+            state.touch()
+
+        def record_step(label: str) -> None:
+            # B.6: the step-label seam — names WHAT is running during
+            # the previously-blind windows (concat, gate probes,
+            # encode, verify) and touches the state so a long phase
+            # never reads as stuck.
+            progress = dict(state.progress or {})
+            progress["step"] = label
+            state.progress = progress
             state.touch()
 
         mezzanine_for_encode: str | None = None
@@ -916,6 +1042,7 @@ def run_file(
             engine_result = active_engine.run(
                 prepared_path, plan, tools,
                 cancel=cancel, on_progress=record_progress,
+                on_step=record_step,
             )
         except UpscaleError as exc:
             # FAIL OPEN (clause d): the job ships the synchronized
@@ -937,6 +1064,12 @@ def run_file(
             state.engine_native_scale = None
             state.mezzanine_path = prepared_path
             mezzanine_for_encode = prepared_path
+            # v0.4.0 (B.5/B.8): when the adapter retained a rejected
+            # mezzanine + diagnostic, those paths ride into the state
+            # (and manifest) through the exception — no signature change.
+            state.rejected_mezzanine = getattr(
+                exc, "rejected_mezzanine", None
+            )
         else:
             state.mezzanine_path = engine_result.mezzanine_path
             state.engine_note = selection_note or engine_result.note
@@ -946,6 +1079,9 @@ def run_file(
             state.frame_clock = engine_result.frame_clock
             state.duration_gates = engine_result.duration_gates
             state.model_hashes_verified = engine_result.model_hashes_verified
+            state.frame_gates = engine_result.frame_gates
+            state.resume = engine_result.resume
+            state.rejected_mezzanine = engine_result.rejected_mezzanine
             mezzanine_for_encode = engine_result.mezzanine_path
             frames_done = engine_result.frames_done
         log(
@@ -961,8 +1097,21 @@ def run_file(
 
         # ---- encode ----
         phase = begin_phase(PHASE_ENCODE)
+        record_step("encode")
+
+        def _encode_hint(elapsed: float) -> None:
+            # B.6: an elapsed-time hint, honestly labeled — the pump is
+            # touch+log only (B.10(4) discipline), no stdout parsing.
+            progress = dict(state.progress or {})
+            progress["step"] = "encode"
+            progress["encode_seconds"] = elapsed
+            state.progress = progress
+
         run_command(
-            PHASE_ENCODE, build_encode_command(tools, plan, mezzanine_for_encode)
+            PHASE_ENCODE,
+            build_encode_command(tools, plan, mezzanine_for_encode),
+            heartbeat=True,
+            on_touch=_encode_hint,
         )
         if not os.path.isfile(plan.output_path):
             raise RunError(f"encode phase produced no file at {plan.output_path}")
@@ -970,14 +1119,41 @@ def run_file(
 
         # ---- verify ----
         phase = begin_phase(PHASE_VERIFY)
+        record_step("verify")
         verify_cmd = build_verification_command(tools, plan.output_path)
         decode_cmd = build_decode_command(tools, plan.output_path)
         state.commands.append(verify_cmd)
         state.commands.append(decode_cmd)
         log(f"verify command: {' '.join(verify_cmd)}")
         log(f"verify decode command: {' '.join(decode_cmd)}")
+
+        def _decode_runner(binary: str, args: list[str]) -> tuple[int, str, str]:
+            # B.6: the full decode (minutes on a feature file) runs
+            # through the heartbeat pump; the cheap ffprobe geometry
+            # check keeps the plain blocking path.
+            def _decode_hint(elapsed: float) -> None:
+                progress = dict(state.progress or {})
+                progress["step"] = "verify"
+                progress["decode_seconds"] = elapsed
+                state.progress = progress
+
+            return run_with_heartbeat(
+                run_cmd,
+                binary,
+                args,
+                touch=state.touch,
+                log_line=log,
+                phase_name=PHASE_VERIFY,
+                on_touch=_decode_hint,
+            )
+
         verification = verify_output(
-            tools, plan, runner=run_cmd, command=verify_cmd, decode_command=decode_cmd
+            tools,
+            plan,
+            runner=run_cmd,
+            command=verify_cmd,
+            decode_command=decode_cmd,
+            decode_runner=_decode_runner,
         )
         state.verification = verification
         state.touch()
@@ -1078,6 +1254,9 @@ def _build_manifest(
             "benchmark_constant": state.benchmark_constant,
             "cancelled": state.cancelled,
             "sample_verdict": state.sample_verdict,
+            "frame_gates": state.frame_gates,
+            "resume": state.resume,
+            "rejected_mezzanine": state.rejected_mezzanine,
         },
         "tools": tools.to_dict(),
         "probe": {
@@ -1144,6 +1323,9 @@ def _write_failure_manifest(state: RunState, tools: ToolBox) -> None:
                 "model_hashes_verified": state.model_hashes_verified,
                 "duration_gates": state.duration_gates,
                 "cancelled": state.cancelled,
+                "frame_gates": state.frame_gates,
+                "resume": state.resume,
+                "rejected_mezzanine": state.rejected_mezzanine,
             },
             "tools": tools.to_dict() if tools else None,
             "artifacts": {
