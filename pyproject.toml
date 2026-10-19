@@ -1,6 +1,6 @@
 [project]
 name = "vidlift"
-version = "0.3.0"
+version = "0.4.0"
 description = "Batch AI upscaler for SD video files (AVI/XviD/DivX, MP4, MOV, MKV, WMV, FLV, MPEG) to 720p HEVC MP4"
 readme = "README.md"
 requires-python = ">=3.12"
