@@ -1,0 +1,3 @@
+packaging/models/*.bin binary
+packaging/models/*.param binary
+packaging/app_icon.ico binary
