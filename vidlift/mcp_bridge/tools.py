@@ -124,8 +124,19 @@ def _report_payload(report) -> dict:
             for a in report.audio
         ],
         "subtitles": [
-            {"codec_name": s.codec_name, "kind": s.kind, "lang": s.lang}
+            {
+                "codec_name": s.codec_name,
+                "kind": s.kind,
+                "lang": s.lang,
+                # v0.4.1 additive: the stream index (the extraction /
+                # selected-track map authority, §B.1)
+                "index": s.index,
+            }
             for s in report.subtitles
+        ],
+        # v0.4.1 additive: adopted sidecars, reported never silent (§B.1)
+        "sidecars": [
+            {"path": sc.path, "kind": sc.kind} for sc in report.sidecars
         ],
         "source_class": report.source_class,
         "displayed_width": report.displayed_width,
@@ -158,6 +169,22 @@ def _plan_payload(plan) -> dict:
         "estimated_output_bytes": plan.estimated_output_bytes,
         "expectation": plan.expectation,
         "subtitle_note": plan.subtitle_note,
+        # v0.4.1 additive (design §B.7): the structured subtitle plan;
+        # additive keys only, no protocol bump.
+        "subtitle_plan": (
+            {
+                "source": plan.subtitle_plan.source,
+                "stream_index": plan.subtitle_plan.stream_index,
+                "sidecar_path": plan.subtitle_plan.sidecar_path or None,
+                "kind": plan.subtitle_plan.kind,
+                "codec_name": plan.subtitle_plan.codec_name,
+                "lang": plan.subtitle_plan.lang,
+                "ocr_required": plan.subtitle_plan.ocr_required,
+            }
+            if plan.subtitle_plan is not None
+            else None
+        ),
+        "subtitle_style_loss": plan.subtitle_style_loss,
         "warnings": warnings,
     }
     if plan.eta_estimate is not None:
@@ -432,6 +459,11 @@ def _status_payload(services: BridgeServices, record) -> dict:
                 "verification": data["verification"],
                 "manifest_path": data["manifest_path"],
                 "error": data["error"] or record.error,
+                # v0.4.1 additive: the subtitles phase outcome rides the
+                # existing status contract (§B.7) — additive key, no
+                # protocol bump; progress["step"] already names OCR
+                # steps through v0.4.0's record_step machinery.
+                "subtitles": data["subtitles"],
             }
         )
         payload["eta_seconds"] = _eta_seconds(services, record, state)

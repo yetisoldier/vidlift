@@ -8,6 +8,7 @@ of hours-long jobs cannot depend on a GUI babysitter.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from . import __version__
@@ -63,7 +64,13 @@ def _render_report(report) -> str:
         lines.append("  audio: none")
     if report.subtitles:
         parts = [f"{s.codec_name} ({s.kind})" for s in report.subtitles]
+        if report.sidecars:
+            names = ", ".join(os.path.basename(sc.path) for sc in report.sidecars)
+            parts.append(f"sidecar noted but not adopted ({names}; embedded subs win)")
         lines.append("  subtitles: " + ", ".join(parts))
+    elif report.sidecars:
+        names = ", ".join(os.path.basename(sc.path) for sc in report.sidecars)
+        lines.append("  subtitles: none embedded; sidecar candidate: " + names)
     else:
         lines.append("  subtitles: none")
     lines.append(f"  source class: {report.source_class}")
@@ -103,6 +110,25 @@ def _render_plan(item) -> str:
     )
     lines.append(f"  estimated size: {_format_bytes(item.estimated_output_bytes)}")
     lines.append(f"  subtitles: {item.subtitle_note}")
+    # v0.4.1 (design §B.7): the plan names the disposition — which
+    # track, how carried, OCR engine, and the honest style-loss note
+    # for ASS sources (mov_text carries plain text + timing only).
+    sp = item.subtitle_plan
+    if sp is not None:
+        if sp.source == "embedded":
+            target = f"stream {sp.stream_index} ({sp.codec_name})"
+        else:
+            target = f"sidecar {os.path.basename(sp.sidecar_path)}"
+        if sp.ocr_required:
+            engine = "seconv" if os.name == "nt" else "tesseract"
+            lines.append(f"  subtitle plan: {target} -> OCR ({engine}) -> mov_text + sidecar")
+        else:
+            lines.append(f"  subtitle plan: {target} -> mov_text + sidecar")
+    if item.subtitle_style_loss:
+        lines.append(
+            "  warning: ASS/SSA styling does not survive mov_text "
+            "conversion (plain text + timing only)"
+        )
     lines.append(f"  expectation: {item.expectation}")
     if report.pal_speedup_suspected:
         lines.append("  warning: PAL speedup suspected; VidLift will process as-is")
@@ -233,6 +259,30 @@ def _cmd_run(
         )
     if state.engine_note:
         print(f"engine note: {state.engine_note}")
+    # v0.4.1: the subtitle outcome, honestly — carried/ocr/none/failed-open
+    subs = state.subtitles
+    if subs is not None:
+        status = subs.get("status", "none")
+        if status == "failed-open":
+            print(
+                "subtitles: FAILED OPEN - shipped without subtitles; "
+                f"{subs.get('reason', 'unknown reason')}"
+            )
+            for warning in subs.get("warnings", []):
+                print(f"  subtitle warning: {warning}")
+        elif status == "ocr":
+            ocr = subs.get("ocr", {})
+            print(
+                f"subtitles: OCR carried ({ocr.get('engine', '?')}, "
+                f"{ocr.get('cue_count', '?')} cues); spot-check spelling"
+            )
+            sidecar = subs.get("sidecar_path")
+            if sidecar:
+                print(f"  sidecar: {sidecar}")
+        elif status == "carried":
+            print("subtitles: carried (mov_text embedded + .srt sidecar)")
+        else:
+            print("subtitles: none")
     print(f"log: {state.log.path if state.log else 'none'}")
     print(f"manifest: {result.manifest_path}")
     print("phases:")

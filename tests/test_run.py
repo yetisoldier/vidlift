@@ -171,6 +171,18 @@ class FakeRunner:
             if self.prepare_exit == 0:
                 Path(args[-1]).write_bytes(b"prepared-stub")
             return self.prepare_exit, "", "prepare boom" if self.prepare_exit else ""
+        if args and args[-1].endswith(".vidlift.720p.hevc.mp4") and "-i" in args and any(a.endswith(".srt") for a in args):
+            # v0.4.1: the mov_text mux into the finished MP4 writes a
+            # temp sibling that mux_srt_into_mp4 then replaces over the
+            # output (temp-then-replace atomicity)
+            if self.encode_exit == 0:
+                Path(args[-1]).write_bytes(b"muxed-output-stub")
+            return self.encode_exit, "", "mux boom" if self.encode_exit else ""
+        if args and args[-1].endswith(".srt") and "-map" in args:
+            # v0.4.1: embedded-text sidecar extraction (-c:s srt)
+            if self.prepare_exit == 0:
+                Path(args[-1]).write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+            return self.prepare_exit, "", "srt boom" if self.prepare_exit else ""
         if args and args[-1].endswith(".vidlift.720p.hevc.mp4"):
             if self.encode_exit == 0 and self.encode_writes_output:
                 Path(args[-1]).write_bytes(b"output-stub")
@@ -329,9 +341,13 @@ class TestRunFilePhases:
     def test_happy_path_sequences_all_phases(self, tmp_path):
         result, runner = run_happy(tmp_path)
         state = result.state
+        # v0.4.1: the subtitles phase slots between verify and done,
+        # optional by presence — this source has no subs, so it runs
+        # and records 'skipped' in milliseconds.
         assert [p.name for p in state.phases] == [
             PHASE_PROBE, PHASE_PLAN, PHASE_PREPARE,
             PHASE_UPSCALE, PHASE_ENCODE, PHASE_VERIFY,
+            "subtitles",
         ]
         assert state.current_phase == PHASE_DONE
         assert all(p.duration_seconds is not None for p in state.phases)
@@ -398,9 +414,13 @@ class TestRunFilePhases:
         assert manifest["verification"]["ok"] is True
         assert manifest["verification"]["actual_geometry"] == [1280, 720]
         assert manifest["artifacts"]["output_path"] == result.plan.output_path
+        # v0.4.1: probe+prepare+encode+verify-probe+decode = 5 with no
+        # subtitle track (the skipped phase adds no commands); the
+        # phases list gains the skipped subtitles phase.
         assert len(manifest["commands"]) == 5
         assert [p["name"] for p in manifest["phases"]] == [
             "probe", "plan", "prepare", "upscale", "encode", "verify",
+            "subtitles",
         ]
         assert all(p["duration_seconds"] is not None for p in manifest["phases"])
 
@@ -578,6 +598,11 @@ class TestEncodeCommand:
         enc = find_command(result.state.commands, "libx265")
         text = " ".join(enc)
         assert "mov_text" in text
+        # v0.4.1: the SELECTED track maps by explicit probe index (the
+        # all-or-nothing -map 1:s? is gone); language is tagged honestly.
+        # elements are '-map' '1:2' as separate argv tokens
+        assert "-map" in enc and "1:2" in enc
+        assert "language=eng" in text
         assert "-map" in enc and "1:a:0" in enc
         assert f"-b:v {result.plan.video_bitrate_kbps}k" in text
         assert f"-b:a {result.plan.audio.bitrate_kbps}k" in text
@@ -901,8 +926,8 @@ class TestFailOpen:
         assert [p.name for p in state.phases] == [
             PHASE_PROBE, PHASE_PLAN, PHASE_PREPARE,
             PHASE_UPSCALE, PHASE_ENCODE, PHASE_VERIFY,
+            "subtitles",  # v0.4.1: skipped (no track selected)
         ]
-        # the shipped output was encoded from the PREPARED file
         assert state.mezzanine_path == state.prepared_path
         # the engine was attempted and is named
         assert state.engine_name == "FakeEngine"

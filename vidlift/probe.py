@@ -20,7 +20,7 @@ import math
 import os
 import subprocess
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 __all__ = [
@@ -29,10 +29,13 @@ __all__ = [
     "MediaProbe",
     "ProbeError",
     "Runner",
+    "SIDECAR_SRT_SUFFIX",
+    "SidecarInfo",
     "SubtitleInfo",
     "VideoInfo",
     "classify",
     "displayed_size",
+    "find_sidecars",
     "probe_and_classify",
     "probe_args",
     "probe_file",
@@ -128,9 +131,30 @@ class AudioInfo:
 
 @dataclass
 class SubtitleInfo:
+    """One embedded subtitle stream (v0.4.1 gains the stream index).
+
+    ``index`` is the ffprobe stream index required for extraction
+    ``-map 0:N`` and for the selected-track encode map (v0.4.1 design
+    §B.1: today the probe drops it; the OCR/mux machinery needs it).
+    """
+
     codec_name: str
     kind: str  # "text" | "image" | "other"
     lang: str
+    index: int = -1  # ffprobe stream index; -1 = absent (back-compat)
+
+
+@dataclass
+class SidecarInfo:
+    """An adopted same-stem subtitle sidecar (v0.4.1 design §B.1).
+
+    ``kind`` mirrors SubtitleInfo's vocabulary: "text" (.srt) or
+    "image" (.sub+.idx VobSub pair). Adoption is reported, never
+    silent: this lands in the report, the plan, and the manifest.
+    """
+
+    path: str
+    kind: str
 
 
 @dataclass
@@ -149,7 +173,12 @@ class MediaProbe:
 class FileReport:
     """Classified probe: what v0.2's pre-flight report and the engine
     consume. Everything here is read or derived from the file itself;
-    nothing is guessed."""
+    nothing is guessed.
+
+    v0.4.1 additive (design §B.1): ``sidecars`` lists the adopted
+    same-stem subtitle files found next to the source (empty list by
+    default; older consumers unaffected).
+    """
 
     path: str
     container: str
@@ -163,6 +192,7 @@ class FileReport:
     upscale_verdict: str  # "candidate" | "already-hd" | "no-video"
     interlaced_flagged: bool
     pal_speedup_suspected: bool
+    sidecars: list[SidecarInfo] = field(default_factory=list)
 
 
 def _parse_ratio(text: object) -> tuple[int, int] | None:
@@ -255,6 +285,7 @@ def parse_probe(path: str, text: str) -> MediaProbe:
                     codec_name=codec_name,
                     kind=_subtitle_kind(codec_name),
                     lang=lang,
+                    index=int(stream.get("index", -1)),
                 )
             )
 
@@ -351,6 +382,40 @@ def _classify_source(probe: MediaProbe, displayed_height: int) -> str:
     return SOURCE_OTHER
 
 
+# v0.4.1 (design §B.1): the sidecar adoption set. Same directory,
+# exact stem match; <stem>.srt first, then the VobSub <stem>.sub+
+# <stem>.idx pair (an OCR candidate of last resort). Strange stems
+# (movie.English.srt) are deliberately NOT globbed — one exact stem,
+# first match wins (multi-language discovery is the §B.9 follow-up).
+SIDECAR_SRT_SUFFIX = ".srt"
+
+
+def find_sidecars(source_path: str) -> list[SidecarInfo]:
+    """Discover same-stem subtitle sidecars next to the source (§B.1).
+
+    Rules: same directory, exact stem (case-insensitive on Windows,
+    exact on Linux), first match wins, in this order: <stem>.srt (text
+    pass-through), <stem>.sub+<stem>.idx (VobSub pair, OCR candidate
+    of last resort). Reported, never silent — the caller surfaces the
+    adoption in the report/plan/manifest. Embedded truth wins: a
+    sidecar alongside a source WITH embedded text subs is noted but
+    not used (that policy lives in plan.py; discovery is a fact
+    gatherer here).
+    """
+    source = Path(source_path)
+    stem = source.stem
+    found: list[SidecarInfo] = []
+    srt = source.with_name(stem + ".srt")
+    if srt.is_file():
+        found.append(SidecarInfo(path=str(srt), kind="text"))
+        return found
+    sub = source.with_name(stem + ".sub")
+    idx = source.with_name(stem + ".idx")
+    if sub.is_file() and idx.is_file():
+        found.append(SidecarInfo(path=str(sub), kind="image"))
+    return found
+
+
 def _pal_speedup_suspected(video: VideoInfo) -> bool:
     """Heuristic for the classic PAL transfer of a film source.
 
@@ -383,6 +448,7 @@ def classify(probe: MediaProbe) -> FileReport:
             upscale_verdict="no-video",
             interlaced_flagged=False,
             pal_speedup_suspected=False,
+            sidecars=find_sidecars(probe.path),
         )
     dw, dh = displayed_size(video.width, video.height, video.sar)
     if 0 < dh <= SD_MAX_DISPLAYED_HEIGHT:
@@ -402,6 +468,7 @@ def classify(probe: MediaProbe) -> FileReport:
         upscale_verdict=verdict,
         interlaced_flagged=video.interlaced_flagged,
         pal_speedup_suspected=_pal_speedup_suspected(video),
+        sidecars=find_sidecars(probe.path),
     )
 
 

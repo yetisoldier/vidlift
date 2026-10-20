@@ -9,6 +9,7 @@ consumes this plan.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -18,6 +19,11 @@ from .probe import (
     SOURCE_H264_SD,
     SOURCE_OTHER,
     SOURCE_XVID_DIVX_AVI,
+)
+from .subtitles import (
+    HANDLED_BITMAP_CODECS,
+    SubtitlePlan,
+    intermediate_ext,
 )
 
 __all__ = [
@@ -30,6 +36,7 @@ __all__ = [
     "build_file_plan",
     "estimate_video_bitrate_kbps",
     "output_geometry",
+    "select_subtitle_track",
 ]
 
 GB = 1_000_000_000
@@ -68,6 +75,16 @@ class PlannedFile:
     # bucket. Additive with a default, so every existing constructor
     # call and consumer is unaffected.
     eta_estimate: dict | None = None
+    # v0.4.1 additive (design §B.7): the structured subtitle plan —
+    # which stream/sidecar was selected, whether OCR is required, and
+    # the engine lane. None = no subtitle track was selected (the
+    # honest 'none'; a fact, not a warning). free-text subtitle_note
+    # stays for back-compat.
+    subtitle_plan: SubtitlePlan | None = None
+    # v0.4.1 additive (design §B.3): True when the selected embedded
+    # text track is ASS/SSA — styling does not survive mov_text
+    # conversion; stated, never hidden.
+    subtitle_style_loss: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,20 +162,151 @@ def _expectation(report: FileReport) -> str:
     return "inspect the sample before a full run"
 
 
+def select_subtitle_track(report: FileReport) -> SubtitlePlan | None:
+    """The deterministic probe-side selection rule (design §B.2).
+
+    The file-first replacement for b2m's scan-side recommend.py, porting
+    the Eric-approved philosophy verbatim in rule (English preferred,
+    players can toggle off; one track; commentary-descriptive skipped is
+    a §B.9 follow-up — v0.4.1 selects purely on kind/lang):
+
+    1. Any embedded TEXT sub -> the first text stream, English-tagged
+       first, lowest stream index as tie-break.
+    2. Else any handled-bitmap sub (PGS/VobSub) -> the first such
+       stream, same preference — the OCR candidate. One stream only.
+    3. Else the adopted sidecar (§B.1 discovery), if any.
+    4. Else None — recorded as the honest 'none', a fact, not a
+       warning.
+
+    Plan-time decision, run-time execution (the repo's established
+    split): the run phase consumes the plan with zero decision logic.
+    """
+    text_subs = [s for s in report.subtitles if s.kind == "text"]
+    if text_subs:
+        chosen = min(
+            text_subs,
+            key=lambda s: (0 if s.lang in ("eng", "en") else 1, s.index),
+        )
+        return SubtitlePlan(
+            source="embedded",
+            stream_index=chosen.index,
+            sidecar_path="",
+            kind="text",
+            codec_name=chosen.codec_name,
+            lang=chosen.lang,
+            ocr_required=False,
+        )
+    bitmap_subs = [
+        s
+        for s in report.subtitles
+        if s.kind == "image" and s.codec_name in HANDLED_BITMAP_CODECS
+    ]
+    if bitmap_subs:
+        chosen = min(
+            bitmap_subs,
+            key=lambda s: (0 if s.lang in ("eng", "en") else 1, s.index),
+        )
+        return SubtitlePlan(
+            source="embedded",
+            stream_index=chosen.index,
+            sidecar_path="",
+            kind="image",
+            codec_name=chosen.codec_name,
+            lang=chosen.lang,
+            ocr_required=True,
+        )
+    for sidecar in report.sidecars:
+        if sidecar.kind == "text":
+            return SubtitlePlan(
+                source="sidecar",
+                stream_index=-1,
+                sidecar_path=sidecar.path,
+                kind="text",
+                codec_name="srt",
+                lang="",  # a sidecar has no tag until muxed; honesty rule -> und
+                ocr_required=False,
+            )
+        if sidecar.kind == "image":
+            return SubtitlePlan(
+                source="sidecar",
+                stream_index=-1,
+                sidecar_path=sidecar.path,
+                kind="image",
+                codec_name="vobsub",
+                lang="",
+                ocr_required=True,
+            )
+    return None
+
+
 def _subtitle_note(report: FileReport) -> str:
-    if not report.subtitles:
+    """Describe the PLAN, not just the inventory (design §B.7).
+
+    v0.4.1 rewrite: today's 'listed only; no OCR in VidLift' verdict is
+    replaced by the disposition — which track carries, how, and what
+    is skipped. A mixed text+bitmap file now reports carrying the
+    text track (the old all-or-nothing silence is the gap v0.4.1
+    closes).
+    """
+    selected = select_subtitle_track(report)
+    if selected is None:
+        if report.sidecars:
+            # Discovery found a sidecar but selection did not adopt it
+            # (embedded truth wins). Name it so the disk file never
+            # surprises anyone when a player auto-loads it.
+            names = ", ".join(os.path.basename(s.path) for s in report.sidecars)
+            return f"none carried; sidecar noted beside source ({names})"
         return "none"
+    parts: list[str] = []
+    if selected.kind == "text" and selected.source == "embedded":
+        parts.append(
+            f"text track {selected.stream_index} ({selected.codec_name}) "
+            "carried as mov_text + sidecar"
+        )
+    elif selected.kind == "text" and selected.source == "sidecar":
+        parts.append(
+            f"sidecar {os.path.basename(selected.sidecar_path)} adopted "
+            "as the text track (muxed mov_text + copied sidecar)"
+        )
+    elif selected.kind == "image" and selected.source == "embedded":
+        engine = "seconv" if os.name == "nt" else "tesseract"
+        parts.append(
+            f"bitmap track {selected.stream_index} ({selected.codec_name}) "
+            f"-> OCR ({engine}) -> mov_text + sidecar"
+        )
+    elif selected.kind == "image" and selected.source == "sidecar":
+        engine = "seconv" if os.name == "nt" else "tesseract"
+        parts.append(
+            f"sidecar {os.path.basename(selected.sidecar_path)} adopted as "
+            f"OCR candidate -> OCR ({engine}) -> mov_text + sidecar"
+        )
+    # The unselected remainder, honestly named.
     text = sum(1 for s in report.subtitles if s.kind == "text")
     image = sum(1 for s in report.subtitles if s.kind == "image")
     other = len(report.subtitles) - text - image
-    parts: list[str] = []
-    if text:
-        parts.append(f"{text} text stream(s) can be carried as mov_text")
-    if image:
-        parts.append(f"{image} image stream(s) listed only; no OCR in VidLift")
-    if other:
-        parts.append(f"{other} unknown subtitle stream(s) listed only")
-    return "; ".join(parts)
+    if selected.source == "embedded":
+        if selected.kind == "text":
+            skipped_image = image
+            skipped_other = other
+            skipped_text = text - 1
+        else:
+            skipped_image = image - 1
+            skipped_other = other
+            skipped_text = text
+    else:
+        skipped_image = image
+        skipped_other = other
+        skipped_text = text
+    skipped: list[str] = []
+    if skipped_text:
+        skipped.append(f"{skipped_text} text stream(s) not selected")
+    if skipped_image:
+        skipped.append(f"{skipped_image} bitmap stream(s) listed only")
+    if skipped_other:
+        skipped.append(f"{skipped_other} unknown stream(s) listed only")
+    if skipped:
+        parts.append("; " + ", ".join(skipped))
+    return ". ".join(parts) if False else "; ".join(parts)
 
 
 def _process_verdict(report: FileReport) -> str:
@@ -189,6 +337,13 @@ def build_file_plan(
     estimated_bytes = None
     if report.duration_seconds is not None:
         estimated_bytes = int(gb_per_hour * GB * report.duration_seconds / 3600)
+    subtitle_plan = select_subtitle_track(report)
+    style_loss = bool(
+        subtitle_plan is not None
+        and subtitle_plan.source == "embedded"
+        and subtitle_plan.kind == "text"
+        and subtitle_plan.codec_name in ("ass", "ssa")
+    )
     return PlannedFile(
         report=report,
         target=target,
@@ -202,6 +357,8 @@ def build_file_plan(
         expectation=_expectation(report),
         subtitle_note=_subtitle_note(report),
         process_verdict=_process_verdict(report),
+        subtitle_plan=subtitle_plan,
+        subtitle_style_loss=style_loss,
     )
 
 

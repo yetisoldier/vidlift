@@ -46,6 +46,16 @@ from .probe import (
     probe_and_classify,
     probe_args,
 )
+from .subtitles import (
+    SubtitleOcrError,
+    SubtitlePlan,
+    mux_language,
+    mux_srt_into_mp4,
+    resolve_seconv,
+    resolve_tesseract,
+    run_subtitle_ocr,
+    sidecar_srt_path,
+)
 
 __all__ = [
     "EngineAdapter",
@@ -59,6 +69,7 @@ __all__ = [
     "PHASE_PLAN",
     "PHASE_PREPARE",
     "PHASE_PROBE",
+    "PHASE_SUBTITLES",
     "PHASE_UPSCALE",
     "PHASE_VERIFY",
     "RunError",
@@ -92,6 +103,13 @@ PHASE_PREPARE = "prepare"
 PHASE_UPSCALE = "upscale"
 PHASE_ENCODE = "encode"
 PHASE_VERIFY = "verify"
+# v0.4.1 (design §B.4): the subtitles phase between verify and done.
+# OCR operates on the SOURCE file but muxes into the FINISHED MP4, so
+# it must run after encode; after verify keeps verify's scope purely
+# A/V structural (§B.5 adds the cheap subtitle assertion there
+# instead of reordering). Optional by presence: no selected track ->
+# the phase records 'skipped' and ends in milliseconds.
+PHASE_SUBTITLES = "subtitles"
 PHASE_DONE = "done"
 
 PHASE_ORDER = [
@@ -101,6 +119,7 @@ PHASE_ORDER = [
     PHASE_UPSCALE,
     PHASE_ENCODE,
     PHASE_VERIFY,
+    PHASE_SUBTITLES,
     PHASE_DONE,
 ]
 
@@ -432,6 +451,14 @@ class VerificationResult:
     the ffmpeg decode-every-frame pass (roadmap item 1 / b12) that
     runs on otherwise-good outputs before the run may be called
     verified.
+
+    v0.4.1 additive (design §B.5): ``subtitle_ok``/``subtitle_detail``
+    carry the cheap subtitle assertion — when the plan selected a
+    track the output must contain a mov_text stream; when none was
+    selected it asserts none. A mismatch is REPORTED, never a
+    verification hard-fail: subtitle loss must not fail an
+    otherwise-good 5-hour upscale (fail-open asymmetry, Eric-approved:
+    A/V integrity is gating, subtitle presence is reporting).
     """
 
     output_path: str
@@ -443,6 +470,9 @@ class VerificationResult:
     actual_geometry: tuple[int, int] | None = None
     expected_geometry: tuple[int, int] | None = None
     error: str | None = None
+    subtitle_expected: bool = False
+    subtitle_ok: bool | None = None
+    subtitle_detail: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -455,6 +485,9 @@ class VerificationResult:
             "actual_geometry": list(self.actual_geometry) if self.actual_geometry else None,
             "expected_geometry": list(self.expected_geometry) if self.expected_geometry else None,
             "error": self.error,
+            "subtitle_expected": self.subtitle_expected,
+            "subtitle_ok": self.subtitle_ok,
+            "subtitle_detail": self.subtitle_detail,
         }
 
 
@@ -519,33 +552,47 @@ def build_encode_command(
 ) -> list[str]:
     """ffmpeg command encoding the mezzanine to the planned MP4.
 
-    The encode planner is already media-agnostic (docs/design.md):
-    HEVC at the planned geometry and bitrate (the final lanczos
-    downscale to the 720p frame happens here, after the engine's 2x),
-    AAC at the planned bitrate, chapters dropped per the design, and
-    text subtitles carried as mov_text. Audio and subtitles come from
-    the ORIGINAL file -- the mezzanine is video-only by contract.
+    The encode planner is media-agnostic (docs/design.md): HEVC at the
+    planned geometry and bitrate (the final lanczos downscale to the
+    720p frame happens here, after the engine's 2x), AAC at the
+    planned bitrate, chapters dropped per the design. Audio and
+    subtitles come from the ORIGINAL file -- the mezzanine is
+    video-only by contract.
 
-    Subtitle carry rule for this slice: all subtitle streams map only
-    when every one is text; mixed text/image files carry none (image
-    subs are never OCR'd and mov_text cannot hold them), matching the
-    planner's "listed only" note.
+    Subtitle carry rule (v0.4.1, design §B.3): the PLANNED text track
+    maps by explicit stream index (``-map 1:<idx> -c:s mov_text``),
+    replacing v0.4.0's all-or-nothing gate -- a mixed text+bitmap
+    file now ships its text track instead of silently dropping
+    everything. Bitmap tracks are skipped here (mov_text cannot hold
+    them); the selected bitmap track rides the OCR stage and muxes
+    after verify. A sidecar-selected text plan also skips this map
+    (there is nothing embedded to map) and muxes post-encode.
     """
     report = plan.report
-    text_subs = [s for s in report.subtitles if s.kind == "text"]
-    carry_subs = bool(text_subs) and all(s.kind == "text" for s in report.subtitles)
+    sub_plan = plan.subtitle_plan
+    embed_text_in_encode = bool(
+        sub_plan is not None
+        and sub_plan.source == "embedded"
+        and sub_plan.kind == "text"
+    )
     cmd = [
         tools.ffmpeg,
         "-hide_banner", "-loglevel", "error", "-nostdin",
         "-i", mezzanine_path,
     ]
-    if report.audio or carry_subs:
+    if report.audio or embed_text_in_encode:
         cmd += ["-i", report.path]
     cmd += ["-map", "0:v:0"]
     if report.audio:
+        # Audio from the SOURCE's first stream. MUST follow the engine's
+        # stamp derivation (engine_ncnn.probe_audio_extent_seconds): if
+        # audio selection ever becomes configurable, both seams move
+        # together or the derived clock is silently wrong.
         cmd += ["-map", "1:a:0"]
-    if carry_subs:
-        cmd += ["-map", "1:s?"]
+    if embed_text_in_encode:
+        # The selected text track by its probe index (plan-time
+        # decision, run-time execution).
+        cmd += ["-map", f"1:{sub_plan.stream_index}"]
     cmd += [
         "-c:v", "libx265",
         "-b:v", f"{plan.video_bitrate_kbps}k",
@@ -554,8 +601,12 @@ def build_encode_command(
     ]
     if report.audio:
         cmd += ["-c:a", "aac", "-b:a", f"{plan.audio.bitrate_kbps}k"]
-    if carry_subs:
-        cmd += ["-c:s", "mov_text"]
+    if embed_text_in_encode:
+        cmd += [
+            "-c:s", "mov_text",
+            "-metadata:s:s:0",
+            f"language={mux_language(sub_plan.lang)}",
+        ]
     cmd += ["-map_chapters", "-1", "-movflags", "+faststart", "-y", plan.output_path]
     return cmd
 
@@ -654,6 +705,39 @@ def verify_output(
     result.actual_geometry = actual
     result.geometry_ok = actual == expected
     result.ok = True
+    # v0.4.1 (design §B.5): the cheap subtitle assertion — REPORTED,
+    # never gating. When the plan selected a track the output must
+    # hold a mov_text stream; when none was selected a stray map must
+    # not have smuggled one in. A mismatch lands as a run warning via
+    # subtitle_detail; verification's ok is untouched (the fail-open
+    # asymmetry: A/V integrity gates, subtitle presence reports).
+    sub_plan = getattr(plan, "subtitle_plan", None)
+    expected_sub = bool(
+        sub_plan is not None
+        and sub_plan.source == "embedded"
+        and sub_plan.kind == "text"
+    )
+    result.subtitle_expected = expected_sub
+    mov_text = [
+        s
+        for s in streams
+        if s.get("codec_type") == "subtitle"
+        and s.get("codec_name") == "mov_text"
+    ]
+    if expected_sub and not mov_text:
+        result.subtitle_ok = False
+        result.subtitle_detail = (
+            "planned subtitle track missing from the encode output "
+            "(no mov_text stream); reported, not gated"
+        )
+    elif not expected_sub and mov_text:
+        result.subtitle_ok = False
+        result.subtitle_detail = (
+            f"unexpected mov_text stream(s) in the output ({len(mov_text)}); "
+            "reported, not gated"
+        )
+    else:
+        result.subtitle_ok = True
     if not result.geometry_ok:
         result.ok = False
         result.error = (
@@ -731,6 +815,12 @@ class RunState:
     frame_gates: dict | None = None
     resume: dict | None = None
     rejected_mezzanine: dict | None = None
+    # v0.4.1 additive (design §B.7): the subtitles phase outcome —
+    # status ('carried' | 'ocr' | 'none' | 'failed-open'), the selected
+    # plan echo, OCR facts, sidecar/embed paths, and the honest
+    # warnings. None until the phase runs; absent = older consumer
+    # unaffected (schema v2 additive convention).
+    subtitles: dict | None = None
 
     def touch(self) -> None:
         self.last_activity_at = time.time()
@@ -778,6 +868,7 @@ class RunState:
             "frame_gates": self.frame_gates,
             "resume": self.resume,
             "rejected_mezzanine": self.rejected_mezzanine,
+            "subtitles": self.subtitles,
         }
 
 
@@ -1166,6 +1257,165 @@ def run_file(
             note="ok" if verification.ok else f"not ok ({verification.error})",
         )
 
+        # ---- subtitles (v0.4.1, design §B.4/B.8) ----
+        # The phase is optional by presence: no selected track -> the
+        # phase records 'skipped' and ends in milliseconds. Every
+        # failure inside is fail-open (§B.8): a subtitle problem NEVER
+        # fails the run, blocks the upscale, or converts to a RunError
+        # — the honest warning names what happened and what to install.
+        phase = begin_phase(PHASE_SUBTITLES)
+        subtitles_block: dict = {"status": "none"}
+        sub_plan = getattr(plan, "subtitle_plan", None)
+        if sub_plan is None:
+            subtitles_block["status"] = "none"
+            end_phase(phase, note="skipped (no subtitle track selected)")
+        else:
+            # Plan-time decision, run-time execution: the selection was
+            # made in build_file_plan; here we only execute it.
+            subtitles_block["selected"] = {
+                "source": sub_plan.source,
+                "stream_index": sub_plan.stream_index,
+                "sidecar_path": sub_plan.sidecar_path,
+                "kind": sub_plan.kind,
+                "codec_name": sub_plan.codec_name,
+                "lang": sub_plan.lang,
+                "ocr_required": sub_plan.ocr_required,
+            }
+            warnings: list[str] = []
+            sidecar_target = sidecar_srt_path(plan.output_path)
+            try:
+                if sub_plan.kind == "text" and sub_plan.source == "embedded":
+                    # Embedded text was carried IN the encode (mov_text,
+                    # selected-index map). Extract the same stream as an
+                    # .srt sidecar post-encode (the KEEP disposition,
+                    # §B.3): ffmpeg transcodes the stream to SRT.
+                    record_step("subtitle-sidecar-extract")
+                    extract_cmd = [
+                        tools.ffmpeg,
+                        "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+                        "-i", report.path,
+                        "-map", f"0:{sub_plan.stream_index}",
+                        "-c:s", "srt",
+                        sidecar_target,
+                    ]
+                    run_command(PHASE_SUBTITLES, extract_cmd)
+                    if os.path.isfile(sidecar_target):
+                        subtitles_block["status"] = "carried"
+                        subtitles_block["sidecar_path"] = sidecar_target
+                        subtitles_block["embedded"] = {
+                            "codec": "mov_text",
+                            "language_tag": mux_language(sub_plan.lang),
+                        }
+                    else:
+                        raise SubtitleOcrError(
+                            "text sidecar extraction produced no file"
+                        )
+                elif sub_plan.kind == "text" and sub_plan.source == "sidecar":
+                    # Adopted .srt sidecar (§B.3): copy to the output
+                    # sidecar, mux mov_text into the finished MP4 with
+                    # the temp-then-replace atomicity.
+                    shutil.copyfile(sub_plan.sidecar_path, sidecar_target)
+                    record_step("subtitle-mux")
+                    mux_srt_into_mp4(
+                        plan.output_path,
+                        sidecar_target,
+                        language=sub_plan.lang,
+                        ffmpeg=tools.ffmpeg,
+                        runner=run_cmd,
+                    )
+                    subtitles_block["status"] = "carried"
+                    subtitles_block["sidecar_path"] = sidecar_target
+                    subtitles_block["embedded"] = {
+                        "codec": "mov_text",
+                        "language_tag": mux_language(sub_plan.lang),
+                    }
+                else:
+                    # The bitmap OCR path (embedded or adopted sidecar).
+                    # Engine resolution is explicit per platform (§A.3):
+                    # Windows = seconv payload; Linux = direct tesseract;
+                    # missing tool = fail-open warning, never a refusal.
+                    engine = "seconv" if os.name == "nt" else "tesseract"
+                    try:
+                        if engine == "seconv":
+                            seconv_binary = resolve_seconv()
+                        else:
+                            tesseract_binary = resolve_tesseract()
+                    except SubtitleOcrError as exc:
+                        raise SubtitleOcrError(
+                            f"no usable OCR engine on this platform: {exc}"
+                        ) from exc
+                    ocr_kwargs: dict = {}
+                    if engine == "seconv":
+                        ocr_kwargs["seconv_binary"] = seconv_binary
+                    else:
+                        ocr_kwargs["tesseract_binary"] = tesseract_binary
+                    ocr_source = (
+                        report.path if sub_plan.source == "embedded"
+                        else sub_plan.sidecar_path
+                    )
+                    ocr_workdir = str(log_root / f"{run_id}.ocr-work")
+                    ocr_result = run_subtitle_ocr(
+                        sub_plan,
+                        ocr_source,
+                        plan.output_path,
+                        ffmpeg=tools.ffmpeg,
+                        runner=run_cmd,
+                        workdir=ocr_workdir,
+                        on_step=record_step,
+                        on_progress=lambda done, total: record_progress(
+                            done, total
+                        ),
+                        **ocr_kwargs,
+                    )
+                    subtitles_block["status"] = "ocr"
+                    subtitles_block["sidecar_path"] = ocr_result.srt_path
+                    subtitles_block["ocr"] = {
+                        "engine": ocr_result.engine,
+                        "language": ocr_result.language,
+                        "cue_count": ocr_result.cue_count,
+                        "auto_resolved": ocr_result.auto_resolved_note,
+                        "notes": list(ocr_result.notes),
+                    }
+                    record_step("subtitle-mux")
+                    mux_srt_into_mp4(
+                        plan.output_path,
+                        ocr_result.srt_path,
+                        language=sub_plan.lang,
+                        ffmpeg=tools.ffmpeg,
+                        runner=run_cmd,
+                    )
+                    subtitles_block["embedded"] = {
+                        "codec": "mov_text",
+                        "language_tag": mux_language(sub_plan.lang),
+                    }
+                    for note in ocr_result.notes:
+                        log(f"subtitles: {note}")
+                        warnings.append(note)
+            except SubtitleOcrError as exc:
+                # FAIL OPEN (§B.8): the run ships video+audio; the
+                # warning names the failure; the manifest records
+                # failed-open. The sidecar, when one was written, is
+                # kept (mux-failure wording distinguishes 'embed
+                # failed; sidecar kept' from 'no subtitles').
+                reason = str(exc)
+                log(f"WARNING: subtitles failed open: {reason}")
+                warnings.append(reason)
+                subtitles_block["status"] = "failed-open"
+                subtitles_block["reason"] = reason
+                if os.path.isfile(sidecar_target):
+                    subtitles_block["sidecar_path"] = sidecar_target
+                    subtitles_block["sidecar_kept"] = True
+                    warnings.append(
+                        "embed failed; sidecar kept next to the output"
+                    )
+            subtitles_block["warnings"] = warnings
+            state.subtitles = subtitles_block
+            end_phase(
+                phase,
+                note=subtitles_block["status"],
+            )
+        state.subtitles = subtitles_block
+
         # ---- manifest + finish ----
         state.ok = verification.ok
         state.finished_at = time.time()
@@ -1257,6 +1507,12 @@ def _build_manifest(
             "frame_gates": state.frame_gates,
             "resume": state.resume,
             "rejected_mezzanine": state.rejected_mezzanine,
+            # v0.4.1 additive (design §B.7): the subtitles phase outcome —
+            # status/carried/ocr/none/failed-open, selected echo, OCR
+            # facts, sidecar/embed paths, warnings. Absent = pre-0.4.1
+            # consumer; additive schema v2, no bump (the doc pins this:
+            # v3 is only warranted for breaking changes; there are none).
+            "subtitles": state.subtitles,
         },
         "tools": tools.to_dict(),
         "probe": {
@@ -1274,6 +1530,23 @@ def _build_manifest(
             "audio_bitrate_kbps": plan.audio.bitrate_kbps,
             "estimated_output_bytes": plan.estimated_output_bytes,
             "subtitle_note": plan.subtitle_note,
+            # v0.4.1 additive (design §B.7): the structured subtitle plan
+            # echo and the ASS style-loss fact. Every key optional;
+            # v1/v2-unextended consumers unaffected.
+            "subtitle_plan": (
+                {
+                    "source": plan.subtitle_plan.source,
+                    "stream_index": plan.subtitle_plan.stream_index,
+                    "sidecar_path": plan.subtitle_plan.sidecar_path or None,
+                    "kind": plan.subtitle_plan.kind,
+                    "codec_name": plan.subtitle_plan.codec_name,
+                    "lang": plan.subtitle_plan.lang,
+                    "ocr_required": plan.subtitle_plan.ocr_required,
+                }
+                if plan.subtitle_plan is not None
+                else None
+            ),
+            "subtitle_style_loss": plan.subtitle_style_loss,
         },
         "artifacts": {
             "prepared_path": state.prepared_path,
