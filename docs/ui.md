@@ -95,19 +95,26 @@ shows.
 
 ## Monitor via MCP
 
-Any local MCP agent sees the same registry the GUI writes to:
+An MCP server reads the same registry the GUI writes to, **as of
+server startup**: the `vidlift mcp-server` stdio server loads
+`$VIDLIFT_STATE_DIR/jobs.json` once when it starts and does not
+re-scan live processes afterwards.
 
-- `list` — queued, running, and finished job ids (include GUI runs).
+- `list` — job ids known to the server at its startup.
 - `status {job_id}` — the full runner state contract: current phase,
   progress frames, log tail, engine honesty fields, ETA when measured.
 - `manifest {job_id}` — the run manifest verbatim.
-- `cancel {job_id}` — the same cooperative cancel the GUI's button
-  uses; both fronts land on one flag.
+
+Practical contract:
+
+- A server started **before** GUI jobs run will not see them.
+- To inspect GUI-started runs, start (or restart) the MCP server
+  after the run completes.
+- Cancelling a live GUI job from a separate MCP server process is
+  not supported in v0.4.4 (queued for v0.4.5).
 
 The registry lives in one state directory per machine
 (`$VIDLIFT_STATE_DIR/jobs.json`, default `~/.vidlift` in development
-and the per-platform app-data dir in packaged builds), so the packaged
-GUI and an agent-side server share job history by default.
-
-The `vidlift mcp-server` stdio server runs against the same registry
-files; nothing in the GUI duplicates its state.
+and the per-platform app-data dir in packaged builds); the stdio
+server runs against the same files, and nothing in the GUI
+duplicates its state.

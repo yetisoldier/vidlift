@@ -578,6 +578,49 @@ def test_a2_parity_stub_row_reads_no_ai_upscale(window, tmp_path):
     assert window.file_table.item(0, 0).text() == "succeeded"
 
 
+def test_run_panel_survives_first_tick_while_queued(window, tmp_path):
+    """D1 regression (v0.4.4 validation): the first 1 Hz tick fires
+    while the job is still QUEUED (production always hits this — the
+    worker has not claimed it yet). The liveness timer must stay
+    alive, the run panel must keep updating, and the row must reach
+    its terminal text once the registry finishes the job."""
+    plan = _plan_for(tmp_path)
+    window.batch = batch_plan_from([plan])
+    window.render_batch(window.batch)
+    window.start_upscale()
+    job_id = window.job_ids[0]
+    assert window.client.registry.require(job_id).state == "queued"
+
+    # Tick 1 — production timing: nothing has been claimed yet.
+    window._tick_elapsed()
+    assert window._elapsed_timer.isActive(), "liveness died on tick 1"
+    assert window._run_started_at is not None, "run clock died on tick 1"
+    assert window.activity_dots._timer.isActive(), "dots died on tick 1"
+    assert not window.engine_combo.isEnabled(), "engine unlocked mid-run"
+
+    # Tick 2 — the worker claims and runs.
+    record = window.client.registry.require(job_id)
+    record.state = "running"
+    record.current_phase = "upscale"
+    record.progress = {"frames_done": 100, "frames_total": 800}
+    window._tick_elapsed()
+    assert window._elapsed_timer.isActive(), "liveness died while running"
+    assert "upscaling" in window.stage_label.text()
+    assert window.file_table.item(0, 0).text() == "running"
+
+    # Tick 3 — terminal; NOW the panel may conclude.
+    record.state = "succeeded"
+    record.ok = True
+    record.engine_simulated = True
+    record.finished_at = time.time()
+    window._tick_elapsed()
+    assert window.file_table.item(0, 0).text() == "completed (no AI upscale)"
+    assert window.job_ids == []
+    assert window._run_started_at is None, "run clock never stopped"
+    assert not window._elapsed_timer.isActive()
+    assert window.engine_combo.isEnabled()
+
+
 def test_stage_label_names_bridge_facts():
     from vidlift.gui import run_stage_label
     assert run_stage_label(None) == ""

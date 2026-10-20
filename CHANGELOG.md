@@ -6,17 +6,18 @@ All notable changes to VidLift. Dates are America/Chicago.
 
 GUI/status/MCP unification (binding design:
 `docs/designs/v0.4.4-gui-status-mcp-unified.md`). The desktop app
-becomes a view over the MCP bridge's persistent job registry: agents
-see GUI-started runs via `list`/`status`/`manifest`, and `cancel` is
-one flag shared by both fronts.
+becomes a view over the MCP bridge's persistent job registry: a
+server started after the run sees GUI-started jobs via
+`list`/`status`/`manifest`; live cross-process `cancel` is v0.4.5.
 
 ### Added
 
 - **Unified job path for GUI runs.** Start enqueues one tracked
   JobRecord per ready file through the bridge's registry/JobExecutor
   (`vidlift.mcp_bridge.client_local`); the serialized single-worker
-  rule is unchanged, and MCP agents see GUI jobs exactly like their
-  own. The old in-thread `UpscaleWorker` is retired.
+  rule is unchanged, and a server started after the run sees GUI
+  jobs exactly like its own. The old in-thread `UpscaleWorker` is
+  retired.
 - **Engine selector in the GUI** with the exact three in-tree choices
   (`auto` / `ncnn` / `stub`), persisted to QSettings; a stale saved
   value reads as `auto`. The choice rides the job's options into the

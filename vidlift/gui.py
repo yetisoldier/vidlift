@@ -764,7 +764,13 @@ class MainWindow(QMainWindow):
                     f"{Path(snapshot.get('file_path') or '?').name}: {state}"
                 )
         self.job_ids = still_active if still_active else []
-        if self._run_started_at is not None:
+        if self._run_started_at is not None and not self.job_ids:
+            # The batch actually finished (every job reached a terminal
+            # state and was drained above). Running this on every tick
+            # would stop the liveness timer on the FIRST tick while
+            # jobs are still queued/running — the run panel would
+            # freeze at "queued" forever (the v0.4.4 validation D1
+            # repro: timer dead, rows never update).
             self._batch_finished(terminal_notes)
 
     def _consume_running_snapshot(self, row: int, snapshot: dict, stage: str) -> None:
