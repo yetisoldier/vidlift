@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -19,9 +20,10 @@ def _executable(path: Path) -> Path:
 
 
 def test_frozen_app_finds_adjacent_ffmpeg_and_ffprobe(tmp_path, monkeypatch):
-    app = _executable(tmp_path / "VidLift")
-    ffmpeg = _executable(tmp_path / "tools" / "ffmpeg")
-    ffprobe = _executable(tmp_path / "tools" / "ffprobe")
+    suffix = ".exe" if os.name == "nt" else ""
+    app = _executable(tmp_path / f"VidLift{suffix}")
+    ffmpeg = _executable(tmp_path / "tools" / f"ffmpeg{suffix}")
+    ffprobe = _executable(tmp_path / "tools" / f"ffprobe{suffix}")
     monkeypatch.setattr(run_module.sys, "frozen", True, raising=False)
     monkeypatch.setattr(run_module.sys, "executable", str(app))
 
@@ -39,9 +41,10 @@ def test_windows_engine_name_prefers_exe():
 
 
 def test_frozen_app_finds_adjacent_realesrgan(tmp_path, monkeypatch):
-    app = _executable(tmp_path / "VidLift")
+    suffix = ".exe" if os.name == "nt" else ""
+    app = _executable(tmp_path / f"VidLift{suffix}")
     engine = _executable(
-        tmp_path / "tools" / "realesrgan" / "realesrgan-ncnn-vulkan"
+        tmp_path / "tools" / "realesrgan" / f"realesrgan-ncnn-vulkan{suffix}"
     )
     monkeypatch.setattr("vidlift.tools_realesrgan.sys.frozen", True, raising=False)
     monkeypatch.setattr("vidlift.tools_realesrgan.sys.executable", str(app))
@@ -51,7 +54,8 @@ def test_frozen_app_finds_adjacent_realesrgan(tmp_path, monkeypatch):
 
 
 def test_frozen_app_finds_adjacent_ocr_tools(tmp_path, monkeypatch):
-    app = _executable(tmp_path / "VidLift")
+    suffix = ".exe" if os.name == "nt" else ""
+    app = _executable(tmp_path / f"VidLift{suffix}")
     seconv = _executable(tmp_path / "tools" / "SubtitleEdit" / "seconv.exe")
     tesseract = _executable(
         tmp_path

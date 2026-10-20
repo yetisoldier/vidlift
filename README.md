@@ -1,104 +1,116 @@
 # VidLift
 
-Batch AI upscaler for SD video files: it takes the obscure 1990s-2000s
-movie shelf (AVI/XviD/DivX rips, MPEG-2 DVD rips, early MP4/MOV files,
-WMV, FLV) and turns each file into a clean 720p HEVC MP4.
+VidLift converts older standard-definition video files into clean 720p HEVC
+MP4s using a local Real-ESRGAN ncnn/Vulkan upscale pipeline.
 
-VidLift is a private, personal tool for Eric's own collection. It is
-the sibling of bluray-to-mp4: a different product (drop files, get
-better MP4s) that shares the same AI upscale engine core. It knows
-nothing about discs, drives, or ripping.
+It supports common AVI, DivX, Xvid, MPEG, MP4, MOV, MKV, WMV, FLV, TS, M4V,
+and VOB inputs. VidLift probes each file, chooses safe geometry and
+deinterlacing behavior, preserves usable audio and subtitles, runs the AI
+upscale, encodes the final MP4, and verifies the result.
 
-**License:** none. This is a private repo and a personal tool, so no
-formal license is attached; nothing here is intended for distribution.
+## Download for Windows 11
 
-## Windows 11 installer
+1. Open the [latest release](https://github.com/yetisoldier/vidlift/releases/latest).
+2. Download **VidLift-<version>-Windows-x64-Setup.exe**.
+3. Run the installer.
+4. Leave **Create a desktop shortcut** selected if you want quick access.
+5. Launch **VidLift** from the Start menu or desktop.
 
-Download the latest `VidLift-<version>-Windows-x64-Setup.exe` from
-[GitHub Releases](https://github.com/yetisoldier/vidlift/releases).
-The installer includes the GUI, CLI, FFmpeg/ffprobe, the Real-ESRGAN
-ncnn/Vulkan engine with VidLift's verified x2plus model, and the
-unattended subtitle OCR tools. Python is not required.
+The installer includes VidLift, FFmpeg/ffprobe, Real-ESRGAN ncnn/Vulkan,
+the verified x2plus model, and unattended subtitle OCR tools. Python is not
+required.
 
-The installer is currently unsigned, so Windows SmartScreen may show
-an **Unknown publisher** warning. The matching `.sha256` file on the
-release verifies the download.
+> The installer is currently unsigned. Windows SmartScreen may display an
+> **Unknown publisher** warning. The release includes a SHA-256 checksum file
+> so you can verify the download.
 
-## Status
+## Plan a batch
 
-**v0.4.2.** What exists today:
+Open VidLift, then drag video files into the window or select **Add Files**
+or **Add Folder**. Choose an optional output folder and select **Plan Batch**.
 
-- The probe/classify core: `vidlift probe FILE...` inspects any
-  video file with ffprobe and reports resolution, SAR, displayed
-  geometry, field order, frame rates, codec, container, duration,
-  audio channels, subtitle types, a source-class guess, and a
-  PAL-speedup suspicion.
-- The batch pre-flight planner: `vidlift plan FILE...` turns probe
-  data into target geometry, bitrate/size estimates, output names,
-  subtitle notes, and honest expectations before a long upscale run.
-- The single-file runner: `vidlift run FILE` drives one file
-  end-to-end (probe, plan, prepare, upscale, encode, verify) with
-  full observability: a run log with every command line, phase
-  timings, last-activity timestamps, explicit missing-tool errors,
-  output verification, and a per-run artifact manifest. The upscale
-  phase uses a stub engine today (the real file-first engine adapter
-  is deferred until bluray-to-mp4 ships it); manifests record
-  `engine_simulated: true` so nothing overclaims.
-- The PyQt planning workbench: `vidlift gui` gives the same planner a
-  batch-table interface with drag/drop, output-folder selection, and
-  selected-file details.
-- The documentation suite under [docs/](docs/).
+![VidLift home screen](docs/images/vidlift-home.png)
 
-The real ncnn/Vulkan AI engine and FIFO bulk queue are available through
-the CLI/MCP runner. The desktop GUI currently plans batches but does not
-yet expose start/cancel controls for the upscale queue.
+The plan shows which files are ready, source type, output geometry, estimated
+size, subtitle handling, and warnings. Select a row to see the complete
+file-level explanation.
 
-## Quick start (what you can actually run today)
+![VidLift planned batch](docs/images/vidlift-planned-batch.png)
 
-Requires Python 3.12+ and ffprobe on PATH (ffmpeg too, for `run`).
+The desktop interface currently plans batches. Start/cancel controls for the
+upscale queue are not yet exposed in the GUI.
 
-```
-python -m venv .venv
-.venv/bin/pip install -e .
-.venv/bin/vidlift --version
-.venv/bin/vidlift probe some_movie.avi another_clip.mov
-.venv/bin/vidlift plan --target 720p --gbph 1.5 some_movie.avi
-.venv/bin/vidlift run some_movie.avi
-.venv/bin/vidlift gui
-```
+## Run an upscale
 
-For development:
+Open PowerShell and run:
 
-```
-python -m venv /tmp/vidlift-venv
-/tmp/vidlift-venv/bin/pip install -e .
-QT_QPA_PLATFORM=offscreen /tmp/vidlift-venv/bin/python -m pytest -q
-```
+~~~powershell
+$vidlift = "$env:LOCALAPPDATA\Programs\VidLift\vidlift-cli.exe"
+& $vidlift run "D:\Videos\movie.avi" --output-dir "D:\Videos\Upscaled" --engine ncnn
+~~~
+
+VidLift performs:
+
+1. source probe and classification
+2. pre-flight plan
+3. deinterlace/prepare when required
+4. Real-ESRGAN AI upscale
+5. 720p HEVC MP4 encode
+6. full verification
+7. subtitle pass-through or OCR when possible
+
+## Bulk upscaling
+
+The OpenClaw/MCP interface accepts multiple paths in one request and queues one
+job per file through a single FIFO worker. This prevents multiple upscales from
+fighting for the same GPU.
+
+Example request to Jarvis:
+
+> Queue every supported video in D:\Videos\To Upscale through VidLift and
+> report when the batch finishes.
+
+The native CLI currently starts one file per command. The desktop GUI can plan
+multiple files but does not yet start the queue.
+
+## What you receive
+
+For each successful job, VidLift writes:
+
+- a verified 720p HEVC MP4
+- an SRT sidecar when a subtitle was selected or recovered
+- a run log with commands, phases, and heartbeat activity
+- a JSON manifest with the input, plan, engine, timing, outputs, and
+  verification result
+
+Run records are stored in **.vidlift-runs** beside the source unless a different
+log directory is supplied.
+
+## Hardware and storage
+
+- Windows 11 x64
+- Vulkan-capable GPU and current graphics driver for AI upscaling
+- enough free space for temporary decoded frames and the final MP4
+- local storage is strongly recommended for long runs
 
 ## Documentation
 
-- [Usage](docs/usage.md)
-- [CLI reference](docs/cli.md)
-- [UI guide](docs/ui.md)
+- [User guide](docs/usage.md)
+- [Desktop interface](docs/ui.md)
+- [Command-line reference](docs/cli.md)
+- [Troubleshooting](docs/usage.md#troubleshooting)
 - [Development](docs/development.md)
 - [Architecture](docs/architecture.md)
 - [Roadmap](docs/roadmap.md)
-- [Design](docs/design.md)
 
-## Planned shape (v0.2 and beyond)
+## Current limitations
 
-- Real engine adapter: when bluray-to-mp4 ships its file-first seam,
-  `vidlift.run.EngineAdapter` gets one implementation and the runner
-  changes zero lines. Sample-based source classification and a full
-  decode pass during verification come with it.
-- Per-file pre-flight report before any hours-long job: probe,
-  classify, one tiny timed engine sample, then projected wall clock,
-  projected output size, and an honest expectation string.
-- Batch queue with per-file status over the proven single-file runner;
-  the queue is the product.
-- CLI for unattended runs, from day one (`vidlift-cli`): hours-long
-  jobs must never depend on a GUI babysitter at 3 AM.
-- Output: 720p-frame HEVC MP4 (16:9 -> 1280x720, 4:3 -> 960x720),
-  anamorphic-safe, AAC audio, text subtitles passed through.
+- GUI start/cancel and live queue controls are not implemented yet.
+- The CLI runs one file per command; bulk queueing is available through MCP.
+- Output target is currently 720p.
+- PAL speedup is reported but not corrected.
+- Chapters are not preserved.
+- OCR is best effort and fails open so a subtitle problem does not discard a
+  completed video.
 
-See [docs/design.md](docs/design.md) for the full plan.
+Copyright © 2026 YetiWurks LLC. All rights reserved.

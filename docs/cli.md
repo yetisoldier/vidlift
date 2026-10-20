@@ -1,99 +1,124 @@
-# VidLift CLI Reference
+# VidLift Command-Line Reference
 
-## `vidlift --version`
+The Windows installer places the CLI at:
 
-Print the installed VidLift version.
+    %LOCALAPPDATA%\Programs\VidLift\vidlift-cli.exe
 
-## `vidlift probe FILE...`
+PowerShell convenience:
 
-Probe one or more video files with `ffprobe` and print the classified source report.
+~~~powershell
+$vidlift = "$env:LOCALAPPDATA\Programs\VidLift\vidlift-cli.exe"
+~~~
+
+## Version and help
+
+~~~powershell
+& $vidlift --version
+& $vidlift --help
+& $vidlift run --help
+~~~
+
+## Probe files
+
+~~~powershell
+& $vidlift probe "D:\Videos\movie.avi" "D:\Videos\clip.mov"
+~~~
+
+The report includes container, codecs, duration, displayed geometry, frame
+rates, audio, subtitles, source class, and upscale verdict.
 
 Exit codes:
 
-- `0`: all files probed successfully
-- `1`: at least one file failed to probe
-- `2`: command-line usage error
+- **0:** every file probed successfully
+- **1:** one or more files failed
+- **2:** command-line usage error
 
-## `vidlift plan FILE...`
+## Plan files
 
-Build a pre-flight plan for one or more files.
+~~~powershell
+& $vidlift plan --target 720p --gbph 1.5 --output-dir "D:\Videos\Upscaled" "D:\Videos\movie.avi" "D:\Videos\clip.mov"
+~~~
 
 Options:
 
-- `--target 720p`: output frame target. Only `720p` exists today.
-- `--gbph NUMBER`: target gigabytes per hour. Default: `1.5`.
-- `--output-dir DIR`: plan outputs into a shared directory instead of beside each input.
+- **--target 720p:** output frame target
+- **--gbph NUMBER:** approximate output gigabytes per hour; default 1.5
+- **--output-dir PATH:** shared output directory
 
-Example:
+Planning does not start an upscale.
 
-```bash
-vidlift plan --target 720p --gbph 1.5 --output-dir /media/upscaled *.avi
-```
+## Run one file
 
-Exit codes:
+~~~powershell
+& $vidlift run "D:\Videos\movie.avi" --output-dir "D:\Videos\Upscaled" --engine ncnn
+~~~
 
-- `0`: all files planned successfully
-- `1`: at least one file failed to probe
-- `2`: invalid plan options or command-line usage error
-
-## `vidlift run FILE`
-
-Run ONE file end-to-end through the runner pipeline: probe, plan,
-prepare, upscale, encode, verify. This is the first execution
-milestone; batch logic and UI controls arrive later as clients of
-this same runner.
+The command runs probe, plan, prepare, upscale, encode, verification, and
+subtitle handling.
 
 Options:
 
-- `--target 720p`: output frame target. Only `720p` exists today.
-- `--gbph NUMBER`: target gigabytes per hour. Default `1.5`.
-- `--output-dir DIR`: where the output MP4 goes (default: beside the input).
-- `--ffmpeg PATH` / `--ffprobe PATH`: explicit tool paths (packaged
-  builds pass bundled binaries here). Environment fallbacks:
-  `VIDLIFT_FFMPEG`, `VIDLIFT_FFPROBE`, then `PATH`. A missing tool is
-  an explicit error naming the tool, never a silent guess.
-- `--log-dir DIR`: where run logs/manifests go
-  (default: `INPUT_DIR/.vidlift-runs`).
+- **--target 720p:** output target
+- **--gbph NUMBER:** approximate output gigabytes per hour
+- **--output-dir PATH:** final MP4 destination
+- **--log-dir PATH:** run log and manifest directory
+- **--engine auto|ncnn|stub:** engine selection
+- **--ffmpeg PATH / --ffprobe PATH:** override bundled binaries
+- **--realesrgan PATH:** override the bundled ncnn executable
+- **--realesrgan-models PATH:** override the bundled model directory
 
-What each run leaves behind:
+Engine behavior:
 
-- the output MP4 (verified to exist, decode, and match planned geometry);
-- a `.log` file with every command line and phase transition (the log
-  tail is the health source, not a progress percent);
-- a `.manifest.json` artifact manifest: inputs, plan, command lines,
-  outputs, phase timings, verification result, and engine status.
-
-**Current limitation (honest):** the upscale phase runs a stub
-engine, not Real-ESRGAN. bluray-to-mp4's validated path is
-chunk-directory based (disc-shaped); its file-first seam does not
-exist yet. A stub run is a REAL ffmpeg re-encode of the prepared
-source at the planned bitrate/geometry — the pipeline machinery,
-observability, and verification are real; the AI pass is not. Every
-manifest records `engine_simulated: true`. Also deferred until the
-real adapter lands: the 60-second sample inspection that classifies
-progressive / hard 3:2 telecine / genuine interlace (the probe's
-interlace flag drives the deinterlace decision today), and a full
-decode pass during verification (the encode's own `-loglevel error`
-exit plus an ffprobe container/geometry check stand in for it).
-
-Example:
-
-```bash
-vidlift run --gbph 1.5 --output-dir /media/upscaled movie.avi
-```
+- **ncnn:** require the real AI engine
+- **auto:** use ncnn when tool resolution and the GPU probe succeed; otherwise
+  record the fallback
+- **stub:** deliberately bypass AI for pipeline testing
 
 Exit codes:
 
-- `0`: run completed and the output verified
-- `1`: run failed (probe, plan verdict, command failure, or verification)
-- `2`: missing external tool (a setup problem, not a media problem)
+- **0:** output completed and verified
+- **1:** media, pipeline, or verification failure
+- **2:** missing required external tool
 
-## `vidlift gui`
+## Benchmark
 
-Open the PyQt planning workbench.
+~~~powershell
+& $vidlift benchmark "D:\Videos\sample.avi" --duration 30 --engine ncnn
+~~~
 
-## Script Aliases
+This measures a short sample on the current machine and records a local timing
+constant for honest ETA calculations.
 
-- `vidlift`: primary command
-- `vidlift-cli`: same CLI entry point, reserved for unattended automation naming
-- `vidlift-gui`: opens the GUI directly
+Options:
+
+- **--duration SECONDS:** sample duration, clamped to 10 through 120
+- **--engine auto|ncnn|stub**
+- **--work-dir PATH**
+- the same FFmpeg and Real-ESRGAN override options as **run**
+
+## Open the GUI
+
+~~~powershell
+& $vidlift gui
+~~~
+
+The Start menu shortcut launches the same planning interface directly.
+
+## Start the MCP server
+
+~~~powershell
+& $vidlift mcp-server
+~~~
+
+Optional:
+
+- **--state-dir PATH:** registry and benchmark state directory
+
+The MCP bridge provides batch queueing, status, cancellation, manifests, and
+benchmarks to compatible clients such as OpenClaw.
+
+## Bulk behavior
+
+The CLI accepts multiple files for **probe** and **plan**, but **run** starts one
+file per command. Bulk upscaling is provided by the MCP bridge, which creates
+one job per input and processes the queue FIFO through one worker.

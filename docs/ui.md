@@ -1,27 +1,43 @@
-# VidLift UI
+# VidLift Desktop Interface
 
-The UI is a focused batch planning workbench. It exists to make the pre-flight decision fast: which files are worth running, how big the outputs will be, and which warnings matter.
+The desktop app is a batch planning workbench. It lets you inspect several
+videos together before committing GPU hours to an upscale.
 
-## Layout
+## Home screen
 
-- Top summary: queued/ready count and total planned size.
-- Control strip: add files, add a folder, clear, set GB/hour, choose output folder, plan batch.
-- Batch table: verdict, file, source class, target geometry, estimated size, subtitle note, and warnings.
-- Details pane: selected-file explanation in plain text for easy copying.
+![VidLift home screen](images/vidlift-home.png)
 
-## Supported Input
+### Controls
 
-The UI accepts file picker selection, folder selection, and drag/drop. Folder adds include common video extensions only.
+- **Add Files:** select one or more videos.
+- **Add Folder:** add supported videos directly inside one folder.
+- **Clear:** remove the current list.
+- **GB/hour:** set the approximate final size per hour of video.
+- **Output Folder:** send every planned MP4 to one destination.
+- **Plan Batch:** probe and classify every listed file.
 
-## Design Intent
+Files can also be dragged into the window.
 
-The interface is intentionally quiet and operational. VidLift is an hours-long batch tool, so the UI prioritizes scanning, comparison, and trustworthy warnings over decoration.
+## Planned batch
 
-## Not Yet In The UI
+![VidLift planned batch](images/vidlift-planned-batch.png)
 
-- Start/Cancel encoding controls
-- Sample benchmark timing
-- Per-file progress
-- Preset management
+The top-right summary shows the ready count and estimated combined output size.
 
-Those belong with the encode runner rather than the planner-only release.
+The table shows:
+
+- verdict
+- source path
+- detected source class
+- target geometry
+- estimated output size
+- subtitle disposition
+- warnings
+
+Select any row to read the complete file-level plan in the right pane.
+
+## What the GUI does not do yet
+
+The desktop app does not currently start, cancel, or monitor upscale jobs. Use
+the installed CLI for a single file or the OpenClaw/MCP interface for a bulk
+queue. These controls are planned for a future GUI release.
