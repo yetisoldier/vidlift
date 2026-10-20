@@ -153,14 +153,6 @@ jobs:
           $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
           "$hash  $(Split-Path $setup -Leaf)" | Set-Content "$setup.sha256"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: VidLift-${{ env.VIDLIFT_VERSION }}-Windows-x64
-          path: |
-            output/VidLift-${{ env.VIDLIFT_VERSION }}-Windows-x64-Setup.exe
-            output/VidLift-${{ env.VIDLIFT_VERSION }}-Windows-x64-Setup.exe.sha256
-          if-no-files-found: error
-
       - name: Publish GitHub release
         shell: pwsh
         env:
