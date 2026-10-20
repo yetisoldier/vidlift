@@ -90,14 +90,22 @@ Runner = Callable[[str, list[str]], "tuple[int, str, str]"]
 
 def real_runner(binary: str, args: list[str]) -> tuple[int, str, str]:
     """Run a real ffprobe command and return (code, stdout, stderr)."""
-    result = subprocess.run(
+    # v0.4.4 (design §6): Popen + the Windows-only child-console
+    # suppression kwargs (startupinfo/CREATE_NO_WINDOW; empty dict
+    # elsewhere) so GUI-driven probes never flash a console window.
+    from . import _proc
+
+    proc = subprocess.Popen(
         [binary, *args],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
+        **_proc.popen_kwargs(),
     )
-    return result.returncode, result.stdout, result.stderr
+    stdout, stderr = proc.communicate()
+    return proc.returncode, stdout, stderr
 
 
 @dataclass

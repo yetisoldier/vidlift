@@ -2,6 +2,59 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.4] - 2026-10-20
+
+GUI/status/MCP unification (binding design:
+`docs/designs/v0.4.4-gui-status-mcp-unified.md`). The desktop app
+becomes a view over the MCP bridge's persistent job registry: agents
+see GUI-started runs via `list`/`status`/`manifest`, and `cancel` is
+one flag shared by both fronts.
+
+### Added
+
+- **Unified job path for GUI runs.** Start enqueues one tracked
+  JobRecord per ready file through the bridge's registry/JobExecutor
+  (`vidlift.mcp_bridge.client_local`); the serialized single-worker
+  rule is unchanged, and MCP agents see GUI jobs exactly like their
+  own. The old in-thread `UpscaleWorker` is retired.
+- **Engine selector in the GUI** with the exact three in-tree choices
+  (`auto` / `ncnn` / `stub`), persisted to QSettings; a stale saved
+  value reads as `auto`. The choice rides the job's options into the
+  existing honest `select_engine` machinery — no GUI-side resolution.
+- **Run panel with proven progress behavior** (port of
+  bluray-to-mp4's UI discipline): stage labels naming what is running
+  (probe/prepare/upscaling — frames X/Y/encode/verify/subtitles), the
+  `EtaProgressBar` busy/ETA contract (duplicate progress lines never
+  blank the ETA), animated activity dots for legitimate 0% windows, a
+  1 Hz elapsed/forecast timer with a single writer per time label, a
+  read-only runner-log tail, and an overall-queue bar.
+- **Honest batch forecast.** "Total remaining" comes only from the
+  live measured ETA plus benchmark-cache constants for files ahead
+  (stub-sourced constants are policy-forbidden in the headline); no
+  measured constant means "…", never a guess.
+- **Windows child-process console suppression**
+  (`vidlift/_proc.py::popen_kwargs`): ffmpeg/ffprobe/realesrgan/
+  seconv/tesseract children spawned by the packaged GUI no longer
+  flash console windows (`CREATE_NO_WINDOW` + hidden `STARTUPINFO`;
+  an empty dict on other platforms).
+- **Header version pill** beside the title (a second persistent
+  version surface) and the muted "1. Add files → 2. Plan → 3. Start"
+  helper line; toolbar verbs read left-to-right in that order.
+
+### Changed
+
+- GUI Cancel and MCP `cancel` land on the same claim-time registry
+  CancelFlag; closing the window cancels through the same path and
+  waits up to 30 s before the documented last-resort terminate.
+- `vidlift mcp-server` and the GUI construct their registry/executor
+  through one factory (`mcp_bridge.server.build_services`), and both
+  run the same restart sweep (a window closed mid-run surfaces as
+  `failed` with the restart error on next launch).
+- Packaged GUI builds pin their state dir to the per-platform
+  app-data location so the GUI and agents share one registry by
+  default (`run_gui.py`; `QSettings` organization/app named before
+  the window constructs).
+
 ## [0.4.3] - 2026-10-20
 
 ### Added

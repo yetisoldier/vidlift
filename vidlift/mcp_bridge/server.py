@@ -15,6 +15,11 @@ Dispatch (Section 5.2): JSON-RPC decode -> schemas.validate -> tools
 adapter -> vidlift.* -> serialize the Section-4 payload. Errors carry
 ``isError: true`` with the human message plus the machine-readable
 ``code`` (Section 7 table).
+
+v0.4.4 (GUI/status/MCP unification design §5): :func:`build_services`
+extracts the registry/executor construction so BOTH the stdio server
+and the GUI's in-process client (``client_local.py``) share one
+construction path — same objects in both worlds, no fork of behavior.
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ __all__ = [
     "PROTOCOL_VERSION",
     "SERVER_INFO",
     "TOOLS_LIST",
+    "build_services",
     "serve_stdio",
 ]
 
@@ -92,6 +98,43 @@ TOOLS_LIST = [
     }
     for name, schema in TOOL_SCHEMAS.items()
 ]
+
+
+def _default_state_dir(explicit: str | Path | None) -> Path:
+    """``$VIDLIFT_STATE_DIR`` else ``~/.vidlift`` — the same resolution
+    the benchmark cache uses, so the benchmark truth and the job
+    registry always share one root."""
+    if explicit is None:
+        from ..benchmark import state_dir as default_state_dir
+
+        return default_state_dir()
+    return Path(explicit)
+
+
+def build_services(state_dir: str | Path | None = None) -> "BridgeServices":
+    """The v0.4.4 unification factory (design §5): one construction
+    path for the bridge's services object, used by BOTH the stdio MCP
+    server's entry and the GUI's in-process client.
+
+    Builds the registry at ``state_dir`` (or ``$VIDLIFT_STATE_DIR`` or
+    the platform default), runs the restart sweep exactly as the MCP
+    server always has, and wires a :class:`JobExecutor` around it. The
+    executor is constructed but NOT started: the server starts it in
+    ``McpServer.__init__`` (worker threads owned there); the GUI client
+    starts it after the Qt app is up and stops it on quit. Test seams
+    on the returned services object (probe/command runners) stay None
+    — production wiring, the real subprocesses."""
+    from .tools import BridgeServices
+
+    resolved = _default_state_dir(state_dir)
+    registry = Registry(resolved)
+    # Restart sweep FIRST (Section 6): the previous process's running
+    # jobs are corpses; they become failed with the binding restart
+    # error, never silently succeeded. Identical for both consumers.
+    registry.sweep_orphans()
+    services = BridgeServices(registry=registry, state_dir=resolved)
+    services.executor = JobExecutor(services)
+    return services
 
 
 class JSONRPCError(Exception):
@@ -381,6 +424,17 @@ def serve_stdio(
     state_dir: str | Path | None = None,
 ) -> None:
     """The ``vidlift mcp-server`` entry: construct and serve on the
-    real stdio streams. Diagnostics to stderr; stdout only frames."""
-    server = McpServer(state_dir=state_dir)
+    real stdio streams. Diagnostics to stderr; stdout only frames.
+
+    v0.4.4: the services object comes from :func:`build_services` —
+    the same factory the GUI's in-process client uses (design §5), so
+    both consumers share one registry/executor construction path."""
+    services = build_services(state_dir)
+    server = McpServer(
+        state_dir=services.state_dir,
+        services=services,
+        registry=services.registry,
+        executor=services.executor,
+        start_workers=True,
+    )
     server.serve()

@@ -74,6 +74,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import _proc
 from .plan import PlannedFile
 from .probe import parse_probe
 from .run import (
@@ -781,7 +782,10 @@ def gpu_probe_frame(
             "-f", "png",
         ]
         try:
-            proc = run_fn(cmd, capture_output=True, text=True, timeout=timeout_s)
+            proc = run_fn(
+                cmd, capture_output=True, text=True, timeout=timeout_s,
+                **_proc.popen_kwargs(),
+            )
         except Exception as exc:  # OSError, TimeoutExpired, driver hangs
             ok, reason = False, f"probe frame could not run: {type(exc).__name__}: {exc}"
         else:
@@ -1355,6 +1359,10 @@ class NcnnVulkanEngine(EngineAdapter):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                # v0.4.4 (design §6): suppress child console windows on
+                # Windows; an empty dict on every other platform, so the
+                # popen_factory test seam sees no kwargs on Linux.
+                **_proc.popen_kwargs(),
             )
         except OSError as exc:
             raise UpscaleError(f"{label} could not start: {exc}") from exc

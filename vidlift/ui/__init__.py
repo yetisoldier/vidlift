@@ -1,0 +1,1 @@
+"""PyQt6 widget subpackage for the VidLift desktop interface."""

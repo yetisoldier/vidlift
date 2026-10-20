@@ -47,6 +47,7 @@ from .probe import (
     probe_and_classify,
     probe_args,
 )
+from . import _proc
 from .subtitles import (
     SubtitleOcrError,
     SubtitlePlan,
@@ -246,14 +247,21 @@ def find_tools(
 
 
 def _subprocess_runner(binary: str, args: list[str]) -> tuple[int, str, str]:
-    result = subprocess.run(
+    # v0.4.4 (design §6): Popen+communicate instead of subprocess.run so
+    # the Windows-only child-console suppression kwargs (startupinfo/
+    # CREATE_NO_WINDOW — an empty dict elsewhere) reach the call. The
+    # capture shape (returncode, stdout, stderr) is unchanged.
+    proc = subprocess.Popen(
         [binary, *args],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
+        **_proc.popen_kwargs(),
     )
-    return result.returncode, result.stdout, result.stderr
+    stdout, stderr = proc.communicate()
+    return proc.returncode, stdout, stderr
 
 
 # v0.4.0 (design B.6): heartbeat cadence for long phases — the pump

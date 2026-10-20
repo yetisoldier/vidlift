@@ -196,11 +196,13 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
             output_dir=options.get("output_dir"),
             tools=tools,
             engine=services.engine,  # None = run_file's own auto selection
+            engine_request=options.get("engine", "auto"),
             probe_runner=tracked_probe,
             command_runner=tracked,
             log_dir=options.get("log_dir"),
             cancel=cancel,
             state_box=state_box,
+            subtitle_ocr=bool(options.get("subtitle_ocr", True)),
         )
     except EngineCancelled as exc:
         state = getattr(exc, "state", None)
