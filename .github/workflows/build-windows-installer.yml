@@ -1,0 +1,178 @@
+name: build-windows-installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Stage FFmpeg
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\ffmpeg.zip"
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip" -OutFile $zip -TimeoutSec 600
+          Expand-Archive $zip "$env:RUNNER_TEMP\ffmpeg" -Force
+          $bin = Get-ChildItem "$env:RUNNER_TEMP\ffmpeg" -Recurse -Directory | Where-Object Name -eq "bin" | Select-Object -First 1
+          if (-not $bin) { throw "FFmpeg bin directory not found" }
+          New-Item -ItemType Directory -Force packaging\tools | Out-Null
+          Copy-Item "$($bin.FullName)\ffmpeg.exe" packaging\tools\ffmpeg.exe
+          Copy-Item "$($bin.FullName)\ffprobe.exe" packaging\tools\ffprobe.exe
+          & packaging\tools\ffmpeg.exe -hide_banner -version
+          & packaging\tools\ffprobe.exe -hide_banner -version
+
+      - name: Stage Real-ESRGAN
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\realesrgan.zip"
+          Invoke-WebRequest -Uri "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/releases/download/v0.2.0/realesrgan-ncnn-vulkan-v0.2.0-windows.zip" -OutFile $zip -TimeoutSec 600
+          Expand-Archive $zip "$env:RUNNER_TEMP\realesrgan" -Force
+          $source = Get-ChildItem "$env:RUNNER_TEMP\realesrgan" -Recurse -Directory | Where-Object { Test-Path (Join-Path $_.FullName "realesrgan-ncnn-vulkan.exe") } | Select-Object -First 1
+          if (-not $source) { throw "Real-ESRGAN executable not found" }
+          $target = "packaging\tools\realesrgan"
+          New-Item -ItemType Directory -Force "$target\models" | Out-Null
+          Copy-Item "$($source.FullName)\realesrgan-ncnn-vulkan.exe" "$target\realesrgan-ncnn-vulkan.exe"
+          Get-ChildItem $source.FullName -File | Where-Object Extension -in ".dll", ".txt" | Copy-Item -Destination $target
+          Copy-Item packaging\models\realesrgan-x2plus.param "$target\models\"
+          Copy-Item packaging\models\realesrgan-x2plus.bin "$target\models\"
+          $paramHash = (Get-FileHash "$target\models\realesrgan-x2plus.param" -Algorithm SHA256).Hash.ToLower()
+          $binHash = (Get-FileHash "$target\models\realesrgan-x2plus.bin" -Algorithm SHA256).Hash.ToLower()
+          if ($paramHash -ne "f26dc4b8d7c467a86fac91f63d361a762ef5ab13ccb0521d3081b1b3152e9a6f") { throw "Real-ESRGAN param hash mismatch" }
+          if ($binHash -ne "cfb044e3a1fe18750f54f7a3d8c2d49a296b54e2c9489c90513bbf88844e9e69") { throw "Real-ESRGAN bin hash mismatch" }
+
+      - name: Stage unattended subtitle OCR
+        shell: pwsh
+        run: |
+          $seZip = "$env:RUNNER_TEMP\seconv.zip"
+          Invoke-WebRequest -Uri "https://github.com/SubtitleEdit/subtitleedit/releases/download/v5.2.0/SeConv-Windows-x64.zip" -OutFile $seZip -TimeoutSec 600
+          Expand-Archive $seZip "$env:RUNNER_TEMP\seconv" -Force
+          New-Item -ItemType Directory -Force packaging\tools\SubtitleEdit | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\seconv\*" packaging\tools\SubtitleEdit\ -Recurse -Force
+          $tessZip = "$env:RUNNER_TEMP\tesseract.zip"
+          Invoke-WebRequest -Uri "https://github.com/SubtitleEdit/support-files/releases/download/tesseract553/Tesseract553.zip" -OutFile $tessZip -TimeoutSec 600
+          Expand-Archive $tessZip "$env:RUNNER_TEMP\tesseract" -Force
+          $tessTarget = "packaging\tools\SubtitleEdit\Tesseract"
+          New-Item -ItemType Directory -Force "$tessTarget\tessdata" | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\tesseract\*" "$tessTarget\" -Recurse -Force
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/tesseract-ocr/tessdata/4.1.0/eng.traineddata" -OutFile "$tessTarget\tessdata\eng.traineddata" -TimeoutSec 600
+          if (-not (Test-Path packaging\tools\SubtitleEdit\seconv.exe)) { throw "seconv.exe missing" }
+          if (-not (Test-Path "$tessTarget\tesseract.exe")) { throw "tesseract.exe missing" }
+
+      - name: Install build tooling
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest pyinstaller
+          choco install innosetup --yes --no-progress
+
+      - name: Test
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Stamp executable version
+        shell: pwsh
+        run: |
+          $version = (Select-String pyproject.toml '^version = "(.+)"').Matches[0].Groups[1].Value
+          "VIDLIFT_VERSION=$version" | Out-File $env:GITHUB_ENV -Append
+          $parts = $version.Split(".")
+          $file = "packaging\version_info.txt"
+          $body = Get-Content $file -Raw
+          $body = $body -replace "filevers=\(\d+, \d+, \d+, \d+\)", "filevers=($($parts[0]), $($parts[1]), $($parts[2]), 0)"
+          $body = $body -replace "prodvers=\(\d+, \d+, \d+, \d+\)", "prodvers=($($parts[0]), $($parts[1]), $($parts[2]), 0)"
+          $body = $body -replace "StringStruct\('FileVersion', '[\d.]+'\)", "StringStruct('FileVersion', '$version')"
+          $body = $body -replace "StringStruct\('ProductVersion', '[\d.]+'\)", "StringStruct('ProductVersion', '$version')"
+          Set-Content $file $body -NoNewline
+
+      - name: Build GUI and CLI executables
+        shell: pwsh
+        run: |
+          pyinstaller vidlift_gui.spec --noconfirm
+          pyinstaller vidlift_cli.spec --noconfirm
+          if (-not (Test-Path dist\VidLift\VidLift.exe)) { throw "GUI executable missing" }
+          if (-not (Test-Path dist\vidlift-cli.exe)) { throw "CLI executable missing" }
+          & dist\vidlift-cli.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "CLI smoke test failed" }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "Inno Setup compiler missing" }
+          & $iscc "/DMyAppVersion=$env:VIDLIFT_VERSION" packaging\vidlift.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed" }
+          $setup = "output\VidLift-$env:VIDLIFT_VERSION-Windows-x64-Setup.exe"
+          if (-not (Test-Path $setup)) { throw "Installer missing" }
+
+      - name: Validate installed artifact
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path "output\VidLift-$env:VIDLIFT_VERSION-Windows-x64-Setup.exe").Path
+          $install = "$env:RUNNER_TEMP\VidLift-installed"
+          $process = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$install") -PassThru -Wait
+          if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)" }
+          foreach ($file in @(
+            "$install\VidLift.exe",
+            "$install\vidlift-cli.exe",
+            "$install\tools\ffmpeg.exe",
+            "$install\tools\ffprobe.exe",
+            "$install\tools\realesrgan\realesrgan-ncnn-vulkan.exe",
+            "$install\tools\realesrgan\models\realesrgan-x2plus.param",
+            "$install\tools\realesrgan\models\realesrgan-x2plus.bin",
+            "$install\tools\SubtitleEdit\seconv.exe",
+            "$install\tools\SubtitleEdit\Tesseract\tesseract.exe"
+          )) {
+            if (-not (Test-Path $file)) { throw "Installed payload missing: $file" }
+          }
+          & "$install\vidlift-cli.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "Installed CLI failed" }
+          & "$install\tools\ffprobe.exe" -hide_banner -version
+          if ($LASTEXITCODE -ne 0) { throw "Installed ffprobe failed" }
+          $gui = Start-Process "$install\VidLift.exe" -PassThru
+          Start-Sleep -Seconds 5
+          if ($gui.HasExited) { throw "Installed GUI exited during launch smoke test" }
+          Stop-Process -Id $gui.Id -Force
+
+      - name: Hash installer
+        shell: pwsh
+        run: |
+          $setup = "output\VidLift-$env:VIDLIFT_VERSION-Windows-x64-Setup.exe"
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $setup -Leaf)" | Set-Content "$setup.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VidLift-${{ env.VIDLIFT_VERSION }}-Windows-x64
+          path: |
+            output/VidLift-${{ env.VIDLIFT_VERSION }}-Windows-x64-Setup.exe
+            output/VidLift-${{ env.VIDLIFT_VERSION }}-Windows-x64-Setup.exe.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:VIDLIFT_VERSION"
+          $setup = "output\VidLift-$env:VIDLIFT_VERSION-Windows-x64-Setup.exe"
+          $hash = "$setup.sha256"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag $setup $hash --target "$env:GITHUB_SHA" --title "VidLift $tag" --notes "Windows 11 x64 installer. Includes the VidLift GUI and CLI, FFmpeg/ffprobe, Real-ESRGAN ncnn/Vulkan with the verified x2plus model, and unattended subtitle OCR tools. This build is unsigned, so Windows SmartScreen may show an Unknown publisher warning."
+          } else {
+            gh release upload $tag $setup $hash --clobber
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Release publication failed" }

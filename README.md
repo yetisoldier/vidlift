@@ -12,9 +12,21 @@ nothing about discs, drives, or ripping.
 **License:** none. This is a private repo and a personal tool, so no
 formal license is attached; nothing here is intended for distribution.
 
+## Windows 11 installer
+
+Download the latest `VidLift-<version>-Windows-x64-Setup.exe` from
+[GitHub Releases](https://github.com/yetisoldier/vidlift/releases).
+The installer includes the GUI, CLI, FFmpeg/ffprobe, the Real-ESRGAN
+ncnn/Vulkan engine with VidLift's verified x2plus model, and the
+unattended subtitle OCR tools. Python is not required.
+
+The installer is currently unsigned, so Windows SmartScreen may show
+an **Unknown publisher** warning. The matching `.sha256` file on the
+release verifies the download.
+
 ## Status
 
-**Early v0.2 build.** What exists today:
+**v0.4.2.** What exists today:
 
 - The probe/classify core: `vidlift probe FILE...` inspects any
   video file with ffprobe and reports resolution, SAR, displayed
@@ -37,9 +49,9 @@ formal license is attached; nothing here is intended for distribution.
   selected-file details.
 - The documentation suite under [docs/](docs/).
 
-What does NOT exist yet: the real AI upscale inside the runner (stub
-engine today), the batch queue, and the UI controls that will attach
-to this runner.
+The real ncnn/Vulkan AI engine and FIFO bulk queue are available through
+the CLI/MCP runner. The desktop GUI currently plans batches but does not
+yet expose start/cancel controls for the upscale queue.
 
 ## Quick start (what you can actually run today)
 

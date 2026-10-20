@@ -2,6 +2,29 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.2] - 2026-10-20
+
+### Added
+
+- Windows 11 x64 installer built and validated on GitHub Actions.
+- Installed GUI and CLI executables with bundled FFmpeg/ffprobe,
+  Real-ESRGAN ncnn/Vulkan plus the verified x2plus model, and unattended
+  subtitle OCR tools.
+- Frozen-app tool discovery for all bundled runtime dependencies.
+- Installer SHA-256 checksum published beside the installer.
+
+### Verification
+
+- Full Python suite runs on Windows before packaging.
+- CI silently installs the exact generated setup executable into a clean
+  directory, verifies every bundled payload, starts the installed GUI,
+  and smoke-tests the installed CLI and ffprobe.
+
+### Known limitation
+
+- The installer is not Authenticode-signed, so Windows SmartScreen may
+  display an Unknown publisher warning.
+
 ## [0.4.1] - 2026-10-20
 
 Subtitle support end to end: probe → selection (pass-through or OCR) →

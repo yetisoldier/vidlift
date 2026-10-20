@@ -42,8 +42,10 @@ import json
 import os
 import re
 import shutil
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .srt import Cue, SrtError, normalize_cues, parse_srt, write_srt_file
 
@@ -245,6 +247,21 @@ _FCE_LANGUAGES = {
 HANDLED_BITMAP_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "vobsub"}
 
 
+def _bundled_ocr_tool(relative: Path) -> str | None:
+    """Return a packaged OCR tool, preferring PyInstaller's data root."""
+    if not getattr(sys, "frozen", False):
+        return None
+    roots: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+    roots.append(Path(sys.executable).resolve().parent)
+    return next(
+        (str(root / relative) for root in roots if (root / relative).is_file()),
+        None,
+    )
+
+
 def resolve_tesseract(explicit: str | None = None) -> str:
     """Explicit tesseract resolution: VIDLIFT_TESSERACT, then PATH.
 
@@ -252,7 +269,12 @@ def resolve_tesseract(explicit: str | None = None) -> str:
     mid-run): the caller passes the resolved path or catches the named
     error. Raises MissingTool-style ValueError naming the tool.
     """
-    binary = explicit or os.environ.get("VIDLIFT_TESSERACT") or "tesseract"
+    binary = (
+        explicit
+        or os.environ.get("VIDLIFT_TESSERACT")
+        or _bundled_ocr_tool(Path("tools/SubtitleEdit/Tesseract/tesseract.exe"))
+        or "tesseract"
+    )
     if not shutil.which(binary):
         raise SubtitleOcrError(
             f"tesseract not found at '{binary}': install Tesseract "
@@ -270,7 +292,12 @@ def resolve_seconv(explicit: str | None = None) -> str:
     SE GUI binary is refused outright (b2m's run-12 lesson: the 5.x GUI
     has no unattended mode at all).
     """
-    binary = explicit or os.environ.get("VIDLIFT_SECONV") or "seconv"
+    binary = (
+        explicit
+        or os.environ.get("VIDLIFT_SECONV")
+        or _bundled_ocr_tool(Path("tools/SubtitleEdit/seconv.exe"))
+        or "seconv"
+    )
     base = os.path.basename((binary or "").replace("\\", "/")).lower()
     if base in _GUI_BINARY_NAMES:
         raise SubtitleOcrError(

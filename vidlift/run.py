@@ -32,6 +32,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -222,7 +223,18 @@ def find_tools(
     """
     resolved: dict[str, str] = {}
     for name, given in (("ffmpeg", ffmpeg), ("ffprobe", ffprobe)):
-        binary = given or os.environ.get(f"VIDLIFT_{name.upper()}") or name
+        binary = given or os.environ.get(f"VIDLIFT_{name.upper()}")
+        if not binary and getattr(sys, "frozen", False):
+            suffix = ".exe" if os.name == "nt" else ""
+            candidates = []
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(Path(meipass) / "tools" / f"{name}{suffix}")
+            candidates.append(
+                Path(sys.executable).resolve().parent / "tools" / f"{name}{suffix}"
+            )
+            binary = next((str(path) for path in candidates if path.is_file()), None)
+        binary = binary or name
         if not shutil.which(binary):
             raise MissingToolError(
                 name,

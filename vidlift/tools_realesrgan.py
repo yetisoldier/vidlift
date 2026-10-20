@@ -78,6 +78,13 @@ def _bundled_realesrgan_dirs() -> list[Path]:
     return dirs
 
 
+def _engine_binary_names(platform_name: str | None = None) -> list[str]:
+    names = [ENGINE_TOOL_NAME]
+    if (platform_name or os.name) == "nt":
+        names.insert(0, f"{ENGINE_TOOL_NAME}.exe")
+    return names
+
+
 def resolve_realesrgan(explicit: str | None = None) -> str:
     """Locate the realesrgan-ncnn-vulkan binary with a named error, never
     a silent guess. Resolution order (design Section 9): explicit option
@@ -93,10 +100,11 @@ def resolve_realesrgan(explicit: str | None = None) -> str:
         )
     tried: list[str] = []
     for directory in _bundled_realesrgan_dirs():
-        candidate = directory / ENGINE_TOOL_NAME
-        tried.append(str(candidate))
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
+        for name in _engine_binary_names():
+            candidate = directory / name
+            tried.append(str(candidate))
+            if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+                return str(candidate)
     raise MissingToolError(
         ENGINE_TOOL_NAME,
         f"{ENGINE_TOOL_NAME} not found; tried bundled locations: "
