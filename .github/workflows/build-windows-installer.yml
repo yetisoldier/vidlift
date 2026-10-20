@@ -86,7 +86,7 @@ jobs:
       - name: Stamp executable version
         shell: pwsh
         run: |
-          $version = (Select-String pyproject.toml '^version = "(.+)"').Matches[0].Groups[1].Value
+          $version = (Select-String -Path pyproject.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           "VIDLIFT_VERSION=$version" | Out-File $env:GITHUB_ENV -Append
           $parts = $version.Split(".")
           $file = "packaging\version_info.txt"
