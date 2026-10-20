@@ -23,7 +23,6 @@ from .probe import (
 from .subtitles import (
     HANDLED_BITMAP_CODECS,
     SubtitlePlan,
-    intermediate_ext,
 )
 
 __all__ = [
@@ -280,6 +279,11 @@ def _subtitle_note(report: FileReport) -> str:
             f"sidecar {os.path.basename(selected.sidecar_path)} adopted as "
             f"OCR candidate -> OCR ({engine}) -> mov_text + sidecar"
         )
+    # A sidecar that was NOT adopted (embedded truth wins) is still
+    # named — the disk file never surprises anyone (§B.1).
+    if selected.source == "embedded" and report.sidecars:
+        names = ", ".join(os.path.basename(s.path) for s in report.sidecars)
+        parts.append(f"sidecar noted but not adopted ({names}; embedded subs win)")
     # The unselected remainder, honestly named.
     text = sum(1 for s in report.subtitles if s.kind == "text")
     image = sum(1 for s in report.subtitles if s.kind == "image")

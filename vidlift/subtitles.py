@@ -17,17 +17,18 @@ Engine lanes (design §A.3):
   fallback.
 - Linux (dev box): a direct-Tesseract lane. seconv is a Windows .NET
   binary; the design assigns this box pipeline correctness, so the
-  lane renders the bitmap track to PNGs via ffmpeg's overlay filter
-  (black canvas + [0:v][1:s:0]overlay, the sub2video path) and OCRs
-  each image with ``tesseract <png> stdout --psm 6``, assembling cues
-  from the render's second-based timestamps. Mechanism deviation from
-  the design doc, found by testing real ffmpeg 8.0.1 on this box: the
-  doc's literal ``-c:s png`` is not an encoder this (or any stock)
-  ffmpeg build ships ("Invalid encoder type 'png'"); the overlay
-  render is the same bitmap-to-PNG transformation through the same
-  runner seam, validated end-to-end on a real PGS sample (the Linux
-  lane's dev-box validation duty, design §C.3/Risk 1). Both lanes
-  share everything downstream of "SRT text in memory" (§B.4).
+  lane renders the bitmap track to PNGs via ffmpeg's image2 muxer
+  (one single-pass decode of the extracted track, ``-fps_mode
+  passthrough``, one sub_%08d.png per decoded frame in container time
+  order) and OCRs each image with ``tesseract <png> stdout --psm 6``,
+  assembling cues from the container's own per-frame timestamps (a
+  showinfo timeline probe of the same filtergraph). Validated on real
+  ffmpeg 8.0.1 + tesseract 5.3.4 against a real PGS sample: per-packet
+  seeking lands on each packet's FIRST segment, which for PGS is the
+  clear/blank wipe (zero cues), and default vsync duplicates frames by
+  hundreds — both rejected; the image2 sequence is the design's §B.4
+  mechanism as written. Both lanes share everything downstream of "SRT
+  text in memory" (§B.4).
 - No usable OCR tool anywhere: FAIL OPEN with an honest warning naming
   the tool and the fix; the run ships video+audio, never refuses
   (§B.8). The engine resolution is explicit like ffmpeg's (env ->
@@ -89,6 +90,135 @@ class SubtitleOcrError(RuntimeError):
 # b2m default Eric approved (design §B.9: no translation; non-English
 # tracks OCR through eng with an honest und tag + warning).
 OCR_LANGUAGE = "eng"
+
+
+_SHOWINFO_FRAME_RE = re.compile(
+    r"n:\s*(\d+)\s+pts:\s*(-?\d+|N/A)\s+pts_time:\s*(-?[\d.]+|N/A)"
+)
+
+
+def _frame_timeline(track_path: str, *, ffmpeg: str, runner: Runner) -> list[float]:
+    """The decoded subtitle frames' presentation timestamps, in decode order.
+
+    The design's §B.4 contract ("frame timestamps come from the container")
+    needs a timeline that matches the rendered PNG sequence 1:1 — and only
+    the decode itself provides one: ffprobe's packet list splits PGS packets
+    differently than the decoder does (validated on real media: 8 packets vs
+    5 decoded frames), so the lane runs the same sub2video filtergraph into a
+    null sink with showinfo logging each frame's container pts. The lines are
+    AV_LOG_INFO, so this pass runs at ffmpeg's default log level and parses
+    stderr; the render pass stays quiet (-loglevel error).
+    """
+    code, _out, err = runner(
+        ffmpeg,
+        [
+            "-hide_banner", "-nostdin",
+            "-i", track_path,
+            "-filter_complex", "[0:s:0]null,showinfo[s]",
+            "-map", "[s]",
+            "-f", "null", "-",
+        ],
+    )
+    if code != 0:
+        raise SubtitleOcrError(
+            f"subtitle timeline probe failed: {(err or '').strip()[:200]}"
+        )
+    pts: list[float] = []
+    for line in err.splitlines():
+        m = _SHOWINFO_FRAME_RE.search(line)
+        if not m:
+            continue
+        try:
+            value = float(m.group(3))
+        except ValueError:
+            continue  # pts_time N/A (no container timestamp on this frame)
+        if value >= 0:
+            pts.append(value)
+    return pts
+
+
+def _render_subtitle_frames(
+    track_path: str, png_dir: str, *, ffmpeg: str, runner: Runner
+) -> int:
+    """Render every decoded subtitle frame to its own PNG (design §B.4).
+
+    The single-pass image2 sequence against the extracted track: one bounded
+    ffmpeg call decodes the whole bitmap stream and writes sub_00000001.png,
+    sub_00000002.png, ... in container time order — no per-packet seeks (a
+    seek at a packet's pts lands on that packet's FIRST segment, which for
+    PGS is the clear/blank wipe: validated wrong on real media), and no
+    frame-rate resampling (-fps_mode passthrough keeps exactly one file per
+    decoded frame; default vsync duplicated frames by hundreds). The image2
+    muxer warns about non-monotonic dts when a packet carries several
+    same-pts segments (a PGS display set); the warning is cosmetic — every
+    frame still lands in its own file, in order. Returns the number of PNGs
+    written; the caller cross-checks it against the timeline length.
+    """
+    os.makedirs(png_dir, exist_ok=True)
+    for stale in os.listdir(png_dir):  # a killed run's partial sequence
+        if re.match(r"^sub_\d{8}\.png$", stale):
+            try:
+                os.remove(os.path.join(png_dir, stale))
+            except OSError:
+                pass
+    pattern = os.path.join(png_dir, "sub_%08d.png")
+    code, _out, err = runner(
+        ffmpeg,
+        [
+            "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+            "-i", track_path,
+            "-filter_complex", "[0:s:0]null[s]",
+            "-map", "[s]",
+            "-fps_mode", "passthrough",
+            "-c:v", "png",
+            pattern,
+        ],
+    )
+    if code != 0:
+        raise SubtitleOcrError(
+            f"subtitle frame render failed: {(err or '').strip()[:200]}"
+        )
+    return len([f for f in os.listdir(png_dir) if re.match(r"^sub_\d{8}\.png$", f)])
+
+
+def _assemble_cues(frames: list[tuple[float, str]]) -> list[Cue]:
+    """Cues from (pts_seconds, ocr_text) pairs in decode order.
+
+    Empty text is a clear/silence segment and closes the open cue at that
+    frame's pts; identical consecutive text continues the display (a PGS
+    packet may carry several same-pts segments); different text without an
+    intervening clear closes the old cue where the new one starts; past the
+    last frame a 3s display hold bounds the tail honestly. Every cue gets
+    the 500ms minimum-display floor the SRT contract expects.
+    """
+    cues: list[Cue] = []
+    open_text: str | None = None
+    open_start = 0.0
+
+    def close(end_pts: float) -> None:
+        nonlocal open_text
+        assert open_text is not None
+        start_ms = int(round(open_start * 1000))
+        end_ms = max(start_ms + 500, int(round(end_pts * 1000)))
+        cues.append(Cue(start_ms, end_ms, open_text))
+        open_text = None
+
+    last_pts = frames[-1][0] if frames else 0.0
+    for pts, text in frames:
+        if not text:
+            if open_text is not None:
+                close(pts)
+        elif open_text == text:
+            continue
+        else:
+            if open_text is not None:
+                close(pts)
+            open_text = text
+            open_start = pts
+    if open_text is not None:
+        close(last_pts + 3.0)
+    return cues
+
 
 # seconv settings seed name (b2m subtitles.py SE_CONV_SETTINGS_NAME).
 SE_CONV_SETTINGS_NAME = "vidlift-seconv-settings.json"
@@ -363,6 +493,11 @@ class SeconvOcr:
     binary: str = "seconv"
     language: str = OCR_LANGUAGE
 
+    def __post_init__(self) -> None:
+        # Construction-time refusal (b2m's rule: a GUI-only install must
+        # never reach any invocation path).
+        _refuse_gui_binary(self.binary)
+
     def command(self, in_path: str, out_dir: str) -> list[str]:
         """Pass 1 (raw OCR). /outputfilename pins the exact output name:
         seconv's derived name for MKV image tracks carries a language
@@ -475,101 +610,26 @@ class SeconvOcr:
 # ---- tesseract lane (Linux; new orchestration, shared downstream) ----------
 
 
-def _render_subtitles_to_pngs(
-    track_path: str,
-    workdir: str,
-    *,
-    ffmpeg: str,
-    runner: Runner,
-    on_step: Callable[[str], None] | None = None,
-) -> list[tuple[str, float]]:
-    """Render the extracted bitmap track to per-cue PNGs; return
-    [(png_path, start_seconds)].
-
-    ffmpeg overlay route (the mechanism validated on this box against
-    real PGS + VobSub media): a 1 fps black canvas at the track's own
-    declared geometry with the subtitle stream overlaid, written as a
-    numbered PNG sequence. Frame N covers wall-clock second N..N+1, so
-    every PNG with visible content becomes one tesseract input at
-    start_ms = (N-1)*1000 (the image2 numbering starts at 1). The
-    render runs one ffmpeg command through the runner seam; the
-    declared sub geometry comes from the source's probe (720x480 and
-    1280x720 both validated).
-    """
-    if on_step is not None:
-        on_step("subtitle-render")
-    png_dir = os.path.join(workdir, "render")
-    os.makedirs(png_dir, exist_ok=True)
-    # A generous canvas duration: ffmpeg stops at the shorter of the
-    # two inputs' ends; 86400s (24h) covers any track. The canvas rate
-    # is 1 fps so one PNG == one wall-clock second.
-    pattern = os.path.join(png_dir, "sub_%08d.png")
-    code, _out, err = runner(
-        ffmpeg,
-        [
-            "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
-            "-f", "lavfi",
-            "-i", "color=black:s=1920x1080:r=1:d=86400",
-            "-i", track_path,
-            "-filter_complex", "[0:v][1:s:0]overlay",
-            "-map", "0:v",
-            "-c:v", "png",
-            "-r", "1",
-            pattern,
-        ],
-    )
-    if code != 0:
-        raise SubtitleOcrError(
-            f"subtitle render failed: {(err or '').strip()[:300]}"
-        )
-    frames: list[tuple[str, float]] = []
-    for name in sorted(os.listdir(png_dir)):
-        if not name.startswith("sub_") or not name.endswith(".png"):
-            continue
-        try:
-            ordinal = int(name[4:-4])
-        except ValueError:
-            continue
-        if ordinal >= 1:
-            frames.append((os.path.join(png_dir, name), float(ordinal - 1)))
-    return frames
-
-
-def _png_has_content(path: str) -> bool:
-    """True when the rendered frame has any non-black pixel.
-
-    Cheap check without PIL: PNG scanlines... keep it dependency-free
-    by asking tesseract itself? No -- zero-cue frames must be skipped
-    BEFORE OCR (they are the silence between cues; OCRing them yields
-    empty text). This reads the PNG with the stdlib only: the render
-    canvas is pure black, so ANY non-zero IDAT content implies a cue
-    bitmap. Implementation: compare file bytes against a black-frame
-    baseline is fragile; instead decode with the lightest possible
-    parse -- the canvas is 1920x1080 black, so tesseract on an empty
-    frame is also fast and returns empty text, which the assembler
-    drops. So: run tesseract on every frame, drop empty results.
-    """
-    return True
-
-
 @dataclass
 class TesseractOcr:
-    """OCR via the system tesseract binary, one PNG per cue.
+    """OCR via the system tesseract binary, one PNG per decoded frame.
 
-    The Linux lane (design §A.3): ffmpeg renders the bitmap track to
-    PNGs; tesseract OCRs each image; cues assemble from the render's
-    second-aligned timestamps. ``--psm 6`` (uniform block) is the
-    subtitle-shape page segmentation; per-image steps give natural
-    progress labels under v0.4.0's record_step machinery.
+    The Linux lane (design §A.3/§B.4 as validated on real media): a
+    showinfo timeline probe decodes the extracted track once and logs
+    each frame's container pts; a single-pass image2 render writes
+    exactly one sub_%08d.png per decoded frame in container time
+    order (``-fps_mode passthrough`` — default vsync duplicated frames
+    by hundreds; per-packet ``-ss`` seeks land on each PGS packet's
+    FIRST segment, which is the clear/blank wipe — both validated
+    wrong and rejected); tesseract OCRs each PNG with ``--psm 6``;
+    ``_assemble_cues`` builds cues from the (pts, text) pairs.
     """
 
     binary: str = "tesseract"
     language: str = OCR_LANGUAGE
     psm: int = 6
 
-    def ocr_png(
-        self, png_path: str, *, runner: Runner
-    ) -> str:
+    def ocr_png(self, png_path: str, *, runner: Runner) -> str:
         """OCR one PNG to text (stdout) through the runner seam."""
         code, out, err = runner(
             self.binary,
@@ -592,30 +652,38 @@ class TesseractOcr:
         on_step: Callable[[str], None] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> "OcrTextResult":
-        """Render -> OCR each frame -> assemble cues from timestamps."""
-        frames = _render_subtitles_to_pngs(
-            track_path, workdir, ffmpeg=ffmpeg, runner=runner, on_step=on_step
-        )
-        if not frames:
+        """showinfo timeline -> single-pass image2 render -> per-PNG OCR."""
+        if on_step is not None:
+            on_step("subtitle-timeline")
+        pts_list = _frame_timeline(track_path, ffmpeg=ffmpeg, runner=runner)
+        if not pts_list:
             raise SubtitleOcrError(
-                "subtitle render produced no frames; the track is likely "
-                "unreadable by ffmpeg's overlay route"
+                "no subtitle frames decoded; the track is likely empty "
+                f"({track_path})"
             )
-        cues: list[Cue] = []
-        texts: list[str] = []
-        total = len(frames)
-        for i, (png_path, start_s) in enumerate(frames):
+        if on_step is not None:
+            on_step("subtitle-render")
+        png_dir = os.path.join(workdir, "frames")
+        rendered = _render_subtitle_frames(
+            track_path, png_dir, ffmpeg=ffmpeg, runner=runner
+        )
+        if rendered != len(pts_list):
+            raise SubtitleOcrError(
+                f"subtitle render produced {rendered} PNGs for "
+                f"{len(pts_list)} timeline frames; aborting rather "
+                "than mis-timing cues"
+            )
+        frames: list[tuple[float, str]] = []
+        total = len(pts_list)
+        for i, pts in enumerate(pts_list):
             if on_step is not None:
                 on_step(f"ocr-image-{i + 1}/{total}")
             if on_progress is not None:
                 on_progress(i, total)
+            png_path = os.path.join(png_dir, f"sub_{i + 1:08d}.png")
             text = self.ocr_png(png_path, runner=runner).strip()
-            texts.append(text)
-            if not text:
-                continue  # between-cue silence
-            start_ms = int(round(start_s * 1000))
-            cues.append(Cue(start_ms, start_ms + 1000, text))
-        return OcrTextResult(raw_text="", assembled_cues=cues)
+            frames.append((pts, text))
+        return OcrTextResult(raw_text="", assembled_cues=_assemble_cues(frames))
 
 
 @dataclass
@@ -774,6 +842,7 @@ def run_subtitle_ocr(
     tesseract_binary: str | None = None,
     on_step: Callable[[str], None] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    force_engine: str | None = None,
 ) -> "OcrResult":
     """Extract -> OCR -> normalize -> <output-stem>.srt sidecar.
 
@@ -817,8 +886,14 @@ def run_subtitle_ocr(
 
     notes: list[str] = []
     engine = "unknown"
+    # The lane selector: platform default (§A.3) with an explicit test
+    # override — forcing os.name is FORBIDDEN as a test technique
+    # (patching os.name poisons pathlib.Path process-wide: WindowsPath
+    # on Linux mangles every path; the seam, not the platform, is the
+    # honest injection point).
+    lane = force_engine or ("seconv" if os.name == "nt" else "tesseract")
     try:
-        if os.name == "nt":
+        if lane == "seconv":
             engine = "seconv"
             # The Windows lane: b2m payload verbatim (settings seed,
             # two passes, stale purges). Binary already resolved by the
@@ -877,7 +952,7 @@ def run_subtitle_ocr(
                     "without glyph corrections - spot-check spelling."
                 )
             auto_resolved_note = notes[0] if notes else ""
-        else:
+        elif lane == "tesseract":
             engine = "tesseract"
             tes = TesseractOcr(binary=tesseract_binary or "tesseract")
             result = tes.run(
@@ -898,6 +973,10 @@ def run_subtitle_ocr(
             write_srt_file(raw_srt_for_kit, cues)
             raw_text = ""
             auto_resolved_note = ""
+        else:
+            raise SubtitleOcrError(
+                f"unknown OCR engine lane {lane!r}"
+            )
     except SubtitleOcrError:
         # v0.2.30 fail-open retention: write the kit from whatever OCR
         # inputs exist (the extracted track always does) BEFORE raising,
@@ -931,7 +1010,7 @@ def run_subtitle_ocr(
                 os.remove(tmp)
         except OSError:
             pass
-    shutil.rmtree(os.path.join(workdir, "render"), ignore_errors=True)
+    shutil.rmtree(os.path.join(workdir, "frames"), ignore_errors=True)
     return OcrResult(
         srt_path=sidecar,
         cue_count=len(cues),

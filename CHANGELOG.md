@@ -2,6 +2,100 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.1] - 2026-10-20
+
+Subtitle support end to end: probe → selection (pass-through or OCR) →
+mov_text embed + `.srt` sidecar. The port of bluray-to-mp4's
+field-proven subtitle machinery (v0.2.16 mov_text embed, v0.2.27
+unattended seconv+Tesseract OCR, v0.2.29 stale-file/truncated-write
+hardening, v0.2.30 quality reporting + `.ocr` diagnosis kit) into
+VidLift's seams. Binding design: `docs/designs/v0.4.1-subtitles.md`.
+Honest provenance: the machinery shape and its failure history
+(GUI-wizard babysitting, stale-SRT poisoning, truncated pass-2
+writes, silent poor-quality OCR) are bluray-to-mp4's field lessons
+(read-only reference at bluray-to-mp4 e62a80e); VidLift v0.4.1 ships
+the PORT re-derived against VidLift's runner-seam architecture.
+The Linux OCR lane is new orchestration, validated on this box
+against real ffmpeg 8.0.1 + tesseract 5.3.4 with a real PGS sample
+(per-packet seeking and default vsync were measured, found wrong,
+and rejected — see the dev-box lane below).
+
+### Added
+
+- **Subtitle probe + selection (B.1/B.2/B.7).** The probe carries
+  per-stream `index`, `kind` (text/image), and language for every
+  subtitle stream. `select_subtitle_track` applies the
+  Eric-approved selection philosophy: English-preferred, text beats
+  bitmap, first-index tie-break, single track ever. Disk sidecars
+  are discovered (same-stem `.srt`; `.sub`+`.idx` VobSub pair) and
+  adopted only as the candidate of last resort — embedded truth
+  wins, and an unadopted sidecar is named in the plan note so the
+  disk file never surprises anyone.
+- **Text-subtitle pass-through (B.3).** A selected text track is
+  muxed into the shipped MP4 as soft `mov_text` through the temp-
+  then-replace atomic mux; the `eng`/`und` language-tag honesty rule
+  never stamps `eng` on an unconfirmed stream.
+- **Bitmap OCR, both lanes (B.4).** PGS (`hdmv_pgs_subtitle`) and
+  DVD VobSub (`dvd_subtitle`) extract losslessly (`.sup` raw;
+  VobSub to single-track MKV) and OCR through the engine lane:
+  Windows ships the ported seconv two-pass flow (raw Tesseract pass,
+  FixCommonOcrErrors pass with timing-paired counting, pinned
+  output names, stale purges before each pass, truncated-write raw
+  fallback); the Linux lane is a showinfo timeline probe + a
+  single-pass `image2` render (`-fps_mode passthrough`, one PNG per
+  decoded frame in container time order) + per-PNG Tesseract
+  (`--psm 6`) + cue assembly from the container's own frame
+  timestamps. Both lanes share everything downstream of "SRT text
+  in memory": normalize → `<stem>.srt` sidecar + mov_text embed.
+- **MicroDVD re-timing (B.6.1).** MicroDVD's frame-numbered cues
+  convert to wall-clock through the v0.4.0 DERIVED stamp token —
+  the only re-timing edge in this milestone; bitmap pairs need none
+  (their wall clock comes from the container).
+- **Fail-open everywhere (B.8).** No usable OCR tool or an OCR
+  hard failure never blocks the run: the video+audio ship, the
+  manifest records `failed-open` with the named tool and fix, and
+  the `.ocr/` diagnosis kit (extracted track + raw pass-1 SRT,
+  size-capped 150 MB) is written on success AND failure for
+  offline re-tuning without re-ripping.
+- **Quality reporting (B.9).** The honest v0.2.30 line ("N% of M
+cues clean") plus the low-cue-count and Tesseract-accuracy
+  spot-check advisories, reporting only, never gating.
+- **Manifest + status (B.7).** A `subtitles` block (status,
+  engine, language, cue count, warnings, sidecar path) in the run
+  state and manifest; the phase sits between verify and done; the
+  verifier records expected-vs-actual subtitle presence as a
+  non-gating warning.
+
+### Changed
+
+- `vidlift run` output for a file with a selected subtitle now
+  writes `<stem>.srt` next to the MP4 (KEEP contract) and a soft
+  mov_text track inside it (disposition contract).
+- The tesseract lane's frame timeline regex tolerates ffmpeg's
+  space-padded `pts:` fields (found while validating against real
+  ffmpeg 8.0.1 output: sub-7-digit pts values are right-padded and
+  were silently dropped by the first regex).
+
+### Verification
+
+- New boundary series S1-S19 + F1 (tests/test_subtitles_v041.py,
+  87 tests), all seam-stubbed, pinning: selection rules, sidecar
+  adoption, argv shapes of both lanes (showinfo null-sink probe,
+  single-pass image2 with `-fps_mode passthrough`, per-PNG
+  `--psm 6`), cue assembly semantics (blank=closes, same-text=
+  continues, 3 s tail hold, 500 ms floor), render-count
+  cross-check, zero-cue fail-open with kit retention, mux
+  atomicity, MicroDVD token conversion, manifest/status shapes,
+  and the run-level fail-open contract.
+- Full suite: 315 passed, 0 failed (previously 305 passed with 6
+  stale-lane failures — the S13/zero-cue tests still asserted the
+  rejected per-packet/overlay approach and were rewritten to the
+  validated showinfo/image2 design).
+- Known gaps (unchanged, by design): the seconv lane is exercised
+  through seam stubs only (Windows-only binary); real-media PGS +
+  VobSub end-to-end ran on this box at implementation time but is
+  not a CI fixture.
+
 ## [0.4.0] - 2026-10-19
 
 Decode-truth clock, frame-exact chunking, gate/heartbeat/resume: the
