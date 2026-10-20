@@ -36,7 +36,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .plan import PlanError, PlannedFile, build_file_plan
@@ -898,6 +898,23 @@ class RunResult:
         return bool(self.state.ok)
 
 
+def _apply_subtitle_ocr_preference(
+    plan: PlannedFile, *, enabled: bool
+) -> PlannedFile:
+    """Remove only bitmap OCR work when the user disables that feature."""
+    if (
+        not enabled
+        and plan.subtitle_plan is not None
+        and plan.subtitle_plan.ocr_required
+    ):
+        return replace(
+            plan,
+            subtitle_plan=None,
+            subtitle_note="bitmap subtitle OCR disabled; no subtitles carried",
+        )
+    return plan
+
+
 def run_file(
     file_path: str,
     *,
@@ -915,6 +932,7 @@ def run_file(
     cancel: Callable[[], bool] | None = None,
     sample_classify: bool = True,
     state_box: dict | None = None,
+    subtitle_ocr: bool = True,
 ) -> RunResult:
     """Run one file through the full pipeline and return its state.
 
@@ -1019,6 +1037,10 @@ def run_file(
         plan = build_file_plan(
             report, target=target, gb_per_hour=gb_per_hour, output_dir=output_dir
         )
+        original_plan = plan
+        plan = _apply_subtitle_ocr_preference(plan, enabled=subtitle_ocr)
+        if plan is not original_plan:
+            log("subtitle OCR disabled by user; bitmap subtitles will not be carried")
         state.plan = plan
         state.output_path = plan.output_path
         log(f"planned output: {plan.output_path}")

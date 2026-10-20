@@ -2,6 +2,21 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.3] - 2026-10-20
+
+### Added
+
+- Visible version badge in the desktop interface.
+- Explicit **Start Upscale** and safe **Cancel Current** controls for serial GUI batches.
+- Exact output destination column and detailed output-content preview.
+- User control for enabling or disabling bitmap subtitle OCR while preserving text-subtitle handling.
+- Batch progress showing the current file and completed count.
+
+### Fixed
+
+- The frozen Windows planner now uses its bundled ffprobe instead of launching a bare PATH command.
+- Planning and setup failures stay inside the GUI as actionable messages instead of terminating the window.
+
 ## [0.4.2] - 2026-10-20
 
 ### Added

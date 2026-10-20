@@ -27,18 +27,21 @@ required.
 ## Plan a batch
 
 Open VidLift, then drag video files into the window or select **Add Files**
-or **Add Folder**. Choose an optional output folder and select **Plan Batch**.
+or **Add Folder**. Choose an optional output folder, decide whether bitmap
+subtitle OCR should run, and select **Plan Batch**.
 
 ![VidLift home screen](docs/images/vidlift-home.png)
 
-The plan shows which files are ready, source type, output geometry, estimated
-size, subtitle handling, and warnings. Select a row to see the complete
-file-level explanation.
+The plan shows which files are ready, source type, output geometry, exact
+output filename, estimated size, subtitle handling, and warnings. Select a row
+to see an output preview covering the destination, HEVC video, AAC audio,
+subtitles, and estimated size.
 
 ![VidLift planned batch](docs/images/vidlift-planned-batch.png)
 
-The desktop interface currently plans batches. Start/cancel controls for the
-upscale queue are not yet exposed in the GUI.
+Select **Start Upscale** to process every ready file serially. VidLift shows the
+current file and completed count while keeping the window responsive. Select
+**Cancel Current** to stop safely.
 
 ## Run an upscale
 
@@ -70,8 +73,8 @@ Example request to Jarvis:
 > Queue every supported video in D:\Videos\To Upscale through VidLift and
 > report when the batch finishes.
 
-The native CLI currently starts one file per command. The desktop GUI can plan
-multiple files but does not yet start the queue.
+The native CLI currently starts one file per command. The desktop GUI and MCP
+interface both process bulk queues serially so jobs do not compete for the GPU.
 
 ## What you receive
 
@@ -105,8 +108,8 @@ log directory is supplied.
 
 ## Current limitations
 
-- GUI start/cancel and live queue controls are not implemented yet.
-- The CLI runs one file per command; bulk queueing is available through MCP.
+- The CLI runs one file per command; bulk queueing is available through the GUI and MCP.
+- GUI progress reports the current file and completed count; detailed phase activity remains in the run log.
 - Output target is currently 720p.
 - PAL speedup is reported but not corrected.
 - Chapters are not preserved.

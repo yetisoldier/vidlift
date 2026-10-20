@@ -28,8 +28,8 @@ release, and select **Run anyway**.
 In PowerShell:
 
 ~~~powershell
-Get-FileHash .\VidLift-0.4.2-Windows-x64-Setup.exe -Algorithm SHA256
-Get-Content .\VidLift-0.4.2-Windows-x64-Setup.exe.sha256
+Get-FileHash .\VidLift-0.4.3-Windows-x64-Setup.exe -Algorithm SHA256
+Get-Content .\VidLift-0.4.3-Windows-x64-Setup.exe.sha256
 ~~~
 
 The two hexadecimal hashes must match exactly.
@@ -66,7 +66,7 @@ Leave it empty to place each output beside its source.
 
 ### Run the pre-flight plan
 
-Select **Plan Batch**.
+Choose whether **Enable subtitle OCR** should remain on, then select **Plan Batch**.
 
 ![VidLift planned batch](images/vidlift-planned-batch.png)
 
@@ -76,14 +76,18 @@ The table reports:
 - **File:** source path
 - **Source:** detected source class
 - **Target:** planned output dimensions
+- **Output:** exact destination filename
 - **Size:** estimated final size
 - **Subtitles:** selected subtitle handling
 - **Warnings:** interlace, PAL-speedup, or other cautions
 
-Select a row to see the complete explanation in the details pane.
+Select a row to see the complete explanation and output preview in the details
+pane. The preview includes the destination, HEVC video, AAC audio, subtitles,
+and estimated size.
 
-The GUI currently plans batches. It does not yet start or cancel the upscale
-queue.
+Select **Start Upscale** to process every ready item serially. The progress bar
+shows the completed count and current file. Select **Cancel Current** to stop
+the active file safely; files not yet started remain untouched.
 
 ## 3. Run one file from PowerShell
 
@@ -127,8 +131,8 @@ Example request to Jarvis:
 You can also provide an explicit list of files. Jarvis can plan the batch,
 start it, report status, cancel a job, and inspect each final manifest.
 
-The installed CLI currently starts one file per command. The GUI plans multiple
-files but does not start the queue.
+The installed CLI currently starts one file per command. The GUI and MCP
+interface both run bulk queues serially so jobs do not compete for the GPU.
 
 ## 5. Understand the pipeline
 
@@ -157,9 +161,10 @@ The run record is stored in a **.vidlift-runs** folder and includes:
 - **.manifest.json:** input, plan, engine, timings, output paths, subtitle
   result, and verification evidence
 
-When OCR produces a subtitle, VidLift writes an SRT beside the MP4 and embeds a
-soft subtitle track where supported. OCR failures do not discard a successfully
-completed video.
+When **Enable subtitle OCR** is on and OCR produces a subtitle, VidLift writes
+an SRT beside the MP4 and embeds a soft subtitle track where supported. Turning
+OCR off skips bitmap subtitle conversion while preserving ordinary text subtitle
+handling. OCR failures do not discard a successfully completed video.
 
 ## 7. Troubleshooting
 
