@@ -1,5 +1,9 @@
 # VidLift
 
+<p align="center"><em>Turn old SD videos into clean 720p HEVC MP4s using local AI upscaling.</em></p>
+
+<p align="center">[Windows 11] [Vulkan/GPU]</p>
+
 VidLift converts older standard-definition video files into clean 720p HEVC
 MP4s using a local Real-ESRGAN ncnn/Vulkan upscale pipeline.
 
@@ -23,6 +27,26 @@ required.
 > The installer is currently unsigned. Windows SmartScreen may display an
 > **Unknown publisher** warning. The release includes a SHA-256 checksum file
 > so you can verify the download.
+
+## ✨ Features
+| | |
+|---|---|
+| **Wide Support** | Upscale AVI, DivX, MP4, MKV, VOB, and more. |
+| **Smart Geometry** | Auto-probes source to choose the safest deinterlacing and scaling. |
+| **AI-Powered** | Uses Real-ESRGAN ncnn/Vulkan for high-fidelity 720p results. |
+| **Subtitle Recovery** | Integrated OCR for bitmap subtitles (VobSub/PGS). |
+| **Verification** | Every file is verified after encode to ensure no corruption. |
+
+## 🚀 Quick Start
+**You'll need:** Windows 11, Vulkan-capable GPU $\cdot$ **Time:** ~2 minutes
+
+1. Download and run the **Setup.exe** from the [latest release](https://github.com/yetisoldier/vidlift/releases/latest).
+2. Launch **VidLift** from the Start menu. ✅ *You should see the main window with "Add Files" options.*
+3. Drag a video file into the window. ✅ *The file should appear in the list with "Ready" status.*
+4. Select **Plan Batch**. ✅ *You should see the output geometry and estimated size.*
+5. Select **Start Upscale**.
+
+Stuck? → [Troubleshooting](#-troubleshooting)
 
 ## Plan a batch
 
@@ -61,6 +85,19 @@ VidLift performs:
 5. 720p HEVC MP4 encode
 6. full verification
 7. subtitle pass-through or OCR when possible
+
+## ⚙️ How it works
+VidLift automates a complex multi-stage pipeline so you don't have to:
+
+```mermaid
+graph LR
+  A[Source Probe] --> B[Pre-flight Plan]
+  B --> C[Deinterlace]
+  C --> D[AI Upscale]
+  D --> E[HEVC Encode]
+  E --> F[Verification]
+  F --> G[Subtitle OCR]
+```
 
 ## Bulk upscaling
 
@@ -105,6 +142,15 @@ log directory is supplied.
 - [Development](docs/development.md)
 - [Architecture](docs/architecture.md)
 - [Roadmap](docs/roadmap.md)
+
+## 🔧 Troubleshooting
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| [VERIFY: exact user-facing string] | Outdated GPU driver | Update your NVIDIA/AMD drivers to the latest version. |
+| App crashes on start | Missing Vulkan runtime | Install the latest Vulkan SDK or GPU driver. |
+| Output size is too large | High bitrate setting | Check the "Plan" screen; try a different engine if available. |
+
+Full guide → [docs/usage.md#troubleshooting](docs/usage.md#troubleshooting)
 
 ## Current limitations
 
