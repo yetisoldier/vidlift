@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -63,6 +64,8 @@ __all__ = [
     "sidecar_srt_path",
     "write_ocr_settings",
     "count_auto_resolved_cues",
+    "convert_microdvd_to_cues",
+    "convert_vobsub_sidecar_pair",
     "ocr_cue_quality",
     "ocr_quality_note",
     "write_ocr_diagnostic_kit",
@@ -165,6 +168,89 @@ class SubtitlePlan:
     codec_name: str
     lang: str
     ocr_required: bool
+
+
+def convert_microdvd_to_cues(content: str, fps: float) -> list[Cue]:
+    """Convert MicroDVD frame-number cues to wall-clock Cues (§B.6.1).
+
+    MicroDVD indexes cues by FRAME NUMBER ({start}{{end}}text per
+    line), so conversion needs a rate. The ONLY re-timing edge in
+    v0.4.1 (the design forbids any other re-timing machinery): the
+    caller passes the v0.4.0 DERIVED stamp rate — the same canonical
+    token the mezzanine was stamped with — so subtitles and video
+    agree by construction. When the stamp refused at derive time
+    (unsnappable → fail-open at original resolution), the caller
+    passes the prepared container's DECLARED rate with an honest
+    container-derived note (the v0.4.0 demotion rule applies to
+    pixels, not this one-time conversion; stated so nobody
+    re-litigates it).
+    """
+    if fps <= 0:
+        raise SubtitleOcrError(
+            f"MicroDVD conversion needs a positive frame rate, got {fps}"
+        )
+    cues: list[Cue] = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        # {start}{end}text — regex is the honest parser (frame numbers
+        # are integers; the text may itself contain braces)
+        match = re.match(r"^\{(\d+)\}\{(\d+)\}(.*)$", line)
+        if not match:
+            continue
+        start_f = int(match.group(1))
+        end_f = int(match.group(2))
+        text = match.group(3).strip()
+        if not text:
+            continue
+        start_ms = int(round(start_f * 1000 / fps))
+        end_ms = int(round(end_f * 1000 / fps))
+        cues.append(Cue(start_ms, end_ms, text))
+    return cues
+
+
+def convert_vobsub_sidecar_pair(
+    sub_path: str,
+    idx_path: str,
+    *,
+    ffmpeg: str,
+    runner: Runner,
+    workdir: str,
+    on_step: Callable[[str], None] | None = None,
+) -> str:
+    """Adopt a .sub/.idx VobSub pair as the OCR candidate of last resort.
+
+    ffmpeg demuxes the pair directly (the vobsub demuxer reads the .idx
+    index + the .sub MPEG packets); the pair is muxed into a single-track
+    MKV through the runner seam and handed to the OCR stage exactly like
+    an embedded VobSub stream (§B.1/B.4). The wall-clock truth comes from
+    the .idx timestamps (wall-clock hh:mm:ss:ms lines), so the OCR lane
+    needs no re-timing at all — the §B.6.1 rate-aware conversion is the
+    MicroDVD text format's need, not the bitmap pair's.
+    """
+    if on_step is not None:
+        on_step("subtitle-sidecar-adopt")
+    os.makedirs(workdir, exist_ok=True)
+    track_path = os.path.join(
+        workdir,
+        os.path.splitext(os.path.basename(sub_path))[0] + ".vobsub.mkv",
+    )
+    code, _out, err = runner(
+        ffmpeg,
+        [
+            "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+            "-i", idx_path,
+            "-map", "0:s:0",
+            "-c", "copy",
+            track_path,
+        ],
+    )
+    if code != 0 or not os.path.exists(track_path):
+        raise SubtitleOcrError(
+            f"VobSub sidecar adoption failed: {(err or '').strip()[:300]}"
+        )
+    return track_path
 
 
 def intermediate_ext(codec_name: str) -> str:
