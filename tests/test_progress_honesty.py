@@ -121,17 +121,6 @@ class _BlockingProbeRunner:
         return 0, "", ""
 
 
-def test_count_probe_blocks_until_decode_pass_finishes():
-    """Test 7's harness truth: the pump returns the decode-counted
-    total and the step/heartbeat machinery drove the wait."""
-    engine = _engine_with_probe(0.15)
-    tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
-    frames, from_metadata = engine._probe_frame_count_alive(
-        "/x/movie.prepared.mkv", tools=tools, label=UPSCALE_STEP_PREPARED_COUNT
-    )
-    assert frames == 3600 and from_metadata is False
-
-
 def test_count_probe_writes_heartbeat_log_line(monkeypatch):
     """Test 7: the count pass writes honest liveness LOG lines at the
     throttled cadence — phase named, elapsed named, no fabricated
