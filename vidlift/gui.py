@@ -54,6 +54,7 @@ from .mcp_bridge.client_local import (
     LocalBridgeClient,
 )
 from .mcp_bridge.tools import BridgeError
+from .run import UPSCALE_STEP_PREPARED_COUNT as PREPARED_COUNT_PROBE_STEP
 from .plan import BatchPlan, PlannedFile, build_batch_plan
 from .probe import ProbeError, probe_and_classify
 from .run import MissingToolError, find_tools
@@ -69,6 +70,17 @@ VIDEO_EXTENSIONS = {
 # single-shot selections before planning; per-click Start enqueues at
 # most MAX_GUI_BATCH job records (client_local also enforces).
 MAX_FILES = 500
+
+# v0.4.5 (progress-honesty design §2, D-tail): pin-to-tail tolerance
+# for the run log widget. Within this many pixels of the scrollbar's
+# maximum the log is "at the bottom" and stays pinned to the tail;
+# farther up counts as user-inspecting and disables the pin.
+_LOG_PIN_TOLERANCE_PX = 8
+
+# v0.4.5 (§3c, D-eta): the honest busy label while the count pass is
+# still producing the denominator — it names what is being measured,
+# never a fabricated percent.
+_BUSY_MEASURING_LABEL = "measuring — counting frames…"
 
 # closeEvent budget (ms): the run worker gets the same 30 s ffmpeg
 # terminate window the sibling's validation established; terminate is
@@ -150,11 +162,27 @@ def detail_text(item: PlannedFile, *, subtitle_ocr_enabled: bool = True) -> str:
     return "\n".join(lines)
 
 
+def _stage_label_text(stage: str) -> str:
+    """The stage-change comparison text: the FIRST SEGMENT of the
+    label with any parenthetical detail stripped (v0.4.5 §3b: heartbeat
+    seconds tick inside one and the same stage; they must not reset
+    the busy/ETA state every second)."""
+    return stage.split(" (", 1)[0]
+
+
 def run_stage_label(snapshot: dict | None) -> str:
     """Stage/step classification from the bridge status payload (the
     sibling's _run_stage classifier, ported to dict facts). Names WHAT
     is running from the runner's own ``current_phase`` plus the
-    ``progress["step"]`` label; never guesses a percent."""
+    ``progress["step"]``/``progress["phase_note"]`` labels; never
+    guesses a percent.
+
+    v0.4.5 (progress-honesty §3, D-count/D-eta): the count pass says
+    so and warns that no per-frame ETA exists yet; the promoted
+    chunk_index/chunk_total render as ``upscaling chunk 3/12``; the
+    long phases surface their heartbeat seconds; a
+    ``progress["phase_note"]`` is appended as a parenthetical suffix.
+    """
     if not snapshot:
         return ""
     phase = snapshot.get("current_phase") or ""
@@ -175,7 +203,27 @@ def run_stage_label(snapshot: dict | None) -> str:
     elif phase == "prepare":
         base = "prepare — normalizing source"
     elif phase == "upscale":
-        base = f"upscaling{chunk_text}"
+        if step == PREPARED_COUNT_PROBE_STEP:
+            # v0.4.5 §3b (D-eta): the count pass has no measurable
+            # denominator — it IS the denominator being measured. The
+            # honest label says so; no fabricated percentage.
+            base = (
+                "upscaling — counting frames (this can take 10–40 min "
+                "on SD sources; no per-frame ETA exists yet)"
+            )
+        elif progress_state.get("chunk_index") and progress_state.get("chunk_total"):
+            # §3b: the promoted chunk-index/total label; the raw frame
+            # counters stay out of the sub-stage label (a chunk is a
+            # known unit: chunk 3/12; "frames 300/3600" remains on the
+            # stage bar via frames_done/frames_total).
+            chunk_index = progress_state.get("chunk_index")
+            chunk_total = progress_state.get("chunk_total")
+            if isinstance(chunk_index, int) and chunk_index > 0 and isinstance(chunk_total, int) and chunk_total > 0:
+                base = f"upscaling chunk {chunk_index}/{chunk_total}"
+            else:
+                base = f"upscaling{chunk_text}"
+        else:
+            base = f"upscaling{chunk_text}"
     elif phase == "encode":
         base = f"encoding{chunk_text}"
     elif phase == "verify":
@@ -186,7 +234,33 @@ def run_stage_label(snapshot: dict | None) -> str:
         base = "done"
     else:
         base = phase or "starting"
-    if step:
+    # v0.4.5 §3b: the two long phases surface the heartbeat's elapsed
+    # seconds honestly (the runner already measures them via on_touch).
+    beat_seconds = progress_state.get(
+        "decode_seconds" if phase == "verify" else "encode_seconds"
+    )
+    if phase in ("encode", "verify") and isinstance(beat_seconds, (int, float)):
+        base = f"{base} (heartbeat t={beat_seconds:.0f}s)"
+    # §3b: the phase_note suffix — a short human string the engine sets
+    # on entering a sub-stage with no measurable denominator.
+    note = progress_state.get("phase_note")
+    if note:
+        if isinstance(note, str) and note.startswith(base):
+            # the note already carries the base render (the engine's
+            # chunk notes embed the chunk label); render it once.
+            return note
+        return f"{base} ({note})"
+    if step and not (
+        isinstance(step, str)
+        and (
+            step.startswith("subtitle")
+            # a token that is already rendered inside base (the bare
+            # phase word or a chunk label carrying chunk_index) adds
+            # no information — never double-render it
+            or step == phase
+            or (isinstance(step, str) and step in base)
+        )
+    ):
         return f"{base} ({step})"
     return base
 
@@ -205,6 +279,15 @@ class MainWindow(QMainWindow):
         # serial). The GUI is a projection: every tick re-reads status.
         self.client = client or LocalBridgeClient()
         self.job_ids: list[str] = []
+
+        # v0.4.5 (progress-honesty §2, D-tail): pin-to-tail state for
+        # the run log widget (Rule 1-5 contract lives in these flags;
+        # the helpers read/reset them). Started disconnected; the
+        # scroll/rangec hooks wire up in _build_shell.
+        self._log_user_scrolled_up = False
+        self._log_force_pin_next = False
+        self._log_rendered_key: str | None = None
+        self._log_scroll_max = 0  # cached maximum (rangeChanged writer)
 
         # Sibling port: the 1 Hz single-writer liveness timer.
         self._elapsed_timer = QTimer(self)
@@ -412,6 +495,15 @@ class MainWindow(QMainWindow):
         run_layout.addWidget(self.overall_bar, 3, 1)
         run_layout.addWidget(QLabel("Log (tail)"), 4, 0, 1, 3)
         run_layout.addWidget(self.run_log_tail, 5, 0, 1, 3)
+        # v0.4.5 (§2, D-tail): the scroll hooks. valueChanged tracks the
+        # user-scroll override; rangeChanged keeps the cached maximum
+        # fresh (setPlainText rebuilds the document, so the range
+        # changes on every re-render). Qt ordering: on setPlainText the
+        # document is REPLACED — rangeChanged fires before any settling
+        # valueChanged, so "was at bottom" is read BEFORE the swap.
+        scrollbar = self.run_log_tail.verticalScrollBar()
+        scrollbar.valueChanged.connect(self._log_scroll_value_changed)
+        scrollbar.rangeChanged.connect(self._log_scroll_range_changed)
         self.run_panel.hide()
         layout.addWidget(self.run_panel)
 
@@ -742,6 +834,14 @@ class MainWindow(QMainWindow):
         snapshots = self.client.enqueue_snapshots(self.job_ids)
         still_active: list[str] = []
         terminal_notes: list[str] = []
+        # v0.4.5 (§2 Rule 4): the rendered job-set key — the leading
+        # job id — force-pins the log tail once when it changes (new
+        # batch start / next job claimed / terminal drain rebase).
+        rendered_key = self.job_ids[0] if self.job_ids else None
+        if rendered_key != self._log_rendered_key:
+            self._log_rendered_key = rendered_key
+            if rendered_key is not None:
+                self._log_force_pin_next = True
         for index, (job_id, snapshot) in enumerate(zip(self.job_ids, snapshots)):
             row = index  # row i of the table ↔ job_ids[i] while a run is live
             if snapshot is None:
@@ -774,20 +874,52 @@ class MainWindow(QMainWindow):
             self._batch_finished(terminal_notes)
 
     def _consume_running_snapshot(self, row: int, snapshot: dict, stage: str) -> None:
-        self._set_text(self.stage_label, stage)
+        # §3b: the phase-change busy/reset keys on the stage's PHASE
+        # FACTS (the label renders progress detail per tick — heartbeat
+        # seconds tick inside one and the same stage — so comparing
+        # rendered label strings would busy-reset every second). The
+        # reset runs BEFORE the eta assignment below (a new stage's
+        # live ETA starts empty per the sibling rule); the busy label
+        # for the count pass is the Measuring label (§3c state 1).
+        key = _stage_label_text(stage)
+        if self._stage_now != key:
+            self._stage_eta = None
+            self._stage_fraction = None
+            self._stage_now = key
+            if PREPARED_COUNT_PROBE_STEP in stage:
+                self.stage_bar.set_busy(True, _BUSY_MEASURING_LABEL)
+            elif key.startswith("starting") or key == "queued":
+                self.stage_bar.set_busy(True, "starting ...")
+            elif "upscaling" in key:
+                self.stage_bar.set_busy(True, "upscaling ...")
+            else:
+                self.stage_bar.set_busy(True, "estimating ...")
         eta = snapshot.get("eta_seconds")
         if eta is not None:
             self._stage_eta = float(eta)
         progress = snapshot.get("progress") or {}
         frames_done = progress.get("frames_done")
         frames_total = progress.get("frames_total")
+        # v0.4.5 (§3b/§3c, D-eta): the stage label's phase_note suffix
+        # rides the payload; the same computed string goes through
+        # _set_text, so identical values never repaint the label.
+        note = progress.get("phase_note")
+        rendered = f"{stage} ({note})" if note else stage
+        self._set_text(self.stage_label, rendered)
         if frames_total and frames_done is not None and frames_total > 0:
             self._stage_fraction = max(0.0, min(1.0, frames_done / frames_total))
+            # §3c: honest ETA the moment it exists. The bridge's
+            # _eta_seconds math is UNTOUCHED; it still requires a
+            # measured benchmark constant AND frames_total > 0. When
+            # eta_seconds is still None but frames are flowing, the
+            # bar leaves busy mode with the measured fraction only —
+            # no number invented.
             self.stage_bar.set_value(self._stage_fraction, self._stage_eta)
         elif self._stage_fraction is None:
-            # no measurable progress yet: keep the honest busy pulse
-            if self._stage_now != "upscale":
-                self.stage_bar.set_busy(True, "estimating ...")
+            # §3c state 1: measuring… names what the pipeline is doing
+            # to GET an ETA (the count pass), never a bare "estimating"
+            # pulse forever. A duplicated busy call is a no-op anyway.
+            self.stage_bar.set_busy(True, _BUSY_MEASURING_LABEL)
         # Overall queue: completed jobs + current fraction, over total.
         done_units = self.run_done
         frac_units = self._stage_fraction or 0.0
@@ -798,18 +930,7 @@ class MainWindow(QMainWindow):
         # inside the snapshot; render it verbatim).
         tail = snapshot.get("log_tail") or []
         if tail:
-            self._set_text_log("\n".join(str(line) for line in tail[-40:]))
-        if self._stage_now != stage:
-            previous = self._stage_now
-            self._stage_now = stage or self._stage_now
-            if stage and stage != previous:
-                # A new stage means the live ETA resets (sibling rule).
-                self._stage_eta = None
-                self._stage_fraction = None
-                if stage.startswith("upscaling"):
-                    self.stage_bar.set_busy(True, "upscaling ...")
-                else:
-                    self.stage_bar.set_busy(True, "estimating ...")
+            self._render_log_tail("\n".join(str(line) for line in tail[-40:]))
 
     def _consume_terminal_snapshot(self, row: int, snapshot: dict) -> None:
         self.run_done += 1
@@ -838,9 +959,65 @@ class MainWindow(QMainWindow):
         if label.text() != text:
             label.setText(text)
 
-    def _set_text_log(self, text: str) -> None:
-        if self.run_log_tail.toPlainText() != text:
-            self.run_log_tail.setPlainText(text)
+    # -- v0.4.5 log tail: pin-to-tail with user-scroll override (§2) --
+
+    def _log_tail_user_at_bottom(self) -> bool:
+        """Rule 3's tolerance read: within _LOG_PIN_TOLERANCE_PX of the
+        scrollbar maximum counts as at-the-bottom. Read BEFORE any
+        setPlainText — the document-swap re-fires range/valueChanged
+        synchronously, so a read after the swap measures the NEW
+        document, not where the user was."""
+        scrollbar = self.run_log_tail.verticalScrollBar()
+        return scrollbar.value() >= scrollbar.maximum() - _LOG_PIN_TOLERANCE_PX
+
+    def _log_scroll_value_changed(self, value: int) -> None:
+        """Track the user-scroll override: any upward move past the
+        tolerance engages inspecting mode; back within tolerance (Rule
+        3) disengages it. One writer — this hook — so the 1 Hz render
+        never races the scrollbar."""
+        scrollbar = self.run_log_tail.verticalScrollBar()
+        at_bottom = value >= self._log_scroll_max - _LOG_PIN_TOLERANCE_PX
+        self._log_user_scrolled_up = not at_bottom
+
+    def _log_scroll_range_changed(self, _min: int, maximum: int) -> None:
+        """Cache the maximum after each document swap. A grown range
+        clears the stale override when the user is still visually at
+        the tail (the pre-swap position now sits within tolerance of
+        the new max); a range change beyond the tolerance from a
+        settled viewport reads as scrolled-away only when the USER
+        moved — handled by the next valueChanged, never guessed here.
+        """
+        self._log_scroll_max = maximum
+        scrollbar = self.run_log_tail.verticalScrollBar()
+        at_bottom = scrollbar.value() >= maximum - _LOG_PIN_TOLERANCE_PX
+        if not at_bottom:
+            return
+        self._log_user_scrolled_up = False
+
+    def _render_log_tail(self, text: str) -> None:
+        """Rule 1-5 render (replaces the old _set_text_log on the tick):
+        identical text never touches the document (Rule 5, the same
+        setText-only-on-change discipline as labels); on a real change
+        "was at bottom" is read BEFORE setPlainText (the §2 Qt
+        subtlety), the text is swapped, and the pin decision is made
+        from the pre-swap position. A pending force-pin (Rule 4, job
+        change) wins over the user's inspecting mode exactly once; the
+        pin clears after landing on tail and inspecting resumes with
+        the next scroll-away."""
+        if self.run_log_tail.toPlainText() == text:
+            return
+        was_pinned = self._log_tail_user_at_bottom() or not self._log_user_scrolled_up
+        self.run_log_tail.setPlainText(text)
+        if self._log_force_pin_next:
+            self._log_force_pin_next = False
+            self._log_user_scrolled_up = False
+            self._pin_log_to_tail()
+        elif was_pinned:
+            self._pin_log_to_tail()
+
+    def _pin_log_to_tail(self) -> None:
+        scrollbar = self.run_log_tail.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _forecast_total_seconds(self) -> float | None:
         """Forecast the whole remaining batch (design §1.5): the live
