@@ -149,6 +149,24 @@ class LocalBridgeClient:
         """One tick's read for several jobs, submission order."""
         return [self.status_snapshot(job_id) for job_id in job_ids]
 
+    # -- queue views (v0.4.6: the status API's active-job read) ----------
+
+    def queue_views(self) -> tuple[list, list]:
+        """The registry's queued-then-running job records, for readers
+        that enumerate active work (the v0.4.6 HTTP monitor's
+        ``active_jobs[]``).
+
+        A pure READ over the shared registry — the same
+        lock-snapshotted views ``status_snapshot()``/``history()``
+        traverse (registry N1 discipline), queued sorted by submission
+        order exactly like ``queue_position``. No lock crossing, no
+        write surface: the tuples are plain record views.
+        """
+        registry = self.registry
+        running = registry.running()
+        queued = sorted(registry.queued(), key=lambda r: r.submitted_at)
+        return running, queued
+
     # -- cancel ---------------------------------------------------------------
 
     def cancel(self, job_id: str) -> str:

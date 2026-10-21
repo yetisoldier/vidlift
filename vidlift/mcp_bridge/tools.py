@@ -448,6 +448,13 @@ def _status_payload(services: BridgeServices, record) -> dict:
         payload.update(
             {
                 "current_phase": data["current_phase"],
+                # v0.4.6 (status-API design §3.1, additive): the runner's
+                # own live progress dict (step / frames_done /
+                # frames_total / chunk_* / phase_note through v0.4.5's
+                # record_step seam) rides the payload at last — the GUI
+                # already consumed this shape; the API made the omission
+                # observable. Pass-through, never computed.
+                "progress": data["progress"],
                 "started_at": data["started_at"],
                 "finished_at": data["finished_at"],
                 "last_activity_at": data["last_activity_at"],
