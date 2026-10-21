@@ -49,11 +49,23 @@ from PyQt6.QtWidgets import (
 )
 
 from . import __version__
+from .config import (
+    MONITOR_ENABLED_DEFAULT,
+    MONITOR_HOST_DEFAULT,
+    MONITOR_PORT_DEFAULT,
+    MONITOR_TOKEN_DEFAULT,
+    QSETTINGS_MONITOR_KEYS,
+)
 from .mcp_bridge.client_local import (
     BatchTooLarge,
     LocalBridgeClient,
 )
 from .mcp_bridge.tools import BridgeError
+from .monitor import (
+    lan_ip,
+    start_server_with_fallback,
+    stop_server,
+)
 from .run import UPSCALE_STEP_PREPARED_COUNT as PREPARED_COUNT_PROBE_STEP
 from .plan import BatchPlan, PlannedFile, build_batch_plan
 from .probe import ProbeError, probe_and_classify
@@ -289,6 +301,18 @@ class MainWindow(QMainWindow):
         self._log_rendered_key: str | None = None
         self._log_scroll_max = 0  # cached maximum (rangeChanged writer)
 
+        # v0.4.6 (status-API design §4): monitor widgets + state.
+        # Default-on per settings; actual startup waits for the tail
+        # of __init__ (the pill must exist before a fallback-port
+        # report reaches it). Startup failure is non-fatal — the pill
+        # says so and the app continues.
+        self.monitor_check = QCheckBox(
+            "LAN monitoring (agents check upscale progress from other machines)"
+        )
+        self.monitor_pill = QLabel("")
+        self.monitor_pill.setObjectName("VersionBadge")
+        self.monitor_port_reported: int | None = None
+
         # Sibling port: the 1 Hz single-writer liveness timer.
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(1000)
@@ -374,6 +398,9 @@ class MainWindow(QMainWindow):
         self._apply_style()
         self._set_summary("No files planned yet", "Drop videos here or choose Add Files.")
         self._render_recent_jobs()
+        # v0.4.6 (§4.1): default-on start AFTER the shell exists — the
+        # pill is built, so a fallback-port report can reach it.
+        self._start_monitor()
 
     # -- engine persistence (design §7) ---------------------------------
 
@@ -387,6 +414,113 @@ class MainWindow(QMainWindow):
         if value not in ("auto", "stub", "ncnn"):
             return "auto"
         return str(value)
+
+    # -- LAN monitor (v0.4.6 design §4) -------------------------------------
+
+    def _monitor_settings(self) -> dict:
+        """The persisted monitor settings (QSettings, §4.4); a missing
+        value reads as the module default — ON by default at
+        0.0.0.0:8765 with the baked token (vidlift.config). A stored
+        empty token means local-only open."""
+        settings = self._settings()
+        try:
+            port = int(
+                settings.value(QSETTINGS_MONITOR_KEYS["port"], MONITOR_PORT_DEFAULT)
+            )
+        except (TypeError, ValueError):
+            port = MONITOR_PORT_DEFAULT
+        enabled = settings.value(
+            QSETTINGS_MONITOR_KEYS["enabled"], MONITOR_ENABLED_DEFAULT
+        )
+        if isinstance(enabled, str):
+            enabled = enabled.lower() not in ("false", "0", "no", "off", "")
+        host = settings.value(QSETTINGS_MONITOR_KEYS["host"], MONITOR_HOST_DEFAULT)
+        token = settings.value(QSETTINGS_MONITOR_KEYS["token"], MONITOR_TOKEN_DEFAULT)
+        return {
+            "enabled": bool(enabled),
+            "host": str(host or MONITOR_HOST_DEFAULT),
+            "port": port,
+            "token": str(token or ""),
+        }
+
+    def _start_monitor(self) -> None:
+        """Construction-time start (default-on, §4.1): a daemon thread
+        through start_server_with_fallback; a fallback port is
+        persisted so the next launch is clean. Startup failure is
+        NON-FATAL — the pill names the problem and the app continues."""
+        monitor = self._monitor_settings()
+        was_blocked = self.monitor_check.blockSignals(True)
+        self.monitor_check.setChecked(bool(monitor["enabled"]))
+        self.monitor_check.blockSignals(was_blocked)
+        if not monitor["enabled"]:
+            self._refresh_monitor_pill()
+            return
+        import os
+
+        if os.environ.get("VIDLIFT_MONITOR_AUTOSTART", "") in (
+            "0",
+            "false",
+            "off",
+        ):
+            # Explicit opt-out (test/CI runs, headless containers):
+            # the setting stays ON; only THIS launch skips the bind.
+            self._refresh_monitor_pill()
+            return
+        try:
+            _server, _base, actual_port = start_server_with_fallback(
+                client=self.client,
+                host=monitor["host"],
+                port=monitor["port"],
+                token=monitor["token"],
+            )
+        except OSError as exc:
+            self.monitor_pill.setText(f"Monitor off (port busy: {exc})")
+            return
+        if actual_port != monitor["port"]:
+            self._settings().setValue(QSETTINGS_MONITOR_KEYS["port"], actual_port)
+        self.monitor_port_reported = actual_port
+        self._refresh_monitor_pill()
+
+    def _toggle_monitor(self, checked: bool) -> None:
+        """The checkbox handler (sibling _toggle_monitor, §4.2): on →
+        start_server_with_fallback; off → stop_server; either way
+        persist the setting and refresh the pill."""
+        self._settings().setValue(QSETTINGS_MONITOR_KEYS["enabled"], bool(checked))
+        try:
+            if checked:
+                monitor = self._monitor_settings()
+                _server, _base, actual_port = start_server_with_fallback(
+                    client=self.client,
+                    host=monitor["host"],
+                    port=monitor["port"],
+                    token=monitor["token"],
+                )
+                if actual_port != monitor["port"]:
+                    self._settings().setValue(
+                        QSETTINGS_MONITOR_KEYS["port"], actual_port
+                    )
+                self.monitor_port_reported = actual_port
+            else:
+                stop_server()
+                self.monitor_port_reported = None
+        except OSError as exc:
+            self._settings().setValue(QSETTINGS_MONITOR_KEYS["enabled"], False)
+            self.monitor_port_reported = None
+            self.monitor_pill.setText(f"Monitor off ({exc})")
+            return
+        self._refresh_monitor_pill()
+
+    def _refresh_monitor_pill(self) -> None:
+        """The pill (sibling _refresh_monitor_pill, §4.3): on with the
+        best-effort LAN IP when serving; off otherwise. State comes
+        from the GUI's own start/stop bookkeeping — never a stale
+        from-import of the monitor's module global (from-imports bind
+        values, not live names). The token is a secret-ish value and
+        stays OUT of window chrome (§4.4)."""
+        if self.monitor_port_reported is not None:
+            self.monitor_pill.setText(f"Monitor on: {lan_ip()}:{self.monitor_port_reported}")
+        else:
+            self.monitor_pill.setText("Monitor off")
 
     def _engine_changed(self, index: int) -> None:
         data = self.engine_combo.itemData(index)
@@ -408,6 +542,7 @@ class MainWindow(QMainWindow):
         title_stack = QVBoxLayout()
         title_stack.addWidget(title)
         title_stack.addWidget(self._version_pill(), alignment=Qt.AlignmentFlag.AlignLeft)
+        title_stack.addWidget(self.monitor_pill, alignment=Qt.AlignmentFlag.AlignLeft)
         title_stack.addWidget(QLabel("Plan and run batch SD video upscales"))
         title_row.addLayout(title_stack)
         title_row.addStretch(1)
@@ -458,6 +593,8 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("Upscale engine"), 1, 0)
         grid.addWidget(self.engine_combo, 1, 1)
         grid.addWidget(self.subtitle_ocr, 1, 2, 1, 3)
+        grid.addWidget(self.monitor_check, 2, 0, 1, 7)
+        self.monitor_check.toggled.connect(self._toggle_monitor)
         grid.addWidget(self.cancel_button, 1, 7)
         grid.setColumnStretch(6, 1)
         layout.addWidget(controls)
@@ -1160,6 +1297,13 @@ class MainWindow(QMainWindow):
                     break
                 time.sleep(0.05)
         self.client.stop()
+        # v0.4.6 (§4.5): stop the LAN monitor beside the worker stop —
+        # the sibling never leaves a listener after close. The pill is
+        # refreshed too: a close-then-inspect window never shows a
+        # stale "Monitor on".
+        stop_server()
+        self.monitor_port_reported = None
+        self._refresh_monitor_pill()
         super().closeEvent(event)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
@@ -1189,12 +1333,17 @@ def main(argv: list[str] | None = None) -> int:
     QApplication.setOrganizationName("YetiWurks")
 
     def _shutdown() -> None:
+        from .monitor import stop_server as _stop_monitor
+
         for widget in QApplication.topLevelWidgets():
             if isinstance(widget, MainWindow):
                 try:
                     widget.client.stop()
                 except Exception:
                     pass
+        # v0.4.6 (§4.5): the monitor never outlives the app (covers
+        # teardown paths that bypass closeEvent, e.g. aboutToQuit).
+        _stop_monitor()
 
     app = QApplication(list(argv or sys.argv[1:]))
     app.aboutToQuit.connect(_shutdown)
