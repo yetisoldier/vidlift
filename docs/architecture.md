@@ -32,6 +32,24 @@ bundled FFmpeg, Real-ESRGAN, and OCR tools beside the frozen executables.
 - Output naming is derived from the input filename.
 - The tool reports source limits honestly instead of promising invented detail.
 
+## State Location (registry lanes)
+
+The persisted job registry (`jobs.json`) lives in ONE state dir per
+host, and the two deployment lanes resolve it differently: the minipc
+dev lane pins `VIDLIFT_STATE_DIR=/home/yetisoldier/.vidlift` (the
+`vidlift-mcp` wrapper), while the packaged Windows GUI resolves
+`default_state_dir()` to `%LOCALAPPDATA%\YetiWurks\VidLift`. These are
+two physically separate registries — each is the source of truth for
+the jobs its own host enqueued, and there is no cross-machine sync
+(lane decision deferred to v0.5.0; the honest rule meanwhile is
+**enqueue and observe on the same host**): enqueue jobs through the
+GUI/CLI/MCP server running on the machine whose registry you intend to
+write, and query status from the same lane. An MCP-side `enqueue`
+against a DIFFERENT machine's registry will not appear in that
+machine's GUI and vice versa; a long-lived MCP server converges on its
+OWN state dir's file via the registry's mtime reload (v0.4.5), which
+works within one host, not across the two.
+
 ## Engine Boundary
 
 VidLift keeps its file-first Real-ESRGAN adapter behind the

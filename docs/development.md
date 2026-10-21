@@ -62,6 +62,23 @@ image.save('/tmp/vidlift-ui-smoke.png')
 PY
 ```
 
+## Observability Heartbeat Rule (v0.4.5)
+
+No phase of the pipeline may run for more than `HEARTBEAT_LOG_SECONDS`
+(30.0 s, `vidlift/run.py`) without emitting at least one observable
+signal: a runner log line, a `progress` step-label change, or a frame
+progress update. This is the lesson of the 2026-10-20 live run, where
+the SD prepared-count probe ran silently for 23+ minutes and the
+packaged GUI read as frozen. The rule's first application is the
+decode-count probe in `vidlift/engine_ncnn.py`, whose heartbeat now
+writes `prepared-count-probe: heartbeat t=<n>s (decode-count pass; no
+per-frame signal until ffprobe summary)` at the 30 s cadence; any
+future long-running seam (an external command that can outlast `30 s`,
+a phase with no per-frame denominator) must emit a log line or update
+a progress field the same way — a `last_activity_at` touch alone does
+not satisfy the rule, because the log tail and status payloads are the
+surfaces health is actually judged from.
+
 ## Local Artifacts
 
 Do not commit caches, generated videos, or screenshots from smoke tests.

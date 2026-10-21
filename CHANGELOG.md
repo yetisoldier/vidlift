@@ -2,6 +2,51 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.5] - 2026-10-20
+
+Progress honesty (binding design:
+`docs/designs/v0.4.5-progress-honesty.md`). Additive patch over
+v0.4.4; nothing touches a live run — everything activates at next GUI
+launch. No protocol or CLI behavior change.
+
+### Fixed
+
+- **Log tail renders the TOP of its buffer** (D-tail). The run log
+  widget now pins to the tail on every tick, a user scroll-up keeps
+  their position (inspect-inspecting mode), scrolling back to the
+  bottom (within an 8 px tolerance) re-engages the pin, a job-set
+  change force-pins once, and identical tail text never touches the
+  document (no scrollbar jitter on the 1 Hz tick).
+- **SD prepared-count probe emitted no progress signal for its whole
+  duration** (D-count). The decode-count pass now writes an honest
+  heartbeat log line every 30 s: `prepared-count-probe: heartbeat
+  t=<n>s (decode-count pass; no per-frame signal until ffprobe
+  summary)` — phase named, elapsed named, no fabricated percent. The
+  engine's step touch (`last_activity_at`) is unchanged.
+- **"estimating ..." gave no motion cue on long stages** (D-eta). The
+  count-pass busy label now reads `measuring — counting frames...`
+  (naming what is being measured); the stage label renders
+  `upscaling — counting frames (this can take 10-40 min on SD sources;
+  no per-frame ETA exists yet)` during the count pass and
+  `upscaling chunk 3/12` once chunks flow; encode/verify surface
+  their heartbeat seconds; the ETA appears the moment the first
+  chunk's counters land. `_eta_seconds` math unchanged.
+- **Registry staleness across long-lived MCP sessions** (D2). The
+  registry stat-checks `jobs.json`'s mtime on every read and reloads
+  (merge-by-job-id, in-memory `_live` boxes and cancel flags
+  preserved) when another process wrote it — a server started before
+  an enqueue now sees the job without a restart. Soft-fail on corrupt
+  files at reload time (startup `load()` stays hard).
+
+### Docs
+
+- `docs/development.md`: the Observability Heartbeat Rule — no phase
+  may run more than 30 s without an observable signal (log line,
+  step-label change, or progress update).
+- `docs/architecture.md`: the registry-lane "State location" note —
+  enqueue and observe on the same host; the cross-machine union
+  (D1) is a v0.5.0 decision.
+
 ## [0.4.4] - 2026-10-20
 
 GUI/status/MCP unification (binding design:
