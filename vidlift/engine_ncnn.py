@@ -67,9 +67,11 @@ import shlex
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -712,6 +714,100 @@ class EngineInvocation:
 # must not pay the probe cost for every run in a long-lived bridge.
 _PROBE_CACHE: dict[tuple[str, str], tuple[bool, str]] = {}
 
+# v0.4.5 slice 2b (the 2026-10-20 live-run verdict): the probe frame's
+# subprocess bound is 120 s — the engine decode of one tiny PNG is
+# sub-second when healthy, so three minutes is 100x honesty headroom,
+# far under the "minutes" the hang cost. The bound lives in
+# _probe_run's self-managed reaping, NOT bare subprocess.run: Python's
+# run(timeout=) does the kill but then calls an UNTIMED communicate()
+# on the pipes — a killed ncnn child whose driver-spawned grandchildren
+# hold the pipes open (the Windows hang: GPU resident-but-idle for
+# three hours) blocks forever. _probe_run keeps the run() call shape
+# so the injected-fake seam and the real path agree.
+GPU_PROBE_TIMEOUT_SECONDS = 120.0
+_PROBE_DRAIN_MAX_LINES = 256
+
+
+def _probe_run(
+    cmd: list[str],
+    *,
+    capture_output: bool = True,
+    text: bool = True,
+    timeout: float | None = None,
+    **kwargs,
+) -> subprocess.CompletedProcess:
+    """subprocess.run-shaped, subprocess-level bounded reaping (2b).
+
+    The DEFAULT ``run_fn`` for :func:`gpu_probe_frame`. Pipe discipline:
+    both streams are drained by daemon threads into bounded tails (no
+    pipe-buffer deadlock, no unbounded memory), the child is waited on
+    against a deadline, and a timeout escalates terminate -> wait 10 s
+    -> kill -> wait 5 s (the same ladder the engine's ``_run_process``
+   validated for stubborn children) — then raises the SAME
+    :class:`subprocess.TimeoutExpired` ``run`` would, so callers and
+    injected fakes share one timeout contract. The bounded-reap
+    difference from ``subprocess.run``: every wait in the escalation is
+    timed, and no untimed communicate() ever follows the kill — the
+    exact trap that hung Eric's Windows probe for three hours.
+    Non-piped calls (unused by the probe) delegate to subprocess.run.
+    """
+    deadline = time.monotonic() + float(timeout) if timeout else None
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **kwargs,
+    )
+    out: deque[str] = deque(maxlen=_PROBE_DRAIN_MAX_LINES)
+    err: deque[str] = deque(maxlen=_PROBE_DRAIN_MAX_LINES)
+
+    def _drain(pipe, sink: deque) -> None:
+        try:
+            for line in pipe:
+                sink.append(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+    threads = [
+        threading.Thread(target=_drain, args=(pipe, sink), daemon=True)
+        for pipe, sink in ((proc.stdout, out), (proc.stderr, err))
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        if deadline is None:
+            proc.wait()
+        else:
+            try:
+                proc.wait(timeout=max(0.05, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass  # bounded give-up; the raise is what matters
+                for thread in threads:
+                    thread.join(timeout=1)
+                raise subprocess.TimeoutExpired(cmd, timeout) from None
+    finally:
+        for thread in threads:
+            thread.join(timeout=1)
+    return subprocess.CompletedProcess(
+        cmd, proc.returncode, "".join(out), "".join(err)
+    )
+
 
 def _tiny_png(size: int = 64) -> bytes:
     """A minimal valid solid-gray RGB PNG the real engine can decode.
@@ -745,8 +841,8 @@ def gpu_probe_frame(
     models_dir: str,
     *,
     spec: ModelSpec | None = None,
-    timeout_s: float = 180.0,
-    run_fn=subprocess.run,
+    timeout_s: float = GPU_PROBE_TIMEOUT_SECONDS,
+    run_fn=_probe_run,
     workspace: Path | None = None,
 ) -> tuple[bool, str]:
     """Run one REAL tiny frame through the engine and verify its output.
@@ -758,7 +854,18 @@ def gpu_probe_frame(
     (binary, models_dir). Never raises — every failure is
     ``(False, reason)`` so auto selection can fall to the stub with
     the reason recorded (design r1: a bad binary fails here, not
-    mid-run). """
+    mid-run).
+
+    v0.4.5 slice 2b (the 2026-10-20 live-run verdict): the probe is
+    subprocess-level BOUNDED at ``GPU_PROBE_TIMEOUT_SECONDS`` (120 s).
+    A timeout is honest engineering data, not a hang: the reason reads
+    ``probe frame timed out after <n>s``, a stderr line says
+    ``engine probe timed out after <n>s``, and ``select_engine``'s
+    existing auto path lands on the stub — the run ships fail-open
+    instead of sitting GPU-resident-but-idle for hours (the default
+    ``run_fn`` is :func:`_probe_run`, whose bounded reaping survives
+    the killed-children-holding-pipes trap that hung the live run).
+    """
     spec = spec or MODEL_TABLE["live-action"]
     key = (str(binary), str(models_dir))
     if key in _PROBE_CACHE:
@@ -794,7 +901,19 @@ def gpu_probe_frame(
                 cmd, capture_output=True, text=True, timeout=timeout_s,
                 **_proc.popen_kwargs(),
             )
-        except Exception as exc:  # OSError, TimeoutExpired, driver hangs
+        except subprocess.TimeoutExpired:
+            # 2b: a probe that outlives the bound is DATA — name the
+            # timeout as the reason (never a bare "could not run"),
+            # say it on stderr (stdout is MCP protocol), and let the
+            # caller's auto path fall to the stub.
+            message = f"probe frame timed out after {int(timeout_s)}s"
+            print(
+                f"engine probe timed out after {int(timeout_s)}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            ok, reason = False, message
+        except Exception as exc:  # OSError, driver hangs
             ok, reason = False, f"probe frame could not run: {type(exc).__name__}: {exc}"
         else:
             if proc.returncode != 0:
