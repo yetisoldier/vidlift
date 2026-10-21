@@ -206,6 +206,99 @@ class Registry:
         # itself, so a running job ALWAYS has a live cancel flag.
         self._cancel_flags: dict = {}
         self.load()
+        # v0.4.5 (D2, progress-honesty design §4): the mtime this
+        # process loaded — the baseline every reader's _maybe_reload
+        # compares against. A registered ``log_event`` hook (server
+        # wiring; optional) receives soft-failure warnings.
+        self._loaded_mtime = self._stat_mtime_or_none()
+        self.log_event = None
+
+    # -- mtime reload (v0.4.5 §4, D2) ------------------------------------
+
+    def _stat_mtime_or_none(self) -> float | None:
+        """The registry file's current mtime, None when absent/unstatable
+        (a missing file is the pre-enqueue state, not an error)."""
+        try:
+            return os.stat(self.path).st_mtime
+        except OSError:
+            return None
+
+    def _maybe_reload(self) -> None:
+        """D2 (§4): converge on other writers' truth before any read.
+
+        One ``stat`` in the common case; a different mtime takes the
+        lock, re-stats INSIDE the lock (another copy may have reloaded
+        us already), re-parses, and merges by job_id:
+        - file rows win over in-memory rows for every persisted field;
+        - in-memory ``_live`` boxes and ``_cancel_flags`` survive (they
+          are process-local by design);
+        - a job in memory but absent from the file is LEFT ALONE (this
+          server's own in-flight record, not yet flushed — absence
+          means another writer deleted it, which the writer set never
+          does; a warning is logged defensively).
+
+        Failure semantics: a failed stat or parse is SOFT — logged,
+        in-memory view kept. The hard raise stays at startup ``load()``.
+        Test seam: monkeypatch ``_stat_mtime_or_none`` or ``_parse_rows``
+        to simulate mtime drift without the filesystem.
+        """
+        mtime = self._stat_mtime_or_none()
+        if mtime == self._loaded_mtime:
+            return
+        with self._lock:
+            mtime = self._stat_mtime_or_none()
+            if mtime == self._loaded_mtime:
+                return
+            try:
+                rows = self._parse_rows()
+            except Exception as exc:
+                self._log_soft(
+                    f"registry reload failed; keeping in-memory view: {exc}"
+                )
+                return
+            file_ids = set()
+            for row in rows:
+                record = JobRecord.from_dict(row)
+                file_ids.add(record.job_id)
+                existing = self._jobs.get(record.job_id)
+                if existing is not None and getattr(existing, "_live", None):
+                    live = existing._live  # process-local, survives reload
+                else:
+                    live = None
+                self._jobs[record.job_id] = record
+                if live:
+                    self._jobs[record.job_id]._live = live
+            for job_id in self._jobs:
+                if job_id not in file_ids:
+                    self._log_soft(
+                        f"registry reload: job {job_id} is in memory but "
+                        "absent from the file; leaving it alone (this "
+                        "server's in-flight record)"
+                    )
+            self._loaded_mtime = mtime
+
+    def _parse_rows(self) -> list[dict]:
+        """The file's job rows parsed strictly; raises for the soft-fail
+        path to catch."""
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        if not isinstance(jobs, list):
+            raise ValueError("registry file has no jobs list")
+        return jobs
+
+    def _log_soft(self, text: str) -> None:
+        """Best-effort observability for soft failures: a ``log_event``
+        hook attribute when attached (server wiring sets it), stderr
+        otherwise. Never raises (a reload problem must not kill a
+        reader)."""
+        hook = getattr(self, "log_event", None)
+        if hook is not None:
+            try:
+                hook(f"registry: {text}")
+                return
+            except Exception:
+                pass
+        print(f"vidlift-registry: {text}", flush=True)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -231,7 +324,12 @@ class Registry:
             self._jobs[record.job_id] = record
 
     def save(self) -> None:
-        """Atomic write-to-temp + os.replace under the lock."""
+        """Atomic write-to-temp + os.replace under the lock.
+
+        v0.4.5 (§4): the post-write mtime becomes ``_loaded_mtime``, so
+        a save→read sequence does not trigger an unnecessary reload of
+        our own write.
+        """
         with self._lock:
             payload = json.dumps(
                 {
@@ -252,6 +350,7 @@ class Registry:
                 except OSError:
                     pass
                 raise
+            self._loaded_mtime = self._stat_mtime_or_none()
 
     # -- job operations -------------------------------------------------------
 
@@ -277,9 +376,11 @@ class Registry:
         return record
 
     def get(self, job_id: str) -> JobRecord | None:
+        self._maybe_reload()
         return self._jobs.get(job_id)
 
     def require(self, job_id: str) -> JobRecord:
+        self._maybe_reload()
         record = self._jobs.get(job_id)
         if record is None:
             raise KeyError(job_id)
@@ -316,6 +417,7 @@ class Registry:
         # this from _claim_next while the MCP message loop enqueues;
         # an unlocked iteration raised RuntimeError mid-enqueue and
         # killed the single worker (D1's consequence class).
+        self._maybe_reload()
         with self._lock:
             return [
                 r for r in self._jobs.values()
@@ -325,6 +427,7 @@ class Registry:
     def queue_position(self, job_id: str) -> int | None:
         """0-based position among queued jobs (submission order), None
         once the job has started."""
+        self._maybe_reload()
         record = self._jobs.get(job_id)
         if record is None or record.state != "queued":
             return None
@@ -338,6 +441,7 @@ class Registry:
     def running(self) -> list[JobRecord]:
         # Same N1 class: snapshot under the lock (status tool calls
         # this from the message-loop thread while enqueues land).
+        self._maybe_reload()
         with self._lock:
             return [
                 r for r in self._jobs.values()
@@ -346,6 +450,7 @@ class Registry:
 
     def history(self) -> list[JobRecord]:
         # Same N1 class: snapshot under the lock, sort the snapshot.
+        self._maybe_reload()
         with self._lock:
             records = [
                 r for r in self._jobs.values()

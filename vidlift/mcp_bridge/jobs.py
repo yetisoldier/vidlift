@@ -138,6 +138,11 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
     # while the worker thread is blocked inside run_file.
     state_box: dict = {}
     record.set_live("state_box", state_box)
+    # v0.4.5 (D2): re-pin the record so a reader's _maybe_reload
+    # cannot re-install a stale file row over the live seams: the
+    # record's _live state box and the cancel flag are process-local
+    # and must survive any concurrent reload.
+    services.registry._jobs[record.job_id] = record
 
     log_root = Path(
         options.get("log_dir") or (Path(path).parent / ".vidlift-runs")

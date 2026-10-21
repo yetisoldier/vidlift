@@ -211,6 +211,10 @@ class McpServer:
         self.stderr = stderr
         self.bridge_log = BridgeLog(self.state_dir / "mcp-server.log")
         self.services.log_event = self._log_event
+        # v0.4.5 (D2): the registry's soft-failure warnings (reload
+        # parse errors, defensively-kept in-flight rows) ride the same
+        # rotating bridge log.
+        self.registry.log_event = self._log_event
         self._log_lock = threading.Lock()
         self._requests_handled = 0
         if start_workers:
