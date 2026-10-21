@@ -2,6 +2,61 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.6] - 2026-10-20
+
+Read-only HTTP status API (binding design:
+`docs/designs/v0.4.6-status-api.md`, D1 lane d). The GUI process
+serves a small stdlib HTTP surface reading the SAME
+registry/executor the GUI tick reads — one truth, two readers, no
+mirror. Remote enqueue/cancel stays out of scope (minipc-dev-only
+through the stdio MCP bridge).
+
+### Added
+
+- **`GET /health`** (token-free liveness: `ok`, `version`, `busy`),
+  **`GET /status`** (token-gated: `api_version: 1` + the bridge's own
+  `_status_payload` per active job — live `progress` dict with
+  `step`/`frames_done`/`frames_total`/`chunk_*`/`phase_note`, honest-
+  null `eta_seconds`, `log_tail`), **`GET /history`** (token-gated
+  pass-through to the registry's history rows). Anything else 404;
+  any non-GET verb 501 — read-only by construction (the handler
+  defines only `do_GET`, and the server holds a three-method
+  `StatusView` read facade, never the client's write surface).
+  Served from `vidlift/monitor.py` (stdlib `ThreadingHTTPServer`,
+  daemon thread); idempotent `start_server`/
+  `start_server_with_fallback`/`stop_server` with the Windows port-
+  walk fallback (WinError 10013, Hyper-V/WSL reservations) and a
+  `lan_ip()` helper. Bind defaults 0.0.0.0:8765, **on by default**
+  (sibling bluray-to-mp4 precedent); fresh baked
+  `MONITOR_TOKEN_DEFAULT` (never the sibling's token); override via
+  QSettings `monitor/*` keys (`vidlift/config.py`).
+- **GUI wiring (~40 LOC):** "LAN monitoring" checkbox (persists via
+  QSettings), header pill (`Monitor on: <lan-ip>:<port>` / `Monitor
+  off`), daemon-thread start at window construction (startup failure
+  non-fatal — pill names it), `stop_server()` in `closeEvent` and
+  `aboutToQuit`. `VIDLIFT_MONITOR_AUTOSTART=0` skips the bind per
+  launch (tests/headless).
+- **README "Remote monitoring" section** with the agent curl recipe
+  and the token-retrieval path.
+
+### Fixed
+
+- **The live status payload never carried the runner's `progress`
+  dict** (`vidlift/mcp_bridge/tools.py::_status_payload`). v0.4.5's
+  GUI consumed `snapshot["progress"]` (stage labels, counters,
+  `phase_note`) but the bridge payload omitted the key — GUI-only
+  tests masked the gap; the API made the omission observable. The
+  runner's own `state.progress` now rides the payload verbatim
+  (additive key, schema-v2 convention). No other bridge change.
+
+### D1 resolution
+
+> **D1 resolved by lane (d).** With the read-only status API shipped,
+> cross-machine *visibility* — the entire reason options (a)
+> (Windows-side MCP server) and (b) (one-way registry sync) were on
+> the table — is served by one curl against the GUI host. (a) and (b)
+> retire to "unnecessary unless remote enqueue is ever needed."
+
 ## [0.4.5] - 2026-10-20
 
 Progress honesty (binding design:

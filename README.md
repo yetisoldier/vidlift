@@ -86,6 +86,36 @@ VidLift performs:
 6. full verification
 7. subtitle pass-through or OCR when possible
 
+## 📡 Remote monitoring
+
+The desktop app serves a small read-only status API while it runs
+(LAN monitoring, on by default; the checkbox in the controls area
+turns it off). Every response is read-only — the server has no write
+verbs and no write surface; it can never enqueue or cancel anything.
+
+```bash
+curl http://ninjabase2:8765/health                          # token-free liveness: {"ok": true, "busy": ...}
+curl "http://ninjabase2:8765/status?token=<token>"         # live queue: api_version 1 + one payload per active job
+curl "http://ninjabase2:8765/history?token=<token>"        # finished jobs, newest first
+```
+
+- Token: `Authorization: Bearer <token>` or `?token=<token>`.
+  The default token is baked into the app
+  (`vidlift/monitor.py::MONITOR_TOKEN_DEFAULT`); override it in
+  `%APPDATA%\YetiWurks\VidLift\VidLift.conf` under `[monitor] token=`
+  (QSettings). The token is a secret-ish value — give it to your
+  agent's config on the remote machine, never to a web page.
+- The server binds `0.0.0.0:8765` by default (overridable via
+  `monitor/host` / `monitor/port`); if the port is reserved (Windows
+  Hyper-V/WSL port exclusions), the next free port is used and
+  persisted.
+- `/status` mirrors exactly what the GUI shows, per active job: state,
+  current phase, the runner's `progress` dict (`step`,
+  `frames_done`/`frames_total`, `chunk_index`/`chunk_total`,
+  `phase_note`), the runner's own `log_tail`, and `eta_seconds` only
+  when honestly known (a measured benchmark constant on a matching
+  engine) — otherwise `null`, never a projection.
+
 ## ⚙️ How it works
 VidLift automates a complex multi-stage pipeline so you don't have to:
 
