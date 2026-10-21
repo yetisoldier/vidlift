@@ -21,3 +21,12 @@ _GUARD_PATH = "/nonexistent/vidlift-test-guard/realesrgan-ncnn-vulkan"
 @pytest.fixture(autouse=True)
 def _auto_engine_guard(monkeypatch):
     monkeypatch.setenv("VIDLIFT_REALESRGAN_NCNN", _GUARD_PATH)
+
+
+@pytest.fixture(autouse=True)
+def _no_monitor_autostart(monkeypatch):
+    # v0.4.6: the GUI's LAN monitor ships ON by default; tests isolate
+    # QSettings but a construction-time listener must never open in a
+    # suite run (nor write the port fallback back to real user
+    # QSettings). Monitor-specific tests re-enable per-test.
+    monkeypatch.setenv("VIDLIFT_MONITOR_AUTOSTART", "0")
