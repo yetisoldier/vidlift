@@ -126,12 +126,26 @@ For each successful job, VidLift writes:
 Run records are stored in **.vidlift-runs** beside the source unless a different
 log directory is supplied.
 
-## Hardware and storage
+## ✍️ Subtitle Recovery (OCR)
 
-- Windows 11 x64
-- Vulkan-capable GPU and current graphics driver for AI upscaling
-- enough free space for temporary decoded frames and the final MP4
-- local storage is strongly recommended for long runs
+VidLift includes a built-in pipeline to rescue subtitles from older SD videos. Many legacy formats use "bitmap" subtitles (VobSub from DVDs or PGS from Blu-rays) which are actually images of text that cannot be searched or toggled.
+
+**How it works:**
+VidLift uses Optical Character Recognition (OCR) to read these images and convert them into a standard text format. The result is delivered in two ways:
+- **Embedded:** The text is muxed into the final MP4 as a `mov_text` track, which is the universal standard supported by VLC, Plex, and Apple TV.
+- **Sidecar:** A separate `.srt` file is written next to your output MP4, allowing you to edit the subtitles manually in any text editor.
+
+**The OCR Engine:**
+On Windows, VidLift bundles the **Subtitle Edit (seconv)** headless converter and **Tesseract OCR**. It runs a disciplined two-pass process:
+1. **Raw OCR:** Tesseract reads the images into a raw SRT file.
+2. **Auto-Fix:** A second pass applies common OCR error rules and dictionary-based guessing to resolve common glyph misreads (e.g., replacing a `|` with an `I`).
+
+**Best-Effort / Fail-Open:**
+OCR is a "best-effort" service. If a subtitle track is too corrupted or the OCR engine fails, VidLift will **fail open**. This means the video and audio will still be upscaled and saved normally, but the subtitles will be skipped. A subtitle problem will never cause a multi-hour upscale run to be discarded.
+
+**Where to control it:**
+In the main window, you can toggle **Enable subtitle OCR**. When enabled, VidLift automatically selects the best available subtitle track (preferring English text over images). In the **Plan** view, you can see exactly which track was selected and whether OCR is required.
+
 
 ## Documentation
 
