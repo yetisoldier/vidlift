@@ -168,6 +168,14 @@ CLOCK_GATE_TOLERANCE_FRACTION = 0.001
 # last_activity_at advances and the status names the running step.
 PROBE_HEARTBEAT_SECONDS = 5.0
 
+# v0.4.5 (progress-honesty §3a, D-count): the LOG-line cadence for the
+# count-pass heartbeat — every 30 s the adapter writes one honest log
+# line ("<label>: heartbeat t=<n>s (decode-count pass; …)") so the
+# log-tail surface disproves "frozen" (the §5 no-silent-window rule:
+# HEARTBEAT_LOG_SECONDS is the named ceiling). Module-level so tests
+# can shrink it without touching call sites.
+PROBE_HEARTBEAT_LOG_SECONDS = 30.0
+
 # Per-chunk resume checkpoint (B.7): written in the engine workdir,
 # atomically, after every completed chunk.
 CHUNK_STATE_FILENAME = "chunk_state.json"
@@ -1252,8 +1260,18 @@ class NcnnVulkanEngine(EngineAdapter):
         decode-count runs minutes on a feature-length file, so it runs
         on a worker thread while the step label re-fires every
         ``PROBE_HEARTBEAT_SECONDS`` — the state's last_activity stays
-        true, the window never reads as frozen."""
+        true, the window never reads as frozen.
+
+        v0.4.5 (progress-honesty design §3a, D-count): the pump also
+        writes a throttled liveness LOG line every
+        ``PROBE_HEARTBEAT_LOG_SECONDS`` — the B.6 step touch mutated
+        state but left the log tail silent, so a 10-40 min count pass
+        looked byte-identical to a hang. The line names the phase,
+        elapsed wall time, and WHY there is no frame counter yet; no
+        fabricated percent.
+        """
         runner = self._seam_runner()
+        started = time.time()
         box: dict = {}
 
         def _work() -> None:
@@ -1268,10 +1286,22 @@ class NcnnVulkanEngine(EngineAdapter):
             target=_work, daemon=True, name=f"vidlift-{label}"
         )
         thread.start()
+        next_log = started + PROBE_HEARTBEAT_LOG_SECONDS
         while thread.is_alive():
             thread.join(timeout=PROBE_HEARTBEAT_SECONDS)
             if thread.is_alive():
                 self._step(label)  # heartbeat touch
+                if time.time() >= next_log:
+                    # §3a: the honest liveness line — names the phase,
+                    # names elapsed wall time, and says WHY there is no
+                    # frame counter yet (the count is the denominator
+                    # being measured; it cannot be its own numerator).
+                    self._log(
+                        f"{label}: heartbeat t={time.time() - started:.0f}s "
+                        "(decode-count pass; no per-frame signal until "
+                        "ffprobe summary)"
+                    )
+                    next_log = time.time() + PROBE_HEARTBEAT_LOG_SECONDS
         if "error" in box:
             raise box["error"]
         return box["value"]
@@ -1532,6 +1562,11 @@ class NcnnVulkanEngine(EngineAdapter):
                 f"resume: reusing {len(reused)} completed chunk(s) from "
                 f"{CHUNK_STATE_FILENAME}"
             )
+        # v0.4.5 (progress-honesty §3b, D-eta): the chunk count is the
+        # honest denominator the moment the decode-count lands; the
+        # frame counters ride the first on_progress below.
+        if self.on_step is not None:
+            self.on_step("chunk")
         try:
             for idx in range(chunks):
                 if idx in completed:
@@ -1549,6 +1584,17 @@ class NcnnVulkanEngine(EngineAdapter):
                 segment = chunk / "segment.mkv"
                 if segment.exists():
                     segment.unlink()
+                # v0.4.5 (§3b): the sub-stage's human note + chunk
+                # position, promoted through the on_step seam (the same
+                # record_step merge; additive keys only).
+                if self.on_step is not None:
+                    self.on_step(
+                        f"chunk {idx + 1}/{chunks} — "
+                        "upscaling chunk "
+                        f"{idx + 1}/{chunks} (no per-frame ETA during "
+                        "extraction; frames_total arrives with the "
+                        "first chunk's counters)"
+                    )
 
                 try:
                     # Extraction (B.3): FRAME-INDEX addressing on the
@@ -1611,6 +1657,18 @@ class NcnnVulkanEngine(EngineAdapter):
                         f"extent={frame_extent} tile={tile} "
                         f"cmd={shlex.join(esrgan_cmd)}"
                     )
+                    # v0.4.5 (§3b): the chunk counters + honest note ride
+                    # the SAME on_step seam so the GUI's stage label can
+                    # render "upscaling chunk 3/12" and the status names
+                    # the AI pass exactly while it runs.
+                    if self.on_step is not None:
+                        self.on_step(
+                            f"chunk {idx + 1}/{chunks} — "
+                            "upscaling chunk "
+                            f"{idx + 1}/{chunks} (no per-frame ETA during "
+                            "the AI pass; frames_total arrives with the "
+                            "first chunk's counters)"
+                        )
                     self._run_process(
                         esrgan_cmd,
                         label=f"Real-ESRGAN chunk {idx + 1}/{chunks}",
@@ -1663,6 +1721,17 @@ class NcnnVulkanEngine(EngineAdapter):
                             "segment_size": segment.stat().st_size,
                         }
                     )
+                    # v0.4.5 (§3b): each reassembled segment's position
+                    # rides the step seam ("reassembly chunk 5/12" +
+                    # the cumulative counters) so the status names the
+                    # assembly work between the GPU passes.
+                    if self.on_step is not None:
+                        self.on_step(
+                            f"chunk {idx + 1}/{chunks} — "
+                            f"reassembly chunk {idx + 1}/{chunks} "
+                            f"({frames_done}/{total_frames} frames "
+                            "upscaled so far)"
+                        )
                     self._write_checkpoint(
                         workdir=workdir,
                         prepared_path=str(prepared_path),
@@ -1675,6 +1744,8 @@ class NcnnVulkanEngine(EngineAdapter):
                             completed_records, key=lambda r: r["idx"]
                         ),
                     )
+                    # v0.4.5 reassembly step rides the seam right ABOVE;
+                    # this on_progress call is unchanged B.3 discipline.
                     if self.on_progress is not None:
                         self.on_progress(
                             min(frames_done, total_frames), total_frames

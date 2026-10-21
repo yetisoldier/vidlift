@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -81,6 +82,7 @@ __all__ = [
     "RunState",
     "StubEngine",
     "ToolBox",
+    "UPSCALE_STEP_PREPARED_COUNT",
     "UpscaleError",
     "VideoToolError",
     "VerificationResult",
@@ -113,6 +115,12 @@ PHASE_VERIFY = "verify"
 # the phase records 'skipped' and ends in milliseconds.
 PHASE_SUBTITLES = "subtitles"
 PHASE_DONE = "done"
+
+# v0.4.5 (progress-honesty design §3b, D-count/D-eta): the runner's
+# step token for the decode-count pass (the engine's B.1 label). The
+# GUI's run_stage_label discriminates on this exact token to render
+# the honest "counting frames" label instead of a bare step name.
+UPSCALE_STEP_PREPARED_COUNT = "prepared-count-probe"
 
 PHASE_ORDER = [
     PHASE_PROBE,
@@ -1146,8 +1154,42 @@ def run_file(
             # the previously-blind windows (concat, gate probes,
             # encode, verify) and touches the state so a long phase
             # never reads as stuck.
+            #
+            # v0.4.5 (progress-honesty §3b, D-count/D-eta): the seam
+            # parses ADDITIVE structured facts the adapter embeds in
+            # the label after a " — " separator (its contract):
+            #   chunk_index/chunk_total — the promoted chunk counters
+            #   phase_note — a short honest note for sub-stages that
+            #     have no measurable denominator (schema-v2 additive,
+            #     same convention as v0.4.1's subtitles block)
+            # Plain labels (encode/verify/concat/gate probes) parse to
+            # no facts and behave exactly as before.
             progress = dict(state.progress or {})
             progress["step"] = label
+            if " — " in label:
+                head, sep, rest = label.partition(" — ")
+                progress["step"] = head
+                progress["phase_note"] = rest.strip()
+                idx: int | None = None
+                total: int | None = None
+                match = re.match(r"^chunk (\d+)/(\d+)$", head.strip())
+                if match:
+                    idx = int(match.group(1))
+                    total = int(match.group(2))
+                else:
+                    note_match = re.match(
+                        r"^upscaling chunk (\d+)/(\d+) \(", rest.strip()
+                    )
+                    if note_match:
+                        idx = int(note_match.group(1))
+                        total = int(note_match.group(2))
+                if idx is not None and total is not None:
+                    progress["chunk_index"] = idx
+                    progress["chunk_total"] = total
+                if re.match(
+                    r"^reassembly chunk \d+/\d+ \(\d+/\d+ frames", rest.strip()
+                ):
+                    progress["phase_note"] = rest.strip()
             state.progress = progress
             state.touch()
 
@@ -1235,6 +1277,9 @@ def run_file(
         def _encode_hint(elapsed: float) -> None:
             # B.6: an elapsed-time hint, honestly labeled — the pump is
             # touch+log only (B.10(4) discipline), no stdout parsing.
+            # v0.4.5 (§3b): the encode heartbeat touches last_activity
+            # too, so a 65-minute encode never reads as stuck.
+            state.touch()
             progress = dict(state.progress or {})
             progress["step"] = "encode"
             progress["encode_seconds"] = elapsed
@@ -1265,6 +1310,9 @@ def run_file(
             # through the heartbeat pump; the cheap ffprobe geometry
             # check keeps the plain blocking path.
             def _decode_hint(elapsed: float) -> None:
+                # v0.4.5 (§3b): the decode heartbeat touches
+                # last_activity for the same stickiness reason.
+                state.touch()
                 progress = dict(state.progress or {})
                 progress["step"] = "verify"
                 progress["decode_seconds"] = elapsed
