@@ -402,8 +402,11 @@ class TestRunFilePhases:
         tail_two = log.tail(2)
         assert len(tail_two) == 2
         # v0.4.7: cleanup lines follow the manifest line on success; the
-        # run-complete line still closes the log.
-        assert "manifest:" in log.tail(3)[0]
+        # run-complete line still closes the log. Karen r2 D3 adds the
+        # engine mezzanine to the sweep, so TWO cleanup lines now sit
+        # between the manifest line and "run complete".
+        assert "manifest:" in log.tail(4)[0]
+        assert "cleanup run artifact:" in log.tail(3)[0]
         assert "run complete" in tail_two[1]
 
     def test_happy_path_manifest_records_artifacts(self, tmp_path):
@@ -775,6 +778,53 @@ class TestSuccessCleanupV047:
         assert sidecar.is_file()
         assert kit.is_dir() and (kit / "movie.raw.srt").is_file()
 
+    def test_success_deletes_engine_mezzanine_karen_r2_d3(self, tmp_path):
+        # Karen r2 D3: the engines build the mezzanine beside the
+        # prepared file as ``<run-id>.prepared.upscaled.mkv``
+        # (``Path(prepared_path).with_suffix(".upscaled.mkv")``,
+        # StubEngine run.py and NcnnVulkanEngine engine_ncnn.py alike).
+        # The real StubEngine path creates it on EVERY successful run,
+        # so it must be in the success-cleanup sweep -- pinned on the
+        # real run, by exact name, never globbed.
+        result, _ = run_happy(tmp_path)
+        log_root = Path(result.state.log.path).parent
+        run_id = Path(result.state.log.path).stem
+        mezzanine = log_root / f"{run_id}.prepared.upscaled.mkv"
+        # sanity: the StubEngine really did produce the mezzanine name
+        # the cleanup list targets
+        assert result.state.mezzanine_path == str(mezzanine)
+        assert not mezzanine.exists(), (
+            "successful run must not leak the engine mezzanine"
+        )
+        assert not Path(result.state.prepared_path).exists()
+        text = Path(result.state.log.path).read_text()
+        assert f"cleanup run artifact: {mezzanine}" in text
+        # the durable record is still kept
+        assert Path(result.state.log.path).is_file()
+        assert Path(result.manifest_path).is_file()
+
+    def test_failed_run_retains_engine_mezzanine(self, tmp_path):
+        # Retention contract (clause e): a hard encode failure after
+        # the engine wrote its mezzanine keeps EVERYTHING -- the
+        # mezzanine included (a failed run is exactly when the disk
+        # evidence matters most).
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload(), encode_exit=3)
+        with pytest.raises(VideoToolError):
+            run_file(
+                path,
+                tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+                probe_runner=runner,
+                command_runner=runner,
+                log_dir=str(tmp_path / "runs"),
+            )
+        log_root = tmp_path / "runs"
+        run_id = list(log_root.glob("*.log"))[0].stem
+        assert (log_root / f"{run_id}.prepared.upscaled.mkv").is_file(), (
+            "failure must retain the engine mezzanine"
+        )
+        assert (log_root / f"{run_id}.prepared.mkv").is_file()
+
 
 class TestReplaceSourceV047:
     """Eric's v0.4.7 order: opt-in delete-and-replace on success.
@@ -1015,6 +1065,97 @@ class TestReplaceSourceV047:
             "verified output survives a refused replace"
         )
         assert result.state.output_path == result.plan.output_path
+
+    def test_cli_prints_success_line_only_on_actual_replace(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # Karen r2 D1: the CLI success line reports the OUTCOME.
+        # _cmd_run prints "source replaced:" only when the replace truly
+        # happened (state.output_path == state.file_path), pinning the
+        # print against a REAL success, not against _cmd_run's decision.
+        result, source = self._run_with_replacement(tmp_path)
+        assert Path(source).is_file()
+        assert result.state.output_path == str(source)
+        monkeypatch.setattr(
+            cli, "find_tools",
+            lambda **kwargs: ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        )
+        monkeypatch.setattr(cli, "run_file", lambda *a, **kw: result)
+        rc = cli.main(["run", "--replace-source", result.state.file_path])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert f"source replaced: now {source}" in out
+
+    def test_cli_refused_replace_prints_no_false_success_line(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # Karen r2 D1: a refused (but kept-success) replace must NEVER
+        # print "source replaced:" on the CLI. Karen's live probe: a
+        # read-only destination dir printed the false success line. The
+        # CLI state here is a real refused run (the corrupt-copy probe
+        # from test_replace_refused_run_still_keeps_success), so the pin
+        # is end-to-end, not a fabricated SimpleNamespace.
+        import types
+
+        import vidlift.run as run_mod
+
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)).endswith("movie.avi") and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        def corrupt_copy2(src_f, dst_f, *args, **kwargs):
+            import shutil as _shutil
+
+            _shutil.copyfile(src_f, dst_f)
+            Path(dst_f).write_bytes(b"corrupted-copy")
+
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        out_dir = tmp_path / "elsewhere"
+        two_fs_stat._armed = True
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            mp.setattr(run_mod.shutil, "copy2", corrupt_copy2)
+            result = run_file(
+                path,
+                tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+                probe_runner=runner,
+                command_runner=runner,
+                output_dir=str(out_dir),
+                log_dir=str(tmp_path / "runs"),
+                replace_source=True,
+            )
+        finally:
+            mp.undo()
+        assert result.ok is True
+        refused = (
+            os.path.normcase(os.path.abspath(result.state.output_path))
+            != os.path.normcase(os.path.abspath(result.state.file_path))
+        ), "precondition: the replace must have been refused"
+        assert refused
+        monkeypatch.setattr(
+            cli, "find_tools",
+            lambda **kwargs: ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        )
+        monkeypatch.setattr(cli, "run_file", lambda *a, **kw: result)
+        rc = cli.main(["run", "--replace-source", result.state.file_path])
+        assert rc == 0, "a refused replace still reports run success"
+        out = capsys.readouterr().out
+        assert "source replaced:" not in out, out
+        assert "source NOT replaced: both files kept" in out
 
     def test_replace_cross_filesystem_verified_copy_succeeds(self, tmp_path):
         import types

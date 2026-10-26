@@ -615,7 +615,10 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("Upscale engine"), 1, 0)
         grid.addWidget(self.engine_combo, 1, 1)
         grid.addWidget(self.subtitle_ocr, 1, 2, 1, 3)
-        grid.addWidget(self.replace_source, 1, 5, 1, 3)
+        # Karen r2 D2: span 2 columns, not 3 -- a 3-column span reached
+        # column 7, where cancel_button sits; the checkbox label clipped
+        # under the Cancel button.
+        grid.addWidget(self.replace_source, 1, 5, 1, 2)
         grid.addWidget(self.monitor_check, 2, 0, 1, 7)
         self.monitor_check.toggled.connect(self._toggle_monitor)
         grid.addWidget(self.cancel_button, 1, 7)

@@ -7,6 +7,42 @@ All notable changes to VidLift. Dates are America/Chicago.
 Three Eric-ordered irritant fixes after the smooth v0.4.6 ship:
 output naming, success cleanup, and opt-in replace-source.
 
+### Fixed (validation r2, Karen's gate run)
+
+- **CLI replace-source report is honest about the outcome** (gate
+  defect D1): `_cmd_run` printed `source replaced:` whenever the
+  flag was set and the paths differed, even when the replace had been
+  refused — Karen's live probe (read-only source dir) caught the
+  false claim. The line now prints only when the replace actually
+  happened (`state.output_path == state.file_path`, which
+  `run_file` sets only inside the successful replace branch); a
+  refused replace gets an explicit `source NOT replaced: both files
+  kept` notice instead, while the upscale still reports success.
+  Pinned both ways: success prints the line
+  (`test_cli_prints_success_line_only_on_actual_replace`), refusal
+  prints no success line plus the honest notice
+  (`test_cli_refused_replace_prints_no_false_success_line` — driven
+  by a real refused run through `run_file`, not a mock).
+- **GUI: the replace-source checkbox no longer collides with the
+  Cancel button** (gate defect D2): the checkbox spanned grid
+  columns 5-7 and clipped under `cancel_button` at (1, 7); it now
+  spans columns 5-6 (`gui.py`). Pinned by an offscreen no-overlap
+  geometry assertion (`test_v047_replace_checkbox_no_overlap_with_cancel`).
+- **Success cleanup sweeps the engine mezzanine** (gate defect D3):
+  `<run-id>.prepared.upscaled.mkv` — the intermediate both engines
+  build beside the prepared file via
+  `Path(prepared_path).with_suffix(".upscaled.mkv")` — was escaping
+  the post-success sweep (a real-measured 1.2 MB leak for a 2 s
+  clip; gigabytes for a movie-length FFV1 mezzanine). Added to
+  `_SUCCESS_SCRATCH_EXTENSIONS` by exact run-id namespaced path,
+  never globbed; the rejected-mezzanine retention path renames to
+  `<run-id>.prepared.rejected-<ts>.mkv` before success cleanup can
+  run, and fail-open encodes never create an upscaled sibling, so
+  retained diagnostics cannot be eaten. Pinned:
+  a successful run leaves NO mezzanine
+  (`test_success_deletes_engine_mezzanine_karen_r2_d3`), a failed
+  run retains it (`test_failed_run_retains_engine_mezzanine`).
+
 ### Changed
 
 - **Output filename drops the `vidlift.` infix.** Planned outputs are

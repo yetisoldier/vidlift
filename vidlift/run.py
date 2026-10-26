@@ -927,6 +927,19 @@ class RunResult:
 # same log root can never lose its own artifacts.
 _SUCCESS_SCRATCH_EXTENSIONS = (
     ".prepared.mkv",
+    # v0.4.7 (Karen r2, D3): the ENGINE's mezzanine, created beside the
+    # prepared file by both engines via
+    # ``Path(prepared_path).with_suffix(".upscaled.mkv")``
+    # (StubEngine, run.py; NcnnVulkanEngine, engine_ncnn.py::1188), so
+    # it is exactly ``<run-id>.prepared.upscaled.mkv`` under the same
+    # log root. Same run-id namespace, never globbed, so a concurrent
+    # run cannot touch another run's mezzanine. The B.5 rejected-
+    # mezzanine retention path renames a rejected mezzanine to
+    # ``<run-id>.prepared.rejected-<ts>.mkv`` BEFORE the caller could
+    # ever reach the success cleanup, and fail-open encodes use the
+    # prepared file itself (no upscaled sibling ever exists), so an
+    # exact-path removal can never eat retained diagnostics.
+    ".prepared.upscaled.mkv",
     ".engine-work",
     ".ocr-work",
 )

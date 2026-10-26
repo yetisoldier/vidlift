@@ -637,3 +637,44 @@ def test_stage_label_names_bridge_facts():
         {"state": "running", "current_phase": "verify", "progress": None}
     ) == "verify — full decode"
     assert run_stage_label({"state": "succeeded", "current_phase": "done"}) == "succeeded"
+
+
+# ---- Karen r2 D2: replace-source checkbox layout ----------------------------
+
+
+def settings_for(monkeypatch, tmp_path):
+    """Isolate QSettings into a throwaway INI (design R3)."""
+    import PyQt6.QtCore as QtCore
+
+    def _settings(self):
+        return QtCore.QSettings(
+            str(tmp_path / "settings.ini"), QtCore.QSettings.Format.IniFormat
+        )
+
+    monkeypatch.setattr(MainWindow, "_settings", _settings)
+
+
+def test_v047_replace_checkbox_no_overlap_with_cancel(
+    client, monkeypatch, tmp_path
+):
+    # Karen r2 D2: the replace_source checkbox (grid column 5, span 2)
+    # must not reach into cancel_button's column 7. Geometry probe
+    # mirrors Karen's offscreen repro: no rect intersection, and the
+    # checkbox right edge stays left of the Cancel left edge.
+    settings_for(monkeypatch, tmp_path)
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow(client=client)
+    try:
+        win.show()
+        app.processEvents()
+        cb = win.replace_source
+        cancel = win.cancel_button
+        assert not cb.geometry().intersects(cancel.geometry()), (
+            f"checkbox {cb.geometry()} overlaps cancel {cancel.geometry()}"
+        )
+        assert cb.geometry().right() < cancel.geometry().left()
+    finally:
+        win.job_ids = []
+        win._run_started_at = None
+        win.close()
+        app.processEvents()

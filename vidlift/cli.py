@@ -263,13 +263,25 @@ def _cmd_run(
         print(f"engine note: {state.engine_note}")
     # v0.4.7: when delete-and-replace shipped, the printed output path is
     # the SOURCE's old location, not the plan's output path.
-    if (
-        replace_source
-        and result.verification.ok
-        and os.path.normcase(os.path.abspath(state.file_path))
-        != os.path.normcase(os.path.abspath(result.plan.output_path))
-    ):
-        print(f"source replaced: now {state.file_path}")
+    # v0.4.7 r2 (Karen D1): line reports the OUTCOME, not the request --
+    # state.file_path == state.output_path holds only after
+    # replace_source_with_output moved the output (run.py sets
+    # state.output_path then); a refused replace leaves output_path at
+    # the plan path and gets an honest kept-both notice instead.
+    if replace_source and result.verification.ok:
+        normalized_file = os.path.normcase(os.path.abspath(state.file_path))
+        normalized_output = os.path.normcase(
+            os.path.abspath(state.output_path)
+        )
+        if normalized_file == normalized_output:
+            print(f"source replaced: now {state.file_path}")
+        elif normalized_file != os.path.normcase(
+            os.path.abspath(result.plan.output_path)
+        ):
+            print(
+                "source NOT replaced: both files kept "
+                "(see run log) 'WARNING: replace-source failed'"
+            )
     # v0.4.1: the subtitle outcome, honestly — carried/ocr/none/failed-open
     subs = state.subtitles
     if subs is not None:
