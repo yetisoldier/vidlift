@@ -16,9 +16,9 @@ from _bcanary import EXECUTED_B
 
 _FILE_MARKERS = {
     "test_engine_ncnn.py": {"b0", "b1", "b2", "b3", "b4", "b5",
-                            "b9", "b10", "b11"},
+                            "b9", "b10", "b11", "b13", "b14", "b15", "b16"},
     "test_benchmark.py": {"b6"},
-    "test_run.py": {"b7", "b8", "b12"},
+    "test_run.py": {"b7", "b8", "b12", "b21"},
 }
 
 

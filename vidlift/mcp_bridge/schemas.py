@@ -49,6 +49,12 @@ _OPTIONS_RUN = {
     # v0.4.7: opt-in delete-and-replace (design guardrail a: default OFF;
     # the runner only ever replaces AFTER verify_output passes).
     "replace_source": {"type": "boolean"},
+    # v0.4.8 (design D5): the upscale model profile ("live-action" |
+    # "anime"), string not enum matching "target"'s permissive shape —
+    # value validation happens in run_file's select_engine path, where
+    # an unknown name raises UpscaleError -> job failure with the
+    # profile named. Absent -> "live-action" (v0.4.7 behavior).
+    "upscale_profile": {"type": "string"},
 }
 
 # The binding tool surface (mcp-bridge.md Section 4, verbatim shapes).

@@ -109,6 +109,22 @@ ENGINE_CHOICES: list[tuple[str, str]] = [
     ("Stub (no AI; encode-only fallback)", "stub"),
 ]
 
+# v0.4.8 (design D5): the model-profile rows — which MODEL_TABLE weights
+# a run upscales with. Manual switch only (D3); the value maps
+# 1:1 into run_file(profile=...) through the bridge's
+# options["upscale_profile"].
+PROFILE_CHOICES: list[tuple[str, str]] = [
+    ("Live action (general x2plus)", "live-action"),
+    ("Anime / cartoons (animevideov3-x2)", "anime"),
+]
+
+PROFILE_TOOLTIP = (
+    "Live action uses the general Real-ESRGAN x2plus net (default). "
+    "Anime/cartoons uses the animevideov3-x2 net — faster on flat fills "
+    "and line art. Manual switch; VidLift does not auto-detect content "
+    "type. Persists across sessions."
+)
+
 PLAN_HELPER_TEXT = "1. Add files → 2. Plan → 3. Start. Planning never writes to disk."
 
 
@@ -139,7 +155,12 @@ def warnings_for(item: PlannedFile) -> list[str]:
     return warnings
 
 
-def detail_text(item: PlannedFile, *, subtitle_ocr_enabled: bool = True) -> str:
+def detail_text(
+    item: PlannedFile,
+    *,
+    subtitle_ocr_enabled: bool = True,
+    upscale_profile: str | None = None,
+) -> str:
     report = item.report
     source = report.video.codec_name if report.video else "no video"
     subtitle_text = item.subtitle_note
@@ -167,6 +188,13 @@ def detail_text(item: PlannedFile, *, subtitle_ocr_enabled: bool = True) -> str:
         "",
         f"Expectation: {item.expectation}",
     ]
+    # v0.4.8 (design D6): the one additive anime sentence at the run
+    # surfaces that hold the profile — never in plan.py, so
+    # PlannedFile.expectation stays stable for every plan consumer.
+    if upscale_profile == "anime":
+        from .cli import ANIME_EXPECTATION_SUFFIX
+
+        lines.append(ANIME_EXPECTATION_SUFFIX)
     warnings = warnings_for(item)
     if warnings:
         lines.extend(["", "Warnings:"])
@@ -386,6 +414,16 @@ class MainWindow(QMainWindow):
         self.engine_combo.setCurrentIndex(index if index >= 0 else 0)
         self.engine_combo.currentIndexChanged.connect(self._engine_changed)
 
+        # ---- profile combo (v0.4.8 design D5): which MODEL_TABLE lane ----
+        self.profile_combo = QComboBox()
+        for label, data in PROFILE_CHOICES:
+            self.profile_combo.addItem(label, data)
+        self.profile_combo.setToolTip(PROFILE_TOOLTIP)
+        self.profile_choice = self._load_profile_choice()
+        index = self.profile_combo.findData(self.profile_choice)
+        self.profile_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.profile_combo.currentIndexChanged.connect(self._profile_changed)
+
         self.plan_button = QPushButton("Plan Batch")
         self.plan_button.setObjectName("PrimaryButton")
         self.plan_button.setToolTip("Probe and classify every listed file. Nothing is written to disk.")
@@ -429,6 +467,14 @@ class MainWindow(QMainWindow):
         value = self._settings().value("engine", "auto")
         if value not in ("auto", "stub", "ncnn"):
             return "auto"
+        return str(value)
+
+    def _load_profile_choice(self) -> str:
+        """The persisted upscale profile (v0.4.8 D5); a stale/unknown
+        value reads as ``live-action`` — never silently applied."""
+        value = self._settings().value("upscale_profile", "live-action")
+        if value not in ("live-action", "anime"):
+            return "live-action"
         return str(value)
 
     # -- LAN monitor (v0.4.6 design §4) -------------------------------------
@@ -550,6 +596,14 @@ class MainWindow(QMainWindow):
             self.engine_choice = data
             self._settings().setValue("engine", data)
 
+    def _profile_changed(self, index: int) -> None:
+        """Persist the upscale-profile choice (v0.4.8 D5, QSettings
+        house rule); only the stored value and the live choice change."""
+        data = self.profile_combo.itemData(index)
+        if data in ("live-action", "anime"):
+            self.profile_choice = data
+            self._settings().setValue("upscale_profile", data)
+
     # -- layout -----------------------------------------------------------
 
     def _build_shell(self) -> QWidget:
@@ -619,7 +673,12 @@ class MainWindow(QMainWindow):
         # column 7, where cancel_button sits; the checkbox label clipped
         # under the Cancel button.
         grid.addWidget(self.replace_source, 1, 5, 1, 2)
-        grid.addWidget(self.monitor_check, 2, 0, 1, 7)
+        # v0.4.8 (design D5): the profile combo lands on row 2 (the only
+        # row 1 cells left are behind cancel_button at (1, 7)), so the
+        # monitor span narrows 7 -> 5 columns to free (2, 5)/(2, 6).
+        grid.addWidget(QLabel("Upscale profile"), 2, 5)
+        grid.addWidget(self.profile_combo, 2, 6)
+        grid.addWidget(self.monitor_check, 2, 0, 1, 5)
         self.monitor_check.toggled.connect(self._toggle_monitor)
         grid.addWidget(self.cancel_button, 1, 7)
         grid.setColumnStretch(6, 1)
@@ -890,6 +949,7 @@ class MainWindow(QMainWindow):
                 detail_text(
                     self.batch.files[row],
                     subtitle_ocr_enabled=self.subtitle_ocr.isChecked(),
+                    upscale_profile=self.profile_choice,
                 )
             )
 
@@ -919,6 +979,10 @@ class MainWindow(QMainWindow):
             "output_dir": self.output_dir.text().strip() or None,
             "subtitle_ocr": self.subtitle_ocr.isChecked(),
             "replace_source": self.replace_source.isChecked(),
+            # v0.4.8 (D5): the profile rides the options into
+            # run_file(profile=...) via the bridge's absent-defaults
+            # rule (absent would read as "live-action" anyway).
+            "upscale_profile": self.profile_choice,
         }
         try:
             self.job_ids = self.client.enqueue_run(
@@ -932,6 +996,9 @@ class MainWindow(QMainWindow):
             return
         self.engine_combo.setEnabled(False)
         self.engine_combo.setToolTip("Engine is fixed once a batch starts; cancel to change it.")
+        # v0.4.8 (D5): the profile is fixed for the batch the same way.
+        self.profile_combo.setEnabled(False)
+        self.profile_combo.setToolTip(PROFILE_TOOLTIP)
         self.run_panel.show()
         self.stage_bar.reset()
         self.overall_bar.reset()
@@ -1275,6 +1342,9 @@ class MainWindow(QMainWindow):
     def _batch_finished(self, notes: list[str]) -> None:
         self._stop_liveness()
         self.engine_combo.setEnabled(True)
+        # v0.4.8 (D5): re-enable the profile combo with its honest tooltip.
+        self.profile_combo.setEnabled(True)
+        self.profile_combo.setToolTip(PROFILE_TOOLTIP)
         self._render_recent_jobs()
         self._sync_run_controls()
         if any("cancelled" in note for note in notes):

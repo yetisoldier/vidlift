@@ -23,6 +23,12 @@ from vidlift.gui import (
 )
 from vidlift.run import _apply_subtitle_ocr_preference
 
+from _bcanary import register_b
+
+
+def marker(name: str) -> None:
+    register_b(name)
+
 
 def _report():
     payload = """
@@ -677,4 +683,133 @@ def test_v047_replace_checkbox_no_overlap_with_cancel(
         win.job_ids = []
         win._run_started_at = None
         win.close()
+
+
+# ---- v0.4.8 b18: the profile combo (design D5) ----------------------------------
+
+
+def test_b18_profile_combo_exists_with_choices_and_default(window):
+    from vidlift.gui import PROFILE_CHOICES
+
+    assert window.profile_combo.count() == len(PROFILE_CHOICES)
+    for index, (label, data) in enumerate(PROFILE_CHOICES):
+        assert window.profile_combo.itemText(index) == label
+        assert window.profile_combo.itemData(index) == data
+    # D3: the default reads "live-action" unless QSettings carries one
+    assert window.profile_combo.currentData() in ("live-action", "anime")
+
+
+def test_b18_profile_combo_default_is_live_action(window):
+    assert window.profile_choice == "live-action"
+    assert window.profile_combo.currentData() == "live-action"
+
+
+def test_b18_profile_combo_persists_on_change(window):
+    index = window.profile_combo.findData("anime")
+    assert index >= 0
+    window.profile_combo.setCurrentIndex(index)
+    assert window.profile_choice == "anime"
+    stored = window._settings().value("upscale_profile")
+    assert str(stored) == "anime"
+    # a stale/unknown persisted value reads as live-action, never applied
+    window._settings().setValue("upscale_profile", "sdxl-soup")
+    assert window._load_profile_choice() == "live-action"
+
+
+def test_b18_profile_combo_loads_persisted_value(client, monkeypatch, tmp_path):
+    import PyQt6.QtCore as QtCore
+
+    settings_path = tmp_path / "settings.ini"
+    settings = QtCore.QSettings(
+        str(settings_path), QtCore.QSettings.Format.IniFormat
+    )
+    settings.setValue("upscale_profile", "anime")
+    settings.sync()
+
+    def _settings(self):
+        return QtCore.QSettings(
+            str(settings_path), QtCore.QSettings.Format.IniFormat
+        )
+
+    monkeypatch.setattr(MainWindow, "_settings", _settings)
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow(client=client)
+    try:
+        assert win.profile_choice == "anime"
+        assert win.profile_combo.currentData() == "anime"
+    finally:
+        win.job_ids = []
+        win._run_started_at = None
+        win.close()
+
+
+def test_b18_profile_combo_passes_through_start_options(window, tmp_path):
+    # the bridge mapping: options["upscale_profile"] == profile_choice
+    plan = _plan_for(tmp_path, "toon.avi", ready=True)
+    window.batch = batch_plan_from([plan])
+    window.profile_combo.setCurrentIndex(
+        window.profile_combo.findData("anime")
+    )
+    window.start_upscale()
+    record = window.client.registry.jobs[0]
+    assert record.options["upscale_profile"] == "anime"
+
+
+def test_b18_profile_combo_disabled_during_batch_and_reenabled_after(
+    window, tmp_path
+):
+    plan = _plan_for(tmp_path, "toon.avi", ready=True)
+    window.batch = batch_plan_from([plan])
+    window.start_upscale()
+    assert window.profile_combo.isEnabled() is False
+    job_id = window.job_ids[0]
+    record = window.client.registry.require(job_id)
+    record.state = "succeeded"
+    record.ok = True
+    record.finished_at = time.time()
+    window._tick_elapsed()  # drains job_ids; the liveness stop path runs
+    window._batch_finished([])
+    assert window.profile_combo.isEnabled() is True
+
+
+def test_b18_profile_combo_geometry_does_not_overlap_cancel(
+    client, monkeypatch, tmp_path
+):
+    # b18 (design D5): the v0.4.7 D2 geometry discipline — the profile
+    # combo lives on row 2 columns 5-6; cancel_button stays at (1, 7)
+    # untouched. Offscreen geometry probe: no rect intersection and the
+    # combo's right edge stays left of Cancel's left edge.
+    settings_for(monkeypatch, tmp_path)
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow(client=client)
+    try:
+        win.show()
         app.processEvents()
+        combo = win.profile_combo
+        cancel = win.cancel_button
+        assert not combo.geometry().intersects(cancel.geometry()), (
+            f"profile combo {combo.geometry()} overlaps cancel {cancel.geometry()}"
+        )
+        assert combo.geometry().right() < cancel.geometry().left()
+    finally:
+        win.job_ids = []
+        win._run_started_at = None
+        win.close()
+
+
+def test_b18_detail_text_appends_anime_sentence_only_for_anime(
+    client, monkeypatch, tmp_path
+):
+    # b18/b22 (design D6): the GUI detail render appends the additive
+    # anime sentence exactly when the profile is "anime".
+    marker("b22")
+    plan = _plan_for(tmp_path, "toon.avi", ready=True)
+    without = detail_text(plan, upscale_profile="live-action")
+    assert "Anime upscaling model" not in without
+    with_anime = detail_text(plan, upscale_profile="anime")
+    assert (
+        "Anime upscaling model: strong fit for flat fills and line art" in with_anime
+    )
+    assert "not for live-action content" in with_anime
+    # default call (no profile kwarg) omits it — plan surfaces untouched
+    assert "Anime upscaling model" not in detail_text(plan)

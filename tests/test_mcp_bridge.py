@@ -242,6 +242,80 @@ def test_t1_tool_surface_matches_the_binding_shapes():
     assert TOOL_SCHEMAS["cancel"]["required"] == ["job_id"]
     assert set(TOOL_SCHEMAS["list"]["properties"]) == {"limit", "include_history"}
     assert TOOL_SCHEMAS["manifest"]["required"] == ["job_id"]
+    # v0.4.8 (design D5): the run options surface gained upscale_profile
+    assert "upscale_profile" in TOOL_SCHEMAS["run"]["properties"]["options"]["properties"]
+
+
+# ---- b19: the run tool's upscale_profile field (design D5) -----------------------
+
+
+def test_b19_run_accepts_upscale_profile_and_threads_it(tmp_path, monkeypatch):
+    marker("b19")
+    server, runner = make_server(tmp_path)
+    captured: dict = {}
+
+    def fake_run_file(path, **kwargs):
+        captured.update(kwargs)
+
+        class _Result:
+            ok = True
+
+        return _Result()
+
+    import vidlift.run as run_mod
+    monkeypatch.setattr(run_mod, "run_file", fake_run_file)
+    path = make_media_file(tmp_path)
+    _result, error, payload = call(
+        server,
+        "run",
+        {"paths": [path], "options": {"upscale_profile": "anime"}},
+    )
+    assert error is None
+    job_id = payload["jobs"][0]["job_id"]
+    deadline = time.time() + 5
+    while not captured and time.time() < deadline:
+        time.sleep(0.02)
+    assert captured.get("profile") == "anime"
+    wait_for_state(server, job_id, {"succeeded", "failed"})
+
+
+def test_b19_run_absent_upscale_profile_defaults_live_action(tmp_path, monkeypatch):
+    marker("b19")
+    server, runner = make_server(tmp_path)
+    captured: dict = {}
+
+    def fake_run_file(path, **kwargs):
+        captured.update(kwargs)
+
+        class _Result:
+            ok = True
+
+        return _Result()
+
+    import vidlift.run as run_mod
+    monkeypatch.setattr(run_mod, "run_file", fake_run_file)
+    path = make_media_file(tmp_path)
+    _result, _error, payload = call(server, "run", {"paths": [path]})
+    job_id = payload["jobs"][0]["job_id"]
+    deadline = time.time() + 5
+    while not captured and time.time() < deadline:
+        time.sleep(0.02)
+    assert captured.get("profile") == "live-action"
+    wait_for_state(server, job_id, {"succeeded", "failed"})
+
+
+def test_b19_run_upscale_profile_wrong_type_is_rejected(tmp_path):
+    marker("b19")
+    server, runner = make_server(tmp_path)
+    path = make_media_file(tmp_path)
+    result, _error, payload = call(
+        server,
+        "run",
+        {"paths": [path], "options": {"upscale_profile": 7}},
+    )
+    assert result["isError"] is True
+    assert payload["code"] == "invalid_input"
+    assert "upscale_profile" in payload["message"]
 def test_t1_dispatch_executes_over_pipe_pair(tmp_path):
     marker("t1")
     server, _runner = make_server(tmp_path)

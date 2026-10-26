@@ -426,10 +426,23 @@ class ModelSpec:
 # VERIFICATION-REPORT.md): ``-s 2`` IS its native mode — this is NOT the
 # v0.2.25 corruption case (x4plus, a native-4x net, at -s 2). x4plus
 # never appears in any VidLift code path; it cannot be constructed
-# through this table. The anime profile row is added when its mode
-# option ships (out of scope this milestone; hash pinning identical).
+# through this table.
+#
+# v0.4.8 (design docs/designs/v0.4.8-anime-upscale-profile.md Section 2,
+# verified 2026-10-26 against the actual released v0.2.0 binary on this
+# host): the animevideov3-x2 net behaves as a TRUE native-2x model at
+# ``-s 2`` — a 64x64 probe returned exactly 128x128 and a 65x47 odd-size
+# probe returned exactly 130x94 (the x2plus verification
+# standard's exact-2x rule). Its fixed internal 4x-then-half Interp
+# combination (Resize_37 x4.0 / Resize_40 x0.5) is exposed to the engine
+# as a scale-2 output; ``-n realesr-animevideov3-x2 -s 2`` is the
+# documented pairing the engine help names as the default combination.
+# No Reorg layer appears in the param; the run produced sane image
+# content. Hash pinning lives in tools_realesrgan.MODEL_ARTIFACTS,
+# verified identically to x2plus (design D1).
 MODEL_TABLE: dict[str, ModelSpec] = {
     "live-action": ModelSpec(name="realesrgan-x2plus", native_scale=2),
+    "anime": ModelSpec(name="realesr-animevideov3-x2", native_scale=2),
 }
 
 
@@ -710,9 +723,13 @@ class EngineInvocation:
 
 
 # Lazy "can this machine even run it" probe cache (design Section 5):
-# one probe frame per (binary, models_dir) per process — auto selection
-# must not pay the probe cost for every run in a long-lived bridge.
-_PROBE_CACHE: dict[tuple[str, str], tuple[bool, str]] = {}
+# one probe frame per (binary, models_dir, model name) per process —
+# auto selection must not pay the probe cost for every run in a
+# long-lived bridge. v0.4.8 (D4): the key gained the probed model name —
+# a probe pass on one profile's model must not silently bless another;
+# with the two-row registry the (binary, models_dir) key alone would
+# alias the anime and live-action probes.
+_PROBE_CACHE: dict[tuple[str, str, str], tuple[bool, str]] = {}
 
 # v0.4.5 slice 2b (the 2026-10-20 live-run verdict): the probe frame's
 # subprocess bound is 120 s — the engine decode of one tiny PNG is
@@ -867,7 +884,7 @@ def gpu_probe_frame(
     the killed-children-holding-pipes trap that hung the live run).
     """
     spec = spec or MODEL_TABLE["live-action"]
-    key = (str(binary), str(models_dir))
+    key = (str(binary), str(models_dir), spec.name)
     if key in _PROBE_CACHE:
         return _PROBE_CACHE[key]
     tmp: Path | None = None
@@ -948,6 +965,7 @@ def gpu_probe_frame(
 def select_engine(
     request: str = "auto",
     *,
+    profile: str = "live-action",
     binary: str | None = None,
     models_dir: str | None = None,
     tools: ToolBox | None = None,
@@ -964,32 +982,45 @@ def select_engine(
       stub with a note saying exactly why (design r1: a bad binary
       fails the probe, never the run).
 
+    v0.4.8 (D4): ``profile`` names the MODEL_TABLE row ("live-action"
+    is the unchanged default; "anime" selects the animevideov3-x2 net,
+    its pinned artifacts, and its own probe). An unknown profile
+    raises :class:`UpscaleError` naming it — the same failure family
+    as the final ``unknown engine request`` raise.
+
     Returns ``(engine, note)`` — ``note`` is the auto-fallback reason
     for the manifest's ``engine_note`` when auto lands on the stub.
     """
     from .run import StubEngine
 
+    spec = MODEL_TABLE.get(profile)
+    if spec is None:
+        raise UpscaleError(f"unknown engine profile: {profile!r}")
     if request == "stub":
         return StubEngine(), None
     if request == "ncnn":
         binary_path = resolve_realesrgan(binary)
         models = resolve_realesrgan_models(binary_path, models_dir)
-        verify_model_artifacts(models, MODEL_TABLE["live-action"].name)
+        verify_model_artifacts(models, spec.name)
         return (
-            NcnnVulkanEngine(binary=binary_path, models_dir=models),
+            NcnnVulkanEngine(
+                binary=binary_path, models_dir=models, profile=profile
+            ),
             None,
         )
     if request == "auto":
         try:
             binary_path = resolve_realesrgan(binary)
             models = resolve_realesrgan_models(binary_path, models_dir)
-            verify_model_artifacts(models, MODEL_TABLE["live-action"].name)
-            ok, reason = gpu_probe_frame(binary_path, models)
+            verify_model_artifacts(models, spec.name)
+            ok, reason = gpu_probe_frame(binary_path, models, spec=spec)
             if not ok:
                 note = f"auto: stub engine ({reason})"
                 return StubEngine(note=note), note
             return (
-                NcnnVulkanEngine(binary=binary_path, models_dir=models),
+                NcnnVulkanEngine(
+                    binary=binary_path, models_dir=models, profile=profile
+                ),
                 None,
             )
         except (MissingToolError, UpscaleError) as exc:

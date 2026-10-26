@@ -49,7 +49,10 @@ from _bcanary import register_b
 
 # ---- b0 execution canary state -------------------------------------------
 
-_EXPECTED_B_TESTS = {"b0", "b1", "b2", "b3", "b4", "b5", "b9", "b10", "b11"}
+_EXPECTED_B_TESTS = {
+    "b0", "b1", "b2", "b3", "b4", "b5", "b9", "b10", "b11",
+    "b13", "b14", "b15", "b16",
+}
 _EXECUTED_B_TESTS: set[str] = set()
 
 
@@ -845,6 +848,9 @@ REAL_X2PLUS_DIR = Path(
 )
 
 
+_REAL_ANIME_DIR = Path(__file__).resolve().parent.parent / "packaging" / "models"
+
+
 def test_b9_real_artifacts_match_the_pinned_table():
     """The marked-slow real-artifact check (design Section 10, b9 note):
     hashes the actual 33 MB x2plus pair once against the pinned table.
@@ -860,10 +866,298 @@ def test_b9_real_artifacts_match_the_pinned_table():
     assert verify_model_artifacts(str(REAL_X2PLUS_DIR), "realesrgan-x2plus")
 
 
-# ---- b10: chunk-flow shape ------------------------------------------------------
+# ---- b13: the anime registry row (design D2) ------------------------------------
 
 
-def test_b10_multi_chunk_flow_shape(tmp_path):
+def test_b13_anime_registry_row():
+    marker("b13")
+    assert MODEL_TABLE["anime"] == engine_module.ModelSpec(
+        name="realesr-animevideov3-x2", native_scale=2
+    )
+    assert MODEL_TABLE["live-action"] == engine_module.ModelSpec(
+        name="realesrgan-x2plus", native_scale=2
+    )
+    assert set(MODEL_TABLE) == {"live-action", "anime"}
+
+
+def test_b13_unknown_profile_raises_at_both_seams():
+    """b13 companion (design D7): an unknown profile refuses to
+    construct at BOTH seams, naming the profile."""
+    marker("b13")
+    with pytest.raises(UpscaleError, match="unknown engine profile"):
+        NcnnVulkanEngine(profile="sdxl-soup")
+    with pytest.raises(UpscaleError, match="unknown engine profile"):
+        engine_module.select_engine("stub", profile="sdxl-soup")
+
+
+# ---- b14: anime hash pinning (design D1) ----------------------------------------
+
+
+def test_b14_anime_pinned_table_shape():
+    marker("b14")
+    from vidlift.tools_realesrgan import MODEL_ARTIFACTS
+
+    anime = MODEL_ARTIFACTS["realesr-animevideov3-x2"]
+    assert anime["param"] == (
+        3_173,
+        "b88ff4f00ebf019a7fdac17fdd45a7fd3665d37509efc5baf2e4da2e24420a04",
+    )
+    assert anime["bin"] == (
+        1_247_368,
+        "548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d",
+    )
+    # the x2plus row is untouched
+    assert MODEL_ARTIFACTS["realesrgan-x2plus"]["param"][0] == 110_995
+    assert set(MODEL_ARTIFACTS) == {
+        "realesrgan-x2plus",
+        "realesr-animevideov3-x2",
+    }
+
+
+def _make_anime_fixture_models(root: Path) -> tuple[Path, dict]:
+    """Tiny stand-in anime artifacts plus their computed hash table (the
+    b9 fixture pattern, applied to the anime row)."""
+    root.mkdir(parents=True, exist_ok=True)
+    name = "realesr-animevideov3-x2"
+    param_bytes = b"tiny-anime-param-fixture"
+    bin_bytes = b"tiny-anime-bin-fixture-0123456789abcdef"
+    (root / f"{name}.param").write_bytes(param_bytes)
+    (root / f"{name}.bin").write_bytes(bin_bytes)
+    table = {
+        name: {
+            "param": (
+                len(param_bytes),
+                hashlib.sha256(param_bytes).hexdigest(),
+            ),
+            "bin": (
+                len(bin_bytes),
+                hashlib.sha256(bin_bytes).hexdigest(),
+            ),
+        }
+    }
+    return root, table
+
+
+def test_b14_anime_hash_gate_matrix(tmp_path):
+    """b14 (design D1): the b9 gate matrix replayed for the anime row —
+    accept-on-correct, then wrong hash, wrong size, and missing file all
+    refuse with named errors; the PINNED table never blesses fixture
+    bytes."""
+    marker("b14")
+    name = "realesr-animevideov3-x2"
+    models, table = _make_anime_fixture_models(tmp_path / "anime-models")
+    assert verify_model_artifacts(str(models), name, artifacts=table)
+
+    # wrong hash (same size): the sha256 check fires
+    models2, table2 = _make_anime_fixture_models(tmp_path / "anime-models2")
+    data = bytearray((models2 / f"{name}.bin").read_bytes())
+    data[0] ^= 0xFF
+    (models2 / f"{name}.bin").write_bytes(bytes(data))
+    with pytest.raises(UpscaleError, match="sha256 mismatch"):
+        verify_model_artifacts(str(models2), name, artifacts=table2)
+
+    # wrong size: caught before hashing
+    models3, table3 = _make_anime_fixture_models(tmp_path / "anime-models3")
+    (models3 / f"{name}.param").write_bytes(b"way too short")
+    with pytest.raises(UpscaleError, match="does not match the pinned"):
+        verify_model_artifacts(str(models3), name, artifacts=table3)
+
+    # missing artifact file
+    models4, table4 = _make_anime_fixture_models(tmp_path / "anime-models4")
+    (models4 / f"{name}.bin").unlink()
+    with pytest.raises(UpscaleError, match="not found in"):
+        verify_model_artifacts(str(models4), name, artifacts=table4)
+
+    # the PINNED table (no artifacts= override) never blesses fixture
+    # bytes: the anime profile verifies against the real digests
+    with pytest.raises(UpscaleError, match="sha256 mismatch|does not match"):
+        verify_model_artifacts(str(models), name)
+
+
+@pytest.mark.slow
+def test_b14_real_vendored_anime_artifacts_match_the_pinned_table():
+    """b14's real-artifact companion (the b9 convention, scaled to the
+    ~1.2 MB anime pair): hash the VENDORED packaging/models/ bytes
+    against the pinned table — the exact bytes the installer ships."""
+    if not _REAL_ANIME_DIR.is_dir():
+        pytest.skip(
+            "vendored anime artifacts not present on this host "
+            "(fixture-based hash tests above still ran)"
+        )
+    assert verify_model_artifacts(
+        str(_REAL_ANIME_DIR), "realesr-animevideov3-x2"
+    )
+
+
+# ---- b15: profile plumb-through, engine seam (design D4) ------------------------
+
+
+def _seed_probe_cache(binary: str, models_dir: str, spec_name: str) -> None:
+    """Bless the probe cache for one (binary, models_dir, model) key —
+    select_engine's auto path skips the real GPU probe (the boundary
+    suite never launches one; the probe itself is covered in b8's
+    tests and test_gpu_probe_timeout)."""
+    engine_module._PROBE_CACHE[(str(binary), str(models_dir), spec_name)] = (
+        True,
+        f"probe frame ok (b15 seeded {spec_name})",
+    )
+
+
+def test_b15_select_engine_profile_reaches_the_engine(tmp_path, monkeypatch):
+    marker("b15")
+    binary = make_fake_binary(tmp_path / "bin")
+    monkeypatch.setattr(
+        engine_module, "resolve_realesrgan", lambda explicit=None: str(binary)
+    )
+    models, _table = make_fixture_models(tmp_path / "models")
+    monkeypatch.setattr(
+        engine_module, "verify_model_artifacts", lambda *a, **k: None
+    )
+    _seed_probe_cache(binary, models, "realesr-animevideov3-x2")
+    engine, note = engine_module.select_engine(
+        "ncnn", binary=str(binary), models_dir=str(models), profile="anime"
+    )
+    assert note is None
+    assert type(engine).__name__ == "NcnnVulkanEngine"
+    assert engine.spec.name == "realesr-animevideov3-x2"
+    assert engine.profile == "anime"
+    assert engine.spec.native_scale == 2
+
+    # the auto path blesses the ANIME probe entry (the seeded key), not
+    # live-action's
+    engine_auto, note_auto = engine_module.select_engine(
+        "auto", binary=str(binary), models_dir=str(models), profile="anime"
+    )
+    assert note_auto is None
+    assert engine_auto.profile == "anime"
+    assert engine_module._PROBE_CACHE[
+        (str(binary), str(models), "realesr-animevideov3-x2")
+    ][0] is True
+
+
+def test_b15_engine_run_argv_carries_anime_model(tmp_path):
+    """b15 companion: a constructed anime-profile engine's recorded
+    invocations carry -n realesr-animevideov3-x2 -s 2 (the b4 pairing
+    rule extended per row)."""
+    marker("b15")
+    prepared = tmp_path / "toon.prepared.mkv"
+    prepared.write_bytes(b"prepared-stub")
+    runner = EngineFakeRunner(
+        prepared_duration=100.0,
+        mezzanine_duration=100.0,
+        audio_stream_duration=100.0,
+        source_format_duration=100.0,
+    )
+    _, table = _make_anime_fixture_models(tmp_path / "anime-models")
+    import hashlib as _hashlib
+
+    # the fixture table only holds the anime row; the engine verifies
+    # its own model name against it
+    engine = NcnnVulkanEngine(
+        profile="anime",
+        binary=str(make_fake_binary(tmp_path / "bin")),
+        models_dir=str(tmp_path / "anime-models"),
+        artifacts=table,
+        runner=runner,
+        engine_runner=FakeEngineProcess(),
+    )
+    result = engine.run(
+        str(prepared), make_plan(duration=100.0),
+        ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+    )
+    assert engine.invocations, "engine was never invoked"
+    for invocation in engine.invocations:
+        argv = invocation.argv
+        assert argv[argv.index("-n") + 1] == "realesr-animevideov3-x2"
+        assert int(argv[argv.index("-s") + 1]) == 2
+    assert result.engine_model == "realesr-animevideov3-x2"
+    assert result.engine_native_scale == 2
+    assert result.simulated is False
+
+
+def test_b15_select_engine_default_is_live_action(tmp_path, monkeypatch):
+    marker("b15")
+    binary = make_fake_binary(tmp_path / "bin")
+    monkeypatch.setattr(
+        engine_module, "resolve_realesrgan", lambda explicit=None: str(binary)
+    )
+    models, _table = make_fixture_models(tmp_path / "models")
+    monkeypatch.setattr(
+        engine_module, "verify_model_artifacts", lambda *a, **k: None
+    )
+    _seed_probe_cache(binary, models, "realesrgan-x2plus")
+    for request in ("ncnn", "auto"):
+        engine, _note = engine_module.select_engine(
+            request, binary=str(binary), models_dir=str(models)
+        )
+        assert engine.spec.name == "realesrgan-x2plus"
+        assert engine.profile == "live-action"
+
+
+def test_b15_probe_cache_key_discriminates_models(tmp_path, monkeypatch):
+    """b15 (design D4): the b10/b15 cache-key rule — ONE probe pass on
+    one profile never blesses the other on the same (binary, models_dir).
+    """
+    marker("b15")
+    monkeypatch.setattr(engine_module, "_PROBE_CACHE", {})
+    calls: list[list[str]] = []
+
+    binary = str(make_fake_binary(tmp_path / "bin"))
+    (tmp_path / "models-mirror").mkdir(parents=True, exist_ok=True)
+    models_dir = str(tmp_path / "models-mirror")
+
+    import zlib
+    import struct as _struct
+
+    def probe_ok_png() -> bytes:
+        def _chunk(tag: bytes, data: bytes) -> bytes:
+            return (
+                _struct.pack(">I", len(data))
+                + tag
+                + data
+                + _struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+            )
+
+        # the engine's real contract: 64x64 in -> 128x128 out at native
+        # scale 2 (both registry rows are native-2x nets)
+        ihdr = _struct.pack(">IIBBBBB", 128, 128, 8, 2, 0, 0, 0)
+        raw = b"".join(b"\x00" + bytes([120]) * (128 * 3) for _ in range(128))
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(raw, 6))
+            + _chunk(b"IEND", b"")
+        )
+
+    # the fake run_fn writes the probe output PNG at the model's exact
+    # native scale result (64x64 -> 128x128, same for both profiles)
+    def fake_run(cmd, *, capture_output=True, text=True, timeout=None, **kw):
+        calls.append(list(cmd))
+        out_dir = Path(cmd[cmd.index("-o") + 1])
+        (out_dir / "probe.png").write_bytes(probe_ok_png())
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    ok_la, reason_la = engine_module.gpu_probe_frame(
+        binary, models_dir,
+        spec=MODEL_TABLE["live-action"], run_fn=fake_run,
+    )
+    assert ok_la is True
+    ok_an, reason_an = engine_module.gpu_probe_frame(
+        binary, models_dir,
+        spec=MODEL_TABLE["anime"], run_fn=fake_run,
+    )
+    assert ok_an is True
+    # TWO probe passes ran: the anime key did NOT hit live-action's entry
+    assert len(calls) == 2
+    argv_models = [c[c.index("-n") + 1] for c in calls]
+    assert argv_models[0] == "realesrgan-x2plus"
+    assert argv_models[1] == "realesr-animevideov3-x2"
+    # and both results are now cached independently
+    ok_again, _ = engine_module.gpu_probe_frame(
+        binary, models_dir,
+        spec=MODEL_TABLE["anime"], run_fn=fake_run,
+    )
+    assert ok_again is True and len(calls) == 2
     marker("b10")
     seen_cleanup: list[bool] = []
 
@@ -2127,6 +2421,106 @@ def test_progress_reporting_uses_exact_total(tmp_path):
         assert total == 900  # the decode-counted total, not ceil(36x29.97)=1079
     assert seen[-1] == (900, 900)
     assert result.frames_done == 900
+
+
+# ---- b16: run_file plumb-through (design D4/D5) ---------------------------------
+
+
+def test_b16_run_file_profile_reaches_manifest(tmp_path):
+    """b16: run_file(profile="anime") with an engine-seam override
+    records the anime profile on the manifest and the state; the
+    manifest carries the anime model exactly as v0.4.0 pinned the
+    model fields."""
+    marker("b16")
+    import sys as _sys
+    import os as _os
+
+    _sys.path.insert(0, _os.path.dirname(__file__))
+    from test_run import FakeRunner, probe_payload
+    from vidlift.run import run_file, ToolBox
+    import json as _json
+
+    path = tmp_path / "toon.avi"
+    path.write_bytes(b"")
+    # the real NcnnVulkanEngine construction with a profile, seam-faked
+    models, anime_table, = _make_anime_fixture_models(tmp_path / "anime-models")
+    anime_engine = NcnnVulkanEngine(
+        profile="anime",
+        binary=str(make_fake_binary(tmp_path / "bin")),
+        models_dir=str(models),
+        artifacts=anime_table,
+        runner=EngineFakeRunner(prepared_duration=5400.0),
+        engine_runner=FakeEngineProcess(),
+    )
+    runner = FakeRunner(probe_payload())
+    result = run_file(
+        str(path),
+        tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        probe_runner=runner,
+        command_runner=runner,
+        engine=anime_engine,
+        profile="anime",
+        log_dir=str(tmp_path / "runs"),
+    )
+    manifest = _json.loads(Path(result.manifest_path).read_text())
+    assert manifest["run"]["upscale_profile"] == "anime"
+    assert result.state.upscale_profile == "anime"
+    # the engine's model lands in the manifest exactly as v0.4.0 pinned
+    assert manifest["run"]["engine_model"] == "realesr-animevideov3-x2"
+    assert manifest["run"]["engine_simulated"] is False
+
+
+def test_b16_run_file_default_profile_is_live_action(tmp_path):
+    """b16 companion (D3): the absent profile reads as live-action in
+    the state/manifest; behavior identical to v0.4.7."""
+    marker("b16")
+    import sys as _sys
+    import os as _os
+
+    _sys.path.insert(0, _os.path.dirname(__file__))
+    from test_run import run_happy
+    import json as _json
+
+    result, _runner = run_happy(tmp_path)
+    manifest = _json.loads(Path(result.manifest_path).read_text())
+    assert manifest["run"]["upscale_profile"] == "live-action"
+    assert result.state.upscale_profile == "live-action"
+
+
+def test_b16_run_file_fail_open_records_anime_attempt(tmp_path):
+    """b16 companion (design D4's fail-open honesty): a forced-failure
+    engine still ships the synchronized re-encode and the manifest
+    records the anime profile as the ATTEMPTED profile."""
+    marker("b16")
+    import sys as _sys
+    import os as _os
+
+    _sys.path.insert(0, _os.path.dirname(__file__))
+    from test_run import FakeRunner, probe_payload
+    import json as _json
+
+    from vidlift.run import run_file, ToolBox, FakeEngine
+
+    path = tmp_path / "toon.avi"
+    path.write_bytes(b"")
+    runner = FakeRunner(probe_payload())
+    result = run_file(
+        str(path),
+        tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        probe_runner=runner,
+        command_runner=runner,
+        engine=FakeEngine(UpscaleError("engine exploded on the anime net")),
+        profile="anime",
+        log_dir=str(tmp_path / "runs"),
+    )
+    assert result.ok is True  # fail-open: the run completed
+    manifest = _json.loads(Path(result.manifest_path).read_text())
+    assert manifest["run"]["upscale_profile"] == "anime"
+    assert manifest["run"]["fail_open"] is True
+    assert "engine exploded on the anime net" in manifest["run"]["fail_open_reason"]
+    assert manifest["run"]["engine_simulated"] is True
+    # the shipped pixels are the synchronized re-encode, never an AI pass
+    assert manifest["run"]["engine_model"] is None
 
 
 # ---- b0: execution canary (runs LAST; pytest executes in file order) ------------

@@ -44,8 +44,14 @@ ENGINE_TOOL_NAME = "realesrgan-ncnn-vulkan"
 # The ONLY source of engine model artifact identity (clause g). sha256
 # values pinned from x2plus VERIFICATION-REPORT.md (2026-10-04): the
 # fp16 ncnn conversion of RealESRGAN_x2plus.pth v0.2.1 (a true native-2x
-# RRDBNet; -s 2 IS its native mode). The animevideov3-x2 row gets pinned
-# here the same way when the anime profile milestone opens.
+# RRDBNet; -s 2 IS its native mode).
+#
+# v0.4.8 (design docs/designs/v0.4.8-anime-upscale-profile.md D1): the
+# anime row is pinned from the 20220424 release zips (Section 2 of the
+# design; sizes and sha256 verified 2026-10-26 before vendoring — the
+# vendored packaging/models/ copies carry these exact bytes). The
+# animevideov3-x2 net is a true native-2x model on the released v0.2.0
+# binary (the design's Section 2 engine-level verification).
 MODEL_ARTIFACTS: dict[str, dict[str, tuple[int, str]]] = {
     "realesrgan-x2plus": {
         "param": (
@@ -55,6 +61,16 @@ MODEL_ARTIFACTS: dict[str, dict[str, tuple[int, str]]] = {
         "bin": (
             33_434_888,
             "cfb044e3a1fe18750f54f7a3d8c2d49a296b54e2c9489c90513bbf88844e9e69",
+        ),
+    },
+    "realesr-animevideov3-x2": {
+        "param": (
+            3_173,
+            "b88ff4f00ebf019a7fdac17fdd45a7fd3665d37509efc5baf2e4da2e24420a04",
+        ),
+        "bin": (
+            1_247_368,
+            "548a36f9c3f4ab8da56cd3b13badf23968bee207b396dad14d04b830e5f2ab2d",
         ),
     },
 }

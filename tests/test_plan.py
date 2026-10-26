@@ -144,3 +144,65 @@ def test_estimate_bitrate_accounts_for_audio():
 def test_invalid_target_raises():
     with pytest.raises(PlanError):
         output_geometry(report_for(), target="1080p")
+
+
+# ---- v0.4.8 b22: plan expectations stay profile-agnostic (design D6) -------------
+
+
+def test_b22_expectation_unchanged_for_dvd_rip():
+    """b22 (design D6): the DVD-MPEG2-rip expectation string is what the
+    brief pins; plan.py grew no profile awareness, so the string is the
+    same for both profiles by construction (build_file_plan takes no
+    profile argument)."""
+    from vidlift.plan import build_file_plan
+    from vidlift.probe import SOURCE_DVD_MPEG2_RIP
+
+    report = report_for(
+        path="dvd.vob",
+        width=640,
+        height=480,
+        codec="mpeg2video",
+        container="mpeg",
+        duration="4.0",
+    )
+    assert report.source_class == SOURCE_DVD_MPEG2_RIP
+    plan = build_file_plan(report)
+    assert (
+        plan.expectation
+        == "best 720p that source can give; good, not transformative"
+    )
+    # additive: build_file_plan accepts no profile kwarg at all —
+    # inspect its signature for the D6 claim
+    import inspect
+
+    params = inspect.signature(build_file_plan).parameters
+    assert "profile" not in params
+    assert "upscale_profile" not in params
+
+
+def test_b22_expectation_strings_stable_across_all_source_classes():
+    import inspect
+
+    from vidlift import plan as plan_mod
+
+    # the four pinned strings, verbatim (any profile-aware drift in
+    # plan.py breaks this test)
+    report_avi = report_for(path="m.avi", codec="mpeg4", container="avi")
+    assert (
+        plan_mod._expectation(report_avi)
+        == "cleaner on a TV, but detail missing from the rip cannot be recovered"
+    )
+    report_dvd = report_for(
+        path="d.vob", codec="mpeg2video", container="mpeg"
+    )
+    assert (
+        plan_mod._expectation(report_dvd)
+        == "best 720p that source can give; good, not transformative"
+    )
+    report_h264 = report_for(
+        path="s.mp4", codec="h264", container="mov,mp4,m4a,3gp,3g2,mj2"
+    )
+    assert (
+        plan_mod._expectation(report_h264)
+        == "likely modest improvement; inspect the sample before a full run"
+    )

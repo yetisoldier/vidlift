@@ -209,6 +209,10 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
             state_box=state_box,
             subtitle_ocr=bool(options.get("subtitle_ocr", True)),
             replace_source=bool(options.get("replace_source", False)),
+            # v0.4.8 (D5): the absent-defaults rule — no
+            # options["upscale_profile"] reads as "live-action", so
+            # v0.4.7 callers are behavior-identical.
+            profile=options.get("upscale_profile", "live-action"),
         )
     except EngineCancelled as exc:
         state = getattr(exc, "state", None)

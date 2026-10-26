@@ -139,6 +139,17 @@ def _render_plan(item) -> str:
     return "\n".join(lines)
 
 
+# v0.4.8 (design D6): the one additive anime expectation sentence,
+# appended ONLY at the run-report surfaces that already hold the
+# profile in scope (CLI run-report, GUI detail text) — plan.py stays
+# content-agnostic (the profile is a run knob, not a plan knob) and
+# PlannedFile.expectation is stable for every plan-level consumer.
+ANIME_EXPECTATION_SUFFIX = (
+    "Anime upscaling model: strong fit for flat fills and line art "
+    "(common in cel animation); not for live-action content."
+)
+
+
 def _cmd_probe(files: list[str]) -> int:
     failures = 0
     for path in files:
@@ -205,6 +216,7 @@ def _cmd_run(
     realesrgan: str | None,
     realesrgan_models: str | None,
     replace_source: bool = False,
+    upscale_profile: str = "live-action",
 ) -> int:
     """Drive one file through the runner and print its state.
 
@@ -228,6 +240,7 @@ def _cmd_run(
             realesrgan=realesrgan,
             realesrgan_models=realesrgan_models,
             replace_source=replace_source,
+            profile=upscale_profile,
         )
     except (ProbeError, PlanError, RunError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -245,6 +258,13 @@ def _cmd_run(
     print(f"output: {result.plan.output_path}")
     verdict = "verified" if result.verification.ok else "failed"
     print(f"verification: {verdict}")
+    # v0.4.8 (D6): the anime expectation note renders ONLY at the
+    # run-report surfaces that hold the profile (never in plan.py) —
+    # appended to the plan's own expectation sentence when the user
+    # chose the anime profile.
+    if getattr(state, "upscale_profile", None) == "anime":
+        print(f"expectation: {result.plan.expectation}")
+        print(f"  {ANIME_EXPECTATION_SUFFIX}")
     if state.fail_open:
         # The final report states exactly what shipped and why (clause d):
         # a fail-open run is a completed, verified re-encode with NO AI
@@ -476,6 +496,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--upscale-profile",
+        choices=["live-action", "anime"],
+        default="live-action",
+        help=(
+            'default "live-action"; choose "anime" for cel-animation / '
+            "flat-fill sources (DVD cartoons, anime), where the "
+            "animevideov3-x2 model is faster and avoids false texture in "
+            "fills. Manual switch only — VidLift does not auto-detect "
+            "content type."
+        ),
+    )
+    run_parser.add_argument(
         "--realesrgan",
         help="explicit realesrgan-ncnn-vulkan path (else VIDLIFT_REALESRGAN_NCNN, then bundled)",
     )
@@ -560,6 +592,7 @@ def main(argv: list[str] | None = None) -> int:
             realesrgan=args.realesrgan,
             realesrgan_models=args.realesrgan_models,
             replace_source=args.replace_source,
+            upscale_profile=args.upscale_profile,
         )
     if args.command == "benchmark":
         return _cmd_benchmark(

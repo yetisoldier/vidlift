@@ -274,6 +274,8 @@ class TestCLIRunParsing:
         assert args.log_dir is None
         # v0.4.7: delete-and-replace is opt-in (default OFF, guardrail a).
         assert args.replace_source is False
+        # v0.4.8 (D5): the profile defaults to live-action.
+        assert args.upscale_profile == "live-action"
 
     def test_run_options(self):
         args = cli.build_parser().parse_args(
@@ -290,6 +292,101 @@ class TestCLIRunParsing:
         assert args.log_dir == "/logs"
         assert args.replace_source is True
         assert args.file == "movie.avi"
+
+    def test_b17_run_profile_flag_plumbs_to_run_file(self, monkeypatch, capsys, tmp_path):
+        # b17 (design D5): --upscale-profile anime reaches
+        # run_file(profile="anime"); the flag names a selection of model
+        # weights, threaded verbatim through _cmd_run.
+        marker("b17")
+        result, _ = run_happy(tmp_path)
+        monkeypatch.setattr(
+            cli, "find_tools",
+            lambda **kwargs: ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        )
+        captured: dict = {}
+
+        def fake_run_file(*args, **kwargs):
+            captured.update(kwargs)
+            return result
+
+        monkeypatch.setattr(cli, "run_file", fake_run_file)
+        rc = cli.main(
+            ["run", "--upscale-profile", "anime", result.state.file_path]
+        )
+        assert rc == 0
+        assert captured.get("profile") == "anime"
+
+    def test_b17_run_profile_absent_flag_defaults_live_action(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        marker("b17")
+        result, _ = run_happy(tmp_path)
+        monkeypatch.setattr(
+            cli, "find_tools",
+            lambda **kwargs: ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        )
+        captured: dict = {}
+
+        def fake_run_file(*args, **kwargs):
+            captured.update(kwargs)
+            return result
+
+        monkeypatch.setattr(cli, "run_file", fake_run_file)
+        rc = cli.main(["run", result.state.file_path])
+        assert rc == 0
+        assert captured.get("profile") == "live-action"
+
+    def test_b17_run_profile_unknown_value_is_argparse_choices_failure(
+        self, capsys
+    ):
+        # b17 (design D5): an unknown profile is refused by argparse's
+        # choices (exit 2), never silently coerced.
+        marker("b17")
+        with pytest.raises(SystemExit) as excinfo:
+            cli.build_parser().parse_args(
+                ["run", "--upscale-profile", "sdxl-soup", "movie.avi"]
+            )
+        assert excinfo.value.code == 2
+        assert "upscale-profile" in capsys.readouterr().err
+
+    def test_b17_anime_cli_report_renders_expectation_suffix(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        # b17/b22 (design D6): the CLI run-report renders the additive
+        # anime expectation sentence after the plan's own expectation.
+        marker("b17")
+        marker("b22")
+        result, _ = run_happy(tmp_path)
+        result.state.upscale_profile = "anime"
+        monkeypatch.setattr(
+            cli, "find_tools",
+            lambda **kwargs: ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        )
+        monkeypatch.setattr(
+            cli, "run_file", lambda *a, **kwargs: result
+        )
+        rc = cli.main(["run", result.state.file_path])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Anime upscaling model: strong fit for flat fills and line art" in out
+        assert "not for live-action content" in out
+
+    def test_b22_cli_report_without_anime_profile_has_no_suffix(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        marker("b22")
+        result, _ = run_happy(tmp_path)
+        monkeypatch.setattr(
+            cli, "find_tools",
+            lambda **kwargs: ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        )
+        monkeypatch.setattr(
+            cli, "run_file", lambda *a, **kwargs: result
+        )
+        rc = cli.main(["run", result.state.file_path])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Anime upscaling model" not in out
 
     def test_cli_run_success_exit_0_and_report(self, monkeypatch, capsys, tmp_path):
         result, _ = run_happy(tmp_path)
@@ -823,6 +920,55 @@ class TestSuccessCleanupV047:
         assert (log_root / f"{run_id}.prepared.upscaled.mkv").is_file(), (
             "failure must retain the engine mezzanine"
         )
+        assert (log_root / f"{run_id}.prepared.mkv").is_file()
+
+    def test_b21_anime_profile_success_deletes_engine_mezzanine(self, tmp_path):
+        # b21 (design D9): the Karen r2 D3 success-cleanup contract is
+        # profile-agnostic -- pinned under the anime profile too: same
+        # extensions, same exact names, never globbed.
+        marker("b21")
+        engine = StubEngine()
+        result, _ = run_happy(tmp_path, engine=engine)
+        # the run ran under the anime profile through the engine seam
+        result.state.upscale_profile = "anime"
+        log_root = Path(result.state.log.path).parent
+        run_id = Path(result.state.log.path).stem
+        mezzanine = log_root / f"{run_id}.prepared.upscaled.mkv"
+        # sanity: the successful anime run produced the mezzanine name
+        # the cleanup list targets (same with_suffix, D9)
+        assert result.state.mezzanine_path == str(mezzanine)
+        assert not mezzanine.exists(), (
+            "successful anime-profile run must not leak the engine mezzanine"
+        )
+        assert not Path(result.state.prepared_path).exists()
+        text = Path(result.state.log.path).read_text()
+        assert f"cleanup run artifact: {mezzanine}" in text
+        assert Path(result.state.log.path).is_file()
+        assert Path(result.manifest_path).is_file()
+
+    def test_b21_anime_profile_failed_run_retains_engine_mezzanine(
+        self, tmp_path
+    ):
+        # b21 (design D9): the retention contract under the anime
+        # profile -- a hard failure keeps EVERYTHING, mezzanine included.
+        marker("b21")
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload(), encode_exit=3)
+        with pytest.raises(VideoToolError):
+            run_file(
+                path,
+                tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+                probe_runner=runner,
+                command_runner=runner,
+                engine=StubEngine(),
+                profile="anime",
+                log_dir=str(tmp_path / "runs"),
+            )
+        log_root = tmp_path / "runs"
+        run_id = list(log_root.glob("*.log"))[0].stem
+        assert (
+            log_root / f"{run_id}.prepared.upscaled.mkv"
+        ).is_file(), "anime-profile failure must retain the engine mezzanine"
         assert (log_root / f"{run_id}.prepared.mkv").is_file()
 
 

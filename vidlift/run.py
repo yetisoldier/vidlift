@@ -852,6 +852,10 @@ class RunState:
     # warnings. None until the phase runs; absent = older consumer
     # unaffected (schema v2 additive convention).
     subtitles: dict | None = None
+    # v0.4.8 additive (design D5): the requested upscale profile
+    # ("live-action" | "anime"). None until the run records it; the
+    # manifest echo states the selection even under fail-open.
+    upscale_profile: str | None = None
 
     def touch(self) -> None:
         self.last_activity_at = time.time()
@@ -900,6 +904,7 @@ class RunState:
             "resume": self.resume,
             "rejected_mezzanine": self.rejected_mezzanine,
             "subtitles": self.subtitles,
+            "upscale_profile": self.upscale_profile,
         }
 
 
@@ -1116,6 +1121,7 @@ def run_file(
     command_runner: Runner | None = None,
     engine: EngineAdapter | None = None,
     engine_request: str = "auto",
+    profile: str = "live-action",
     realesrgan: str | None = None,
     realesrgan_models: str | None = None,
     log_dir: str | None = None,
@@ -1152,6 +1158,15 @@ def run_file(
     ``replace_source`` (strictly opt-in) moves the verified output over
     the source path afterwards; a replace failure logs a warning and
     keeps the success.
+
+    v0.4.8: ``profile`` selects the upscale model family —
+    ``"live-action"`` (the unchanged default, realesrgan-x2plus) or
+    ``"anime"`` (realesr-animevideov3-x2, for cel-animation /
+    flat-fill sources). Manual switch only; no content auto-detection.
+    When ``engine`` is passed explicitly the caller-built engine
+    carries its own profile and ``profile`` is ignored on that path
+    (the explicit-engine seam wins, the same discipline as
+    ``engine_request`` being ignored when ``engine`` is passed).
     """
     if tools is None:
         tools = find_tools()
@@ -1321,6 +1336,10 @@ def run_file(
 
         # ---- upscale ----
         phase = begin_phase(PHASE_UPSCALE)
+        # v0.4.8 (D5): record the requested profile ("live-action" or
+        # "anime") once the upscale phase opens — status/manifest echo
+        # the selection under every engine (stub, real, fail-open).
+        state.upscale_profile = profile
 
         def record_progress(frames_done: int, frames_total: int) -> None:
             # B.6: merge, never replace — the "step" label set by
@@ -1387,6 +1406,7 @@ def run_file(
 
                 active_engine, selection_note = select_engine(
                     engine_request,
+                    profile=profile,
                     binary=realesrgan,
                     models_dir=realesrgan_models,
                 )
@@ -1803,6 +1823,10 @@ def _build_manifest(
             # consumer; additive schema v2, no bump (the doc pins this:
             # v3 is only warranted for breaking changes; there are none).
             "subtitles": state.subtitles,
+            # v0.4.8 additive (design D5): the requested upscale profile
+            # ("live-action" | "anime"), echoed for status/manifest
+            # honesty under both engines and fail-open.
+            "upscale_profile": state.upscale_profile,
         },
         "tools": tools.to_dict(),
         "probe": {
@@ -1889,6 +1913,10 @@ def _write_failure_manifest(state: RunState, tools: ToolBox) -> None:
                 "frame_gates": state.frame_gates,
                 "resume": state.resume,
                 "rejected_mezzanine": state.rejected_mezzanine,
+                # v0.4.8 additive (design D5): the attempted upscale
+                # profile, recorded on the failure manifest too so
+                # failure debugging sees the selection.
+                "upscale_profile": state.upscale_profile,
             },
             "tools": tools.to_dict() if tools else None,
             "artifacts": {
