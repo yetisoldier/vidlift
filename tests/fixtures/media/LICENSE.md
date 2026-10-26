@@ -13,8 +13,8 @@ public-domain cel-animation short:
   <https://archive.org/details/superman_mechanical_monsters>
   (metadata `licenseurl`: http://creativecommons.org/publicdomain/zero/1.0/).
 - **Downloaded from:** <https://archive.org/download/superman_mechanical_monsters/superman_mechanical_monsters.mp4>
-  (MP4 v2, h264 640x480, 609.9 s; downloaded 2026-10-26 and sha256-checked
-  by size before the extract below).
+  (MP4 v2, h264 640x480, 609.9 s; downloaded 2026-10-26 and
+  sha256-checked before the extract below).
 - **Derivation (the fixture bytes):**
 
   ```

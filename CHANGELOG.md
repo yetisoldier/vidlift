@@ -21,8 +21,11 @@ per the binding design `docs/designs/v0.4.8-anime-upscale-profile.md`
   - Python API: `run_file(..., profile="anime")` (additive keyword;
     the default behavior is unchanged).
   - MCP bridge: `run` options gained `upscale_profile` (string;
-    absent → "live-action"; an unknown value fails the job naming
-    the profile, the same shape as an unknown `engine`).
+    absent → "live-action"; an unknown value is refused outright at
+    the CLI/GUI seams, but at the Python-API and MCP seams it fails
+    open — the job succeeds as an honest no-AI re-encode whose
+    manifest/log name the profile, the same shape as an unknown
+    `engine` value there).
   - No auto-detection, by design (D3): every anime run is the user's
     stated intent; VidLift never guesses content type.
 - **The model, vendored and hash-pinned like x2plus** (D1):
@@ -50,7 +53,11 @@ per the binding design `docs/designs/v0.4.8-anime-upscale-profile.md`
   MPEG-2 (q:v 6) VOB cut from Fleischer's *Superman: The Mechanical
   Monsters* (1941), public domain (US non-renewal; the Internet
   Archive copy carries a CC0 dedication) — see
-  `tests/fixtures/media/LICENSE.md`. Suite: 458 tests.
+  `tests/fixtures/media/LICENSE.md`. The checked-in 4 s fixture is
+  under the frame clock's 10 s audio-extent sanity minimum, so it can
+  never take a real AI pass: it deterministically exercises the
+  fail-open path; the real-engine e2e used a 10.5 s derivation from
+  the same source. Suite: 458 tests.
 
 ### Changed
 

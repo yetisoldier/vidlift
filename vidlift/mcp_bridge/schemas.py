@@ -52,8 +52,11 @@ _OPTIONS_RUN = {
     # v0.4.8 (design D5): the upscale model profile ("live-action" |
     # "anime"), string not enum matching "target"'s permissive shape —
     # value validation happens in run_file's select_engine path, where
-    # an unknown name raises UpscaleError -> job failure with the
-    # profile named. Absent -> "live-action" (v0.4.7 behavior).
+    # Unknown profile: run_file's selection-time fail-open turns the
+    # UpscaleError into an honest no-AI success naming the profile
+    # (NOT a job failure — the bridge's job-failure path is never
+    # reached; CLI/GUI refuse an unknown value outright instead).
+    # Absent -> "live-action" (v0.4.7 behavior).
     "upscale_profile": {"type": "string"},
 }
 
