@@ -40,7 +40,7 @@ ffmpeg -f lavfi -i testsrc2=size=640x272:rate=25:duration=2 \
   -shortest /tmp/vidlift-smoke.avi
 python -m vidlift run --log-dir /tmp/vidlift-runs /tmp/vidlift-smoke.avi
 ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height \
-  -of csv /tmp/vidlift-smoke.vidlift.720p.hevc.mp4   # hevc,1280,720
+  -of csv /tmp/vidlift-smoke.720p.hevc.mp4   # hevc,1280,720
 ```
 
 The run prints its log/manifest paths and phase timings; the manifest

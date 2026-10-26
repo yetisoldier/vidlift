@@ -355,6 +355,22 @@ class MainWindow(QMainWindow):
             "Convert image-based PGS/VobSub subtitles to text. Ordinary text subtitles are still carried when this is off."
         )
         self.subtitle_ocr.toggled.connect(self._refresh_details)
+        # v0.4.7 (delete-and-replace): strictly opt-in, default OFF;
+        # persisted via QSettings like every other GUI preference.
+        self.replace_source = QCheckBox(
+            "Replace original on success (deletes the source video)"
+        )
+        self.replace_source.setChecked(
+            self._settings().value("replace_source", False, type=bool)
+        )
+        self.replace_source.setToolTip(
+            "After a verified upscale, delete the source video and move the "
+            "finished 720p MP4 into its original path.\n\n"
+            "Replaces the original file after a successful upscale "
+            "(irreversible). If the replace cannot be done, the upscale "
+            "output is kept in its planned location and nothing is deleted."
+        )
+        self.replace_source.toggled.connect(self._replace_source_changed)
 
         # ---- engine combo (design §7): EXACT three adapters in tree ----
         self.engine_combo = QComboBox()
@@ -522,6 +538,12 @@ class MainWindow(QMainWindow):
         else:
             self.monitor_pill.setText("Monitor off")
 
+    def _replace_source_changed(self, checked: bool) -> None:
+        """Persist the replace-source preference (QSettings, house
+        rule). The checkbox itself warns the user in its label; only
+        the stored value changes here."""
+        self._settings().setValue("replace_source", bool(checked))
+
     def _engine_changed(self, index: int) -> None:
         data = self.engine_combo.itemData(index)
         if data in ("auto", "stub", "ncnn"):
@@ -593,6 +615,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel("Upscale engine"), 1, 0)
         grid.addWidget(self.engine_combo, 1, 1)
         grid.addWidget(self.subtitle_ocr, 1, 2, 1, 3)
+        grid.addWidget(self.replace_source, 1, 5, 1, 3)
         grid.addWidget(self.monitor_check, 2, 0, 1, 7)
         self.monitor_check.toggled.connect(self._toggle_monitor)
         grid.addWidget(self.cancel_button, 1, 7)
@@ -892,6 +915,7 @@ class MainWindow(QMainWindow):
             "gb_per_hour": gbph,
             "output_dir": self.output_dir.text().strip() or None,
             "subtitle_ocr": self.subtitle_ocr.isChecked(),
+            "replace_source": self.replace_source.isChecked(),
         }
         try:
             self.job_ids = self.client.enqueue_run(

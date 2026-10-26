@@ -81,6 +81,17 @@ def test_client_local_enqueue_run_creates_jobs_in_order(tmp_path, monkeypatch):
         assert record_a.options["engine"] == "ncnn"
         assert record_b.options["engine"] == "ncnn"
         assert record_a.options["gb_per_hour"] == 2.0
+        # v0.4.7: replace-source rides options verbatim too (additive;
+        # absent reads as False at the jobs seam).
+        client2 = LocalBridgeClient(state_dir=tmp_path, start_executor=False)
+        try:
+            ids2 = client2.enqueue_run(
+                [str(first)], options={"replace_source": True}, engine="auto"
+            )
+            record = client2.registry.require(ids2[0])
+            assert record.options["replace_source"] is True
+        finally:
+            client2.stop()
         # ...and the persisted registry carries it too.
         data = json.loads((tmp_path / "jobs.json").read_text())
         saved = {row["job_id"]: row for row in data["jobs"]}

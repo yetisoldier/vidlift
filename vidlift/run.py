@@ -38,6 +38,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from pathlib import Path
 
 from .plan import PlanError, PlannedFile, build_file_plan
@@ -94,6 +95,8 @@ __all__ = [
     "find_tools",
     "run_file",
     "run_with_heartbeat",
+    "cleanup_run_artifacts",
+    "replace_source_with_output",
     "verify_output",
 ]
 
@@ -914,6 +917,164 @@ class RunResult:
         return bool(self.state.ok)
 
 
+# v0.4.7 (success cleanup): the log-root artifacts a SUCCESSFUL run
+# leaves behind that are pure scratch. The log and manifest are the
+# run's durable record ("what happened" evidence) and never cleanup
+# candidates; the engine workdir is engine_ncnn's own retention
+# contract; the OCR workdir holds subtitle intermediates already
+# copied into the retained .ocr/ diagnostic kit. Cleanup is
+# namespaced per run-id (no globbing), so a concurrent run under the
+# same log root can never lose its own artifacts.
+_SUCCESS_SCRATCH_EXTENSIONS = (
+    ".prepared.mkv",
+    ".engine-work",
+    ".ocr-work",
+)
+
+
+def _iter_run_scratch_artifacts(run_id: str, log_root: Path):
+    for ext in _SUCCESS_SCRATCH_EXTENSIONS:
+        candidate = log_root / f"{run_id}{ext}"
+        if candidate.is_dir():
+            yield candidate
+        elif candidate.is_file():
+            yield candidate
+
+
+def cleanup_run_artifacts(
+    run_id: str, log_root: str, *, log_line=None
+) -> list[str]:
+    """Delete one successful run's scratch artifacts; return what was removed.
+
+    v0.4.7 (Eric: "when a run is completed successfully we need to ensure
+    the files used for the conversion are properly removed"): after the
+    run completes verified, the scratch (the prepared mezzanine, the
+    engine's frame/chunk workdir, the OCR intermediates) is removed so a
+    finished job does not leave gigabytes of hidden disk usage behind.
+
+    Retention stays exactly as designed:
+    - the run log and manifest are KEPT (the durable record);
+    - nothing is deleted for a failed/cancelled run (clause-e retention
+      contract) -- the caller only invokes this on the success path;
+    - caches are NOT temp (benchmark caches under ``~/.vidlift`` stay);
+    - sidecar .srt files and the .ocr/ diagnosis kit live beside the
+      OUTPUT and are never touched here.
+
+    Every delete failure is logged as a WARNING (via ``log_line``) and
+    swallowed: cleanup must never convert a successful run into a
+    failure; best effort only.
+    """
+    removed: list[str] = []
+    root = Path(log_root)
+    for candidate in _iter_run_scratch_artifacts(run_id, root):
+        try:
+            if candidate.is_dir():
+                shutil.rmtree(candidate)
+            else:
+                candidate.unlink()
+            removed.append(str(candidate))
+            if log_line is not None:
+                log_line(f"cleanup run artifact: {candidate}")
+        except OSError as exc:
+            if log_line is not None:
+                log_line(
+                    f"WARNING run artifact cleanup could not remove "
+                    f"{candidate}: {exc}"
+                )
+    return removed
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def replace_source_with_output(
+    source_path: str,
+    output_path: str,
+    *,
+    log_line=None,
+) -> str:
+    """Delete the source and move the verified output into its place.
+
+    v0.4.7 (Eric: "I want an option to have it delete and replace the
+    source file when the upscale is complete"): strictly opt-in, called
+    only AFTER ``verify_output`` passed, never automatically.
+
+    Guardrails:
+    - the output must already exist on disk (verify checked it);
+    - never when the output IS the source path (nothing to replace);
+    - same filesystem -> one atomic ``os.replace`` (rename(2): either
+      the old file is replaced or the call errs);
+    - cross filesystem -> copy first, verify the copy by SHA-256, and
+      only then delete the original output copy -- a verified copy
+      never destroys the only good data;
+    - failures raise :class:`RunError` -- the runner catches it and
+      converts to a logged warning so a replace failure can never fail
+      a successful upscale.
+
+    Returns the path the output now occupies (the source's original
+    path). The output's former path may then no longer hold a file
+    when the source and output directories differ.
+    """
+    source = Path(source_path)
+    output = Path(output_path)
+    if not source.is_file():
+        raise RunError(
+            f"replace-source refused: source is gone: {source}"
+        )
+    if not output.is_file():
+        raise RunError(
+            f"replace-source refused: verified output is missing: {output}"
+        )
+    if os.path.normcase(os.path.abspath(str(source))) == os.path.normcase(
+        os.path.abspath(str(output))
+    ):
+        if log_line is not None:
+            log_line(
+                "replace-source: skipped (source path == output path)"
+            )
+        return str(source)
+    if os.stat(str(source)).st_dev == os.stat(str(output)).st_dev:
+        try:
+            os.replace(str(output), str(source))
+        except OSError as exc:
+            raise RunError(
+                f"replace-source failed to move the output over the "
+                f"source ({source}): {exc}"
+            ) from exc
+    else:
+        try:
+            shutil.copy2(str(output), str(source))
+            if _sha256_file(output) != _sha256_file(source):
+                raise RunError(
+                    "replace-source: the copied file at "
+                    f"{source} does not hash-match the verified output; "
+                    "keeping the verified original and the source"
+                )
+        except OSError as exc:
+            raise RunError(
+                f"replace-source cross-filesystem copy into {source} "
+                f"failed: {exc}"
+            ) from exc
+        # The copy hash-verified: the file at the source path is now the
+        # good data, so only the former output copy gets removed.
+        try:
+            output.unlink()
+        except OSError as exc:
+            if log_line is not None:
+                log_line(
+                    f"WARNING replace-source: the verified output copy at "
+                    f"{output} could not be removed: {exc}"
+                )
+    if log_line is not None:
+        log_line(f"replace-source: output now at {source}")
+    return str(source)
+
+
 def _apply_subtitle_ocr_preference(
     plan: PlannedFile, *, enabled: bool
 ) -> PlannedFile:
@@ -949,6 +1110,7 @@ def run_file(
     sample_classify: bool = True,
     state_box: dict | None = None,
     subtitle_ocr: bool = True,
+    replace_source: bool = False,
 ) -> RunResult:
     """Run one file through the full pipeline and return its state.
 
@@ -969,6 +1131,14 @@ def run_file(
     original-resolution encode, the manifest stating what shipped and
     why. :class:`EngineCancelled` closes the run as cancelled, never
     as a failure.
+
+    v0.4.7: on a VERIFIED run (never on failure/cancel), the run's
+    scratch artifacts under ``log_dir``/``.vidlift-runs`` (prepared
+    mezzanine, engine workdir, OCR workdir) are cleaned up
+    best-effort; cleanup failures log a warning and keep the success.
+    ``replace_source`` (strictly opt-in) moves the verified output over
+    the source path afterwards; a replace failure logs a warning and
+    keeps the success.
     """
     if tools is None:
         tools = find_tools()
@@ -1518,6 +1688,23 @@ def run_file(
         log(f"manifest: {manifest_path}")
         if not verification.ok:
             raise RunError(state.error)
+        # v0.4.7 (success cleanup, Eric): the run is verified; remove its
+        # scratch. Retention on failure/cancel is untouched (the except
+        # blocks below never reach this code). Best-effort: a cleanup
+        # failure logs a WARNING inside cleanup_run_artifacts and keeps
+        # the success; the log and manifest are never candidates.
+        cleanup_run_artifacts(run_id, str(log_root), log_line=log)
+        if replace_source:
+            try:
+                replaced_path = replace_source_with_output(
+                    file_path, plan.output_path, log_line=log
+                )
+                state.output_path = replaced_path
+            except (RunError, OSError) as exc:
+                # Guardrail (d): a replace failure must never crash the
+                # caller or fail the verified run; the upscale output
+                # stays exactly where the plan put it.
+                log(f"WARNING: replace-source failed; keeping both files: {exc}")
         state.current_phase = PHASE_DONE
         log("run complete")
         return RunResult(

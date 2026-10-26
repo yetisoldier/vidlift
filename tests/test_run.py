@@ -171,7 +171,7 @@ class FakeRunner:
             if self.prepare_exit == 0:
                 Path(args[-1]).write_bytes(b"prepared-stub")
             return self.prepare_exit, "", "prepare boom" if self.prepare_exit else ""
-        if args and args[-1].endswith(".vidlift.720p.hevc.mp4") and "-i" in args and any(a.endswith(".srt") for a in args):
+        if args and args[-1].endswith(".720p.hevc.mp4") and "-i" in args and any(a.endswith(".srt") for a in args):
             # v0.4.1: the mov_text mux into the finished MP4 writes a
             # temp sibling that mux_srt_into_mp4 then replaces over the
             # output (temp-then-replace atomicity)
@@ -183,7 +183,7 @@ class FakeRunner:
             if self.prepare_exit == 0:
                 Path(args[-1]).write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
             return self.prepare_exit, "", "srt boom" if self.prepare_exit else ""
-        if args and args[-1].endswith(".vidlift.720p.hevc.mp4"):
+        if args and args[-1].endswith(".720p.hevc.mp4"):
             if self.encode_exit == 0 and self.encode_writes_output:
                 Path(args[-1]).write_bytes(b"output-stub")
             return self.encode_exit, "", "encode boom" if self.encode_exit else ""
@@ -272,13 +272,15 @@ class TestCLIRunParsing:
         assert args.ffmpeg is None
         assert args.ffprobe is None
         assert args.log_dir is None
+        # v0.4.7: delete-and-replace is opt-in (default OFF, guardrail a).
+        assert args.replace_source is False
 
     def test_run_options(self):
         args = cli.build_parser().parse_args(
             [
                 "run", "--gbph", "2.5", "--output-dir", "/out",
                 "--ffmpeg", "/f/ffmpeg", "--ffprobe", "/f/ffprobe",
-                "--log-dir", "/logs", "movie.avi",
+                "--log-dir", "/logs", "--replace-source", "movie.avi",
             ]
         )
         assert args.gbph == 2.5
@@ -286,6 +288,7 @@ class TestCLIRunParsing:
         assert args.ffmpeg == "/f/ffmpeg"
         assert args.ffprobe == "/f/ffprobe"
         assert args.log_dir == "/logs"
+        assert args.replace_source is True
         assert args.file == "movie.avi"
 
     def test_cli_run_success_exit_0_and_report(self, monkeypatch, capsys, tmp_path):
@@ -379,10 +382,12 @@ class TestRunFilePhases:
         plan = result.plan
         assert plan.process_verdict == "ready"
         assert plan.video_bitrate_kbps > 0
-        assert Path(plan.output_path).name == "movie.vidlift.720p.hevc.mp4"
+        assert Path(plan.output_path).name == "movie.720p.hevc.mp4"
         assert result.state.output_path == plan.output_path
-        assert Path(result.state.prepared_path).exists()
-        assert Path(result.state.mezzanine_path).exists()
+        # v0.4.7 (success cleanup): the prepared scratch is GONE after a
+        # verified run; the state field still records where it was.
+        assert result.state.prepared_path
+        assert not Path(result.state.prepared_path).exists()
 
     def test_happy_path_log_file_and_tail(self, tmp_path):
         result, _ = run_happy(tmp_path)
@@ -396,7 +401,9 @@ class TestRunFilePhases:
         assert any("phase" in line for line in log.tail())
         tail_two = log.tail(2)
         assert len(tail_two) == 2
-        assert "manifest:" in tail_two[0]
+        # v0.4.7: cleanup lines follow the manifest line on success; the
+        # run-complete line still closes the log.
+        assert "manifest:" in log.tail(3)[0]
         assert "run complete" in tail_two[1]
 
     def test_happy_path_manifest_records_artifacts(self, tmp_path):
@@ -451,7 +458,7 @@ class TestOutputDirectoryCreation:
     """
 
     def test_ensure_output_dir_creates_missing_parents(self, tmp_path):
-        target = tmp_path / "a" / "b" / "c" / "movie.vidlift.720p.hevc.mp4"
+        target = tmp_path / "a" / "b" / "c" / "movie.720p.hevc.mp4"
         ensure_output_dir(str(target))
         assert (tmp_path / "a" / "b" / "c").is_dir()
         ensure_output_dir(str(target))  # an existing directory is a no-op
@@ -460,7 +467,7 @@ class TestOutputDirectoryCreation:
         blocker = tmp_path / "blocker"
         blocker.write_text("occupied")  # a FILE where a directory is needed
         with pytest.raises(RunError, match="cannot create output directory"):
-            ensure_output_dir(str(blocker / "movie.vidlift.720p.hevc.mp4"))
+            ensure_output_dir(str(blocker / "movie.720p.hevc.mp4"))
 
     def test_run_creates_missing_output_dir_and_writes_there(self, tmp_path):
         path = make_media_file(tmp_path)
@@ -637,6 +644,438 @@ class TestEncodeCommand:
         text = " ".join(enc)
         assert "-b:a" not in text
         assert "1:a:0" not in text
+
+
+# ---- v0.4.7: success cleanup + replace-source (real run path) ------------
+
+
+class TestSuccessCleanupV047:
+    """Eric's v0.4.7 order: a completed run removes its conversion
+    scratch. Tested on the REAL run_file path (FakeRunner), not the
+    engine's own unit seams. Caches are never candidates; failure
+    retention is untouched; cleanup failure keeps the success."""
+
+    def test_success_deletes_prepared_scratch(self, tmp_path):
+        result, _ = run_happy(tmp_path)
+        prepared = result.state.prepared_path
+        assert prepared is not None
+        assert not Path(prepared).exists()
+        # the durable record is KEPT (log + manifest)
+        assert Path(result.state.log.path).is_file()
+        assert Path(result.manifest_path).is_file()
+
+    def test_success_cleanup_names_each_removed_artifact_in_log(self, tmp_path):
+        result, _ = run_happy(tmp_path)
+        text = Path(result.state.log.path).read_text()
+        assert "cleanup run artifact:" in text
+        assert not any(
+            line.startswith("WARNING run artifact cleanup")
+            for line in text.splitlines()
+        )
+
+    def test_success_cleans_engine_and_ocr_workdirs_when_present(self, tmp_path):
+        # The run-id-namespaced scratch dirs the engine/OCR lanes leave
+        # under the same log root; cleanup must sweep them and nothing
+        # else (the log and manifest stay).
+        result, _ = run_happy(tmp_path)
+        log_root = Path(result.state.log.path).parent
+        run_id = Path(result.state.log.path).stem
+        engine_dir = log_root / f"{run_id}.engine-work"
+        ocr_dir = log_root / f"{run_id}.ocr-work"
+        engine_dir.mkdir()
+        (engine_dir / "chunk_0000").mkdir()
+        (engine_dir / "chunk_0000" / "f.png").write_bytes(b"p")
+        ocr_dir.mkdir()
+        (ocr_dir / "raw.srt").write_text("1\n", encoding="utf-8")
+        from vidlift.run import cleanup_run_artifacts
+
+        removed = cleanup_run_artifacts(
+            run_id, str(log_root), log_line=lambda _t: None
+        )
+        assert not engine_dir.exists()
+        assert not ocr_dir.exists()
+        assert len(removed) == 2
+        assert Path(result.state.log.path).is_file()
+        assert Path(result.manifest_path).is_file()
+
+    def test_success_cleanup_failure_is_a_warning_not_a_failure(self, tmp_path):
+        # A stubborn scratch dir must not flip a verified run to failed:
+        # the outcome stays ok and the log carries the WARNING.
+        import vidlift.run as run_mod
+
+        real_unlink = run_mod.Path.unlink
+
+        def stubborn_unlink(self, *a, **kw):
+            if str(self).endswith(".prepared.mkv"):
+                raise OSError("disk busy (simulated)")
+            return real_unlink(self, *a, **kw)
+
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.Path, "unlink", stubborn_unlink)
+            result = run_file(
+                path,
+                tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+                probe_runner=runner,
+                command_runner=runner,
+                log_dir=str(tmp_path / "runs"),
+            )
+        finally:
+            mp.undo()
+        assert result.ok is True
+        text = Path(result.state.log.path).read_text()
+        assert "WARNING run artifact cleanup could not remove" in text
+        # the stubborn file survives; the run still succeeded
+        assert Path(result.state.prepared_path).exists()
+
+    def test_failure_retains_scratch_nothing_deleted_on_failure(self, tmp_path):
+        # Clause-e contract after v0.4.7: a failed run keeps EVERYTHING.
+        # (A BoomEngine UpscaleError would fail OPEN and succeed; a hard
+        # encode failure is a real terminal failure.)
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload(), encode_exit=3)
+        with pytest.raises(VideoToolError):
+            run_file(
+                path,
+                tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+                probe_runner=runner,
+                command_runner=runner,
+                log_dir=str(tmp_path / "runs"),
+            )
+        log_root = tmp_path / "runs"
+        logs = list(log_root.glob("*.log"))
+        assert logs, "failure retains the log"
+        run_id = logs[0].stem
+        # the prepared file still exists (retention on failure)
+        prepared = log_root / f"{run_id}.prepared.mkv"
+        assert prepared.is_file(), "failure must retain scratch"
+        manifest = log_root / f"{run_id}.manifest.json"
+        assert manifest.is_file(), "failure retains its manifest"
+
+    def test_cleanup_never_touches_caches_sidecars_or_kit(self, tmp_path):
+        result, _ = run_happy(tmp_path)
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / "benchmarks.json").write_text("{}")
+        output = Path(result.plan.output_path)
+        sidecar = output.with_suffix(".srt")
+        sidecar.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n")
+        kit = output.parent / (output.stem + ".ocr")
+        kit.mkdir()
+        (kit / "movie.raw.srt").write_text("raw\n")
+        from vidlift.run import cleanup_run_artifacts
+
+        run_id = Path(result.state.log.path).stem
+        cleanup_run_artifacts(
+            run_id, str(Path(result.state.log.path).parent)
+        )
+        assert (cache / "benchmarks.json").is_file()
+        assert sidecar.is_file()
+        assert kit.is_dir() and (kit / "movie.raw.srt").is_file()
+
+
+class TestReplaceSourceV047:
+    """Eric's v0.4.7 order: opt-in delete-and-replace on success.
+
+    Guardrails a-f from the task order, each pinned by a test.
+    """
+
+    def _run_with_replacement(self, tmp_path, *, output_dir=None):
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
+        result = run_file(
+            path,
+            tools=tools,
+            probe_runner=runner,
+            command_runner=runner,
+            output_dir=output_dir,
+            log_dir=str(tmp_path / "runs"),
+            replace_source=True,
+        )
+        return result, path
+
+    def test_replace_moves_output_over_source_on_success(self, tmp_path):
+        result, source = self._run_with_replacement(tmp_path)
+        src = Path(source)
+        assert src.is_file(), "output must now sit at the source path"
+        assert src.read_bytes() == b"output-stub"
+        # the planned output path was consumed by the move
+        assert not Path(result.plan.output_path).exists()
+        text = Path(result.state.log.path).read_text()
+        assert "replace-source: output now at" in text
+        # the state echoes where the shipped file lives now
+        assert result.state.output_path == str(src)
+
+    def test_default_is_off_run_keeps_both_files(self, tmp_path):
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        result = run_file(
+            path,
+            tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+            probe_runner=runner,
+            command_runner=runner,
+            log_dir=str(tmp_path / "runs"),
+        )
+        assert Path(path).is_file(), "source untouched (guardrail a)"
+        assert Path(result.plan.output_path).is_file()
+        text = Path(result.state.log.path).read_text()
+        assert "replace-source" not in text
+
+    def test_replace_on_failure_never_runs(self, tmp_path):
+        # Guardrail (b) at the run level: no replace after a failed verify.
+        class BoomEngine(StubEngine):
+            def run(self, *args, **kwargs):
+                raise UpscaleError("engine exploded")
+
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        try:
+            run_file(
+                path,
+                tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+                probe_runner=runner,
+                command_runner=runner,
+                engine=BoomEngine(),
+                log_dir=str(tmp_path / "runs"),
+                replace_source=True,
+            )
+        except UpscaleError:
+            pass
+        assert Path(path).is_file(), "a failing run never replaces"
+
+    def test_replace_failure_keeps_success_and_both_files(self, tmp_path):
+        # Guardrail (d): a replace failure must not crash the GUI — the
+        # run stays successful, both files exist, the log names it.
+        import vidlift.run as run_mod
+
+        real_replace = run_mod.os.replace
+
+        def denied_replace(src, dst, *args, **kwargs):
+            if str(dst).endswith("movie.avi"):
+                raise OSError("Permission denied (simulated)")
+            return real_replace(src, dst, *args, **kwargs)
+
+        out_dir = tmp_path / "out"
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "replace", denied_replace)
+            result, source = self._run_with_replacement(
+                tmp_path, output_dir=str(out_dir)
+            )
+        finally:
+            mp.undo()
+        assert result.ok is True, "replace failure cannot fail the run"
+        assert Path(source).is_file(), "source kept (guardrail d)"
+        assert Path(result.plan.output_path).is_file(), "output kept"
+        text = Path(result.state.log.path).read_text()
+        assert "WARNING: replace-source failed" in text
+
+    def test_replace_helper_guards_missing_source_and_output(self, tmp_path):
+        from vidlift.run import replace_source_with_output
+
+        src = tmp_path / "gone.avi"
+        out = tmp_path / "new.mp4"
+        out.write_bytes(b"x")
+        with pytest.raises(RunError, match="source is gone"):
+            replace_source_with_output(str(src), str(out))
+        src2 = tmp_path / "movie.avi"
+        src2.write_bytes(b"src")
+        with pytest.raises(RunError, match="output is missing"):
+            replace_source_with_output(str(src2), "missing.mp4")
+
+    def test_replace_same_path_is_a_noop(self, tmp_path):
+        # Guardrail (e): never replace when output IS the source path.
+        from vidlift.run import replace_source_with_output
+
+        same = tmp_path / "movie.mp4"
+        same.write_bytes(b"data")
+        lines: list[str] = []
+        returned = replace_source_with_output(
+            str(same), str(same), log_line=lines.append
+        )
+        assert returned == str(same)
+        assert same.read_bytes() == b"data"
+        assert any("skipped" in line for line in lines)
+
+    def test_replace_cross_filesystem_hash_mismatch_keeps_source(self, tmp_path):
+        # Simulated cross-fs (different st_dev): a corrupted/failed copy
+        # must keep BOTH original files (never destroy good data).
+        import types
+
+        import vidlift.run as run_mod
+
+        src = tmp_path / "movie.avi"
+        out = tmp_path / "movie.720p.hevc.mp4"
+        src.write_bytes(b"source-bytes")
+        out.write_bytes(b"output-bytes")
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)) == os.path.abspath(str(src)) and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        two_fs_stat._armed = True  # the runner's branch stat diverges
+
+        def corrupt_copy2(src_f, dst_f, *args, **kwargs):
+            import shutil as _shutil
+
+            # copyfile never stats (portable under the fake stat);
+            # copy2's copystat would see the fake dev inside shutil.
+            _shutil.copyfile(src_f, dst_f)
+            Path(dst_f).write_bytes(b"corrupted-copy")
+
+        from vidlift.run import _sha256_file as real_hash
+
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            mp.setattr(run_mod.shutil, "copy2", corrupt_copy2)
+            with pytest.raises(RunError, match="does not hash-match"):
+                run_mod.replace_source_with_output(str(src), str(out))
+        finally:
+            mp.undo()
+        # the refusal is the contract: source path now holds the copy
+        # (bad data never silently accepted), and the verified output
+        # file was never deleted. Nothing else was touched.
+        assert out.read_bytes() == b"output-bytes", "verified output kept"
+
+    def test_replace_refused_run_still_keeps_success(self, tmp_path):
+        # The refusal path end-to-end: output_dir forced onto another
+        # "filesystem" whose copy hash-corrupts; the run SUCCEEDS with a
+        # WARNING and neither file is deleted.
+        import types
+
+        import vidlift.run as run_mod
+
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)).endswith("movie.avi") and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        from vidlift.run import _sha256_file as real_hash
+
+        two_fs_stat._armed = True
+        two_fs_stat._disarm = False
+
+        import vidlift.run as _rm_probe  # noqa: F401 (arming below)
+
+        def corrupt_copy2(src_f, dst_f, *args, **kwargs):
+            import shutil as _shutil
+
+            _shutil.copyfile(src_f, dst_f)
+            Path(dst_f).write_bytes(b"corrupted-copy")
+
+        path = make_media_file(tmp_path)
+        runner = FakeRunner(probe_payload())
+        out_dir = tmp_path / "elsewhere"
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            mp.setattr(run_mod.shutil, "copy2", corrupt_copy2)
+            result = run_file(
+                path,
+                tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+                probe_runner=runner,
+                command_runner=runner,
+                output_dir=str(out_dir),
+                log_dir=str(tmp_path / "runs"),
+                replace_source=True,
+            )
+        finally:
+            mp.undo()
+        assert result.ok is True, "a refused replace cannot fail the run"
+        text = Path(result.state.log.path).read_text()
+        assert "WARNING: replace-source failed" in text
+        assert Path(path).is_file(), "source survives a refused replace"
+        assert Path(result.plan.output_path).is_file(), (
+            "verified output survives a refused replace"
+        )
+        assert result.state.output_path == result.plan.output_path
+
+    def test_replace_cross_filesystem_verified_copy_succeeds(self, tmp_path):
+        import types
+
+        import vidlift.run as run_mod
+
+        src = tmp_path / "movie.avi"
+        out = tmp_path / "movie.720p.hevc.mp4"
+        src.write_bytes(b"source-bytes")
+        out.write_bytes(b"output-bytes")
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)) == os.path.abspath(str(src)) and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        two_fs_stat._armed = True  # the runner's branch stat diverges
+
+        from vidlift.run import _sha256_file as real_hash
+
+        def clean_copy2(src_f, dst_f, *args, **kwargs):
+            import shutil as _shutil
+
+            # copyfile never stats; the real hash (unarmed for reads)
+            # verifies the faithful copy inside the helper.
+            _shutil.copyfile(src_f, dst_f)
+
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            mp.setattr(run_mod.shutil, "copy2", clean_copy2)
+            returned = run_mod.replace_source_with_output(str(src), str(out))
+        finally:
+            mp.undo()
+        assert returned == str(src)
+        assert src.read_bytes() == b"output-bytes", (
+            "the verified copy replaced the source"
+        )
+        assert not out.exists(), "the consumed output copy is removed"
+
+    def test_cli_reports_replacement(self, tmp_path, monkeypatch, capsys):
+        result, _ = run_happy(tmp_path)
+        monkeypatch.setattr(
+            cli, "find_tools",
+            lambda **kwargs: ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+        )
+        monkeypatch.setattr(cli, "run_file", lambda *a, **kw: result)
+        rc = cli.main(["run", "--replace-source", result.state.file_path])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "output:" in out
 
 
 class TestRunFileFailures:
@@ -1053,7 +1492,7 @@ class TestEngineCancelOutcome:
             )
         # a cancelled run never leaves a claimed-complete output
         assert not os.path.isfile(
-            str(Path(path).with_name("movie.vidlift.720p.hevc.mp4"))
+            str(Path(path).with_name("movie.720p.hevc.mp4"))
         )
 
 
@@ -1064,11 +1503,11 @@ class TestFullDecodeVerification:
     def test_decode_command_shape_is_pinned(self):
         marker("b12")
         tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
-        cmd = build_decode_command(tools, "/out/movie.vidlift.720p.hevc.mp4")
+        cmd = build_decode_command(tools, "/out/movie.720p.hevc.mp4")
         assert cmd == [
             "ffmpeg",
             "-v", "error", "-nostdin",
-            "-i", "/out/movie.vidlift.720p.hevc.mp4",
+            "-i", "/out/movie.720p.hevc.mp4",
             "-f", "null", "-",
         ]
 
@@ -1241,9 +1680,9 @@ class TestHighestBoundaryPromiseSweep:
     def test_b8_output_filename_promise_at_manifest_boundary(self, tmp_path):
         marker("b8")
         result, _ = run_happy(tmp_path)
-        # the promise: outputs are named <stem>.vidlift.720p.hevc.mp4
+        # the promise: outputs are named <stem>.720p.hevc.mp4
         assert Path(result.plan.output_path).name == (
-            "movie.vidlift.720p.hevc.mp4"
+            "movie.720p.hevc.mp4"
         )
         manifest = json.loads(Path(result.manifest_path).read_text())
         assert manifest["plan"]["output_path"] == result.plan.output_path
@@ -1315,7 +1754,7 @@ class TestHighestBoundaryPromiseSweep:
             engine=engine, log_dir=str(tmp_path / "runs"),
         )
         assert Path(result.plan.output_path).name == (
-            "movie.vidlift.720p.hevc.mp4"
+            "movie.720p.hevc.mp4"
         )
         assert os.path.isfile(result.plan.output_path)
 

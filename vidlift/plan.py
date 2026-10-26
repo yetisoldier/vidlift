@@ -146,7 +146,7 @@ def _audio_plan(report: FileReport) -> AudioPlan:
 def _expected_output_path(input_path: str, output_dir: str | None) -> str:
     source = Path(input_path)
     directory = Path(output_dir) if output_dir else source.parent
-    return str(directory / f"{source.stem}.vidlift.720p.hevc.mp4")
+    return str(directory / f"{source.stem}.720p.hevc.mp4")
 
 
 def _expectation(report: FileReport) -> str:

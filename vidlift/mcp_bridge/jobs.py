@@ -208,6 +208,7 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
             cancel=cancel,
             state_box=state_box,
             subtitle_ocr=bool(options.get("subtitle_ocr", True)),
+            replace_source=bool(options.get("replace_source", False)),
         )
     except EngineCancelled as exc:
         state = getattr(exc, "state", None)

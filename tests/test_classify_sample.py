@@ -341,7 +341,7 @@ class RunnerWithIdet:
         if args and str(args[-1]).endswith(".prepared.mkv"):
             Path(args[-1]).write_bytes(b"prepared-stub")
             return 0, "", ""
-        if args and str(args[-1]).endswith(".vidlift.720p.hevc.mp4"):
+        if args and str(args[-1]).endswith(".720p.hevc.mp4"):
             Path(args[-1]).write_bytes(b"output-stub")
             return 0, "", ""
         if args and args[-1] == "-" and "null" in args:

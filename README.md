@@ -57,7 +57,8 @@ subtitle OCR should run, and select **Plan Batch**.
 ![VidLift home screen](docs/images/vidlift-home.png)
 
 The plan shows which files are ready, source type, output geometry, exact
-output filename, estimated size, subtitle handling, and warnings. Select a row
+output filename (`<source-name>.720p.hevc.mp4` beside the source unless an
+output folder was chosen), estimated size, subtitle handling, and warnings. Select a row
 to see an output preview covering the destination, HEVC video, AAC audio,
 subtitles, and estimated size.
 

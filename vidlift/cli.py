@@ -204,6 +204,7 @@ def _cmd_run(
     engine: str,
     realesrgan: str | None,
     realesrgan_models: str | None,
+    replace_source: bool = False,
 ) -> int:
     """Drive one file through the runner and print its state.
 
@@ -226,6 +227,7 @@ def _cmd_run(
             engine_request=engine,
             realesrgan=realesrgan,
             realesrgan_models=realesrgan_models,
+            replace_source=replace_source,
         )
     except (ProbeError, PlanError, RunError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -259,6 +261,15 @@ def _cmd_run(
         )
     if state.engine_note:
         print(f"engine note: {state.engine_note}")
+    # v0.4.7: when delete-and-replace shipped, the printed output path is
+    # the SOURCE's old location, not the plan's output path.
+    if (
+        replace_source
+        and result.verification.ok
+        and os.path.normcase(os.path.abspath(state.file_path))
+        != os.path.normcase(os.path.abspath(result.plan.output_path))
+    ):
+        print(f"source replaced: now {state.file_path}")
     # v0.4.1: the subtitle outcome, honestly — carried/ocr/none/failed-open
     subs = state.subtitles
     if subs is not None:
@@ -433,6 +444,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory for run logs/manifests (default: INPUT_DIR/.vidlift-runs)",
     )
     run_parser.add_argument(
+        "--replace-source",
+        action="store_true",
+        help=(
+            "after a verified upscale, delete the source video and move the "
+            "MP4 into its place (IRREVERSIBLE: the original SD encode is "
+            "destroyed; default: keep both files)"
+        ),
+    )
+    run_parser.add_argument(
         "--engine",
         choices=["auto", "stub", "ncnn"],
         default="auto",
@@ -527,6 +547,7 @@ def main(argv: list[str] | None = None) -> int:
             engine=args.engine,
             realesrgan=args.realesrgan,
             realesrgan_models=args.realesrgan_models,
+            replace_source=args.replace_source,
         )
     if args.command == "benchmark":
         return _cmd_benchmark(

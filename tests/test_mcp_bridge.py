@@ -142,7 +142,7 @@ class BridgeRunner:
         if args and str(args[-1]).endswith(".slice.prepared.mkv"):
             Path(args[-1]).write_bytes(b"slice-stub")
             return 0, "", ""
-        if args and str(args[-1]).endswith(".vidlift.720p.hevc.mp4"):
+        if args and str(args[-1]).endswith(".720p.hevc.mp4"):
             Path(args[-1]).write_bytes(b"output-stub")
             return 0, "", ""
         if args and args[-1] == "-" and "null" in args:
@@ -292,6 +292,85 @@ def test_t2_probe_and_plan_equal_pipeline_output_field_by_field(tmp_path):
     assert bridge_plan["estimated_output_bytes"] == plan.estimated_output_bytes
     # the summary's honesty list is present and non-empty (clause c)
     assert plan_payload["summary"]["cannot_know"], "cannot_know must be non-empty"
+
+
+# ---- v0.4.7: replace-source through the bridge options surface ---------
+
+
+def test_v047_replace_source_option_reaches_the_runner(tmp_path, monkeypatch):
+    marker("v0.4.7-replace-source")
+    server, runner = make_server(tmp_path)
+    captured: dict = {}
+
+    def fake_run_file(path, **kwargs):
+        captured.update(kwargs)
+
+        class _Result:
+            ok = True
+
+        return _Result()
+
+    import vidlift.run as run_mod
+    monkeypatch.setattr(run_mod, "run_file", fake_run_file)
+    path = make_media_file(tmp_path)
+    _result, error, payload = call(
+        server,
+        "run",
+        {
+            "paths": [path],
+            "options": {"replace_source": True},
+        },
+    )
+    assert error is None
+    job_id = payload["jobs"][0]["job_id"]
+    deadline = time.time() + 5
+    while not captured and time.time() < deadline:
+        time.sleep(0.02)
+    assert captured.get("replace_source") is True
+    wait_for_state(server, job_id, {"succeeded", "failed"})
+
+
+def test_v047_replace_source_default_is_off(tmp_path, monkeypatch):
+    marker("v0.4.7-replace-source-default")
+    server, runner = make_server(tmp_path)
+    captured: dict = {}
+
+    def fake_run_file(path, **kwargs):
+        captured.update(kwargs)
+
+        class _Result:
+            ok = True
+
+        return _Result()
+
+    import vidlift.run as run_mod
+    monkeypatch.setattr(run_mod, "run_file", fake_run_file)
+    path = make_media_file(tmp_path)
+    _result, error, payload = call(server, "run", {"paths": [path]})
+    assert error is None
+    job_id = payload["jobs"][0]["job_id"]
+    deadline = time.time() + 5
+    while not captured and time.time() < deadline:
+        time.sleep(0.02)
+    assert captured.get("replace_source") is False
+    wait_for_state(server, job_id, {"succeeded", "failed"})
+
+
+def test_v047_replace_source_wrong_type_is_rejected(tmp_path):
+    marker("v0.4.7-replace-source-type")
+    server, runner = make_server(tmp_path)
+    path = make_media_file(tmp_path)
+    result, _error, payload = call(
+        server,
+        "run",
+        {
+            "paths": [path],
+            "options": {"replace_source": "yes"},
+        },
+    )
+    assert result["isError"] is True
+    assert payload["code"] == "invalid_input"
+    assert "replace_source" in payload["message"]
 
 
 # ---- t3: async run lifecycle ------------------------------------------------------

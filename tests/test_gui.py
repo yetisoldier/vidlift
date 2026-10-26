@@ -284,7 +284,7 @@ def test_detail_text_previews_output_contents_and_ocr_choice():
     text = detail_text(plan, subtitle_ocr_enabled=False)
     assert "OUTPUT PREVIEW" in text
     assert "Destination:" in text
-    assert "movie.vidlift.720p.hevc.mp4" in text
+    assert "movie.720p.hevc.mp4" in text
     assert "Video: HEVC MP4" in text
     assert "Audio: AAC" in text
 

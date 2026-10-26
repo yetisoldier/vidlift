@@ -97,7 +97,7 @@ def test_output_geometry_preserves_four_three_shape():
 def test_file_plan_names_output_and_estimates_size():
     plan = build_file_plan(report_for(path="/media/Movie.avi"), gb_per_hour=1.5)
     assert plan.process_verdict == "ready"
-    assert plan.output_path == "/media/Movie.vidlift.720p.hevc.mp4"
+    assert plan.output_path == "/media/Movie.720p.hevc.mp4"
     assert plan.estimated_output_bytes == 2_250_000_000
     assert plan.audio.label == "stereo"
     assert "mov_text" in plan.subtitle_note
@@ -107,7 +107,7 @@ def test_file_plan_uses_output_dir():
     plan = build_file_plan(
         report_for(path="/media/Movie.avi"), output_dir="/output"
     )
-    assert plan.output_path == "/output/Movie.vidlift.720p.hevc.mp4"
+    assert plan.output_path == "/output/Movie.720p.hevc.mp4"
 
 
 def test_hd_file_is_planned_as_skip_verdict_not_ready():

@@ -46,6 +46,9 @@ _OPTIONS_RUN = {
     "ffmpeg": {"type": ["string", "null"]},
     "ffprobe": {"type": ["string", "null"]},
     "log_dir": {"type": ["string", "null"]},
+    # v0.4.7: opt-in delete-and-replace (design guardrail a: default OFF;
+    # the runner only ever replaces AFTER verify_output passes).
+    "replace_source": {"type": "boolean"},
 }
 
 # The binding tool surface (mcp-bridge.md Section 4, verbatim shapes).
