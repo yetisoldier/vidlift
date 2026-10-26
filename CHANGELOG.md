@@ -2,6 +2,60 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.7] - 2026-10-26
+
+Three Eric-ordered irritant fixes after the smooth v0.4.6 ship:
+output naming, success cleanup, and opt-in replace-source.
+
+### Changed
+
+- **Output filename drops the `vidlift.` infix.** Planned outputs are
+  now `<source-stem>.720p.hevc.mp4` (was `...vidlift.720p.hevc.mp4`),
+  beside the source unless `--output-dir` is set. All pinned tests and
+  the docs smoke command updated; README now states the naming
+  explicitly (v0.4.7 naming decision: the extension chain already says
+  "vidlift enough").
+
+### Added
+
+- **Success cleanup ("when a run is completed successfully we need to
+  ensure the files used for the conversion are properly removed").**
+  After `verify_output` passes, `run_file` removes the run's scratch
+  under the log root: `<run-id>.prepared.mkv`,
+  `<run-id>.engine-work/`, `<run-id>.ocr-work/` — by exact run-id
+  namespace, never globbing, so a concurrent run under the same log
+  root cannot lose its own artifacts (`run.py::cleanup_run_artifacts`,
+  wired only on the verified-success path). Retention contracts are
+  untouched: the run log and manifest are the durable record and stay;
+  nothing is deleted on a failed or cancelled run (clause-e engine
+  retention intact); caches are NOT temp — benchmark caches under
+  `~/.vidlift` stay; sidecar `.srt` files and the `.ocr/` diagnosis
+  kit live beside the OUTPUT and stay. Cleanup failures log a WARNING
+  and keep the success — cleanup is best-effort, never a new failure
+  mode.
+- **Opt-in delete-and-replace of the source** ("I want an option to
+  have it delete and replace the source file when the upscale is
+  complete"). `replace_source` is strictly opt-in, default OFF:
+  after a verified run, the source video is deleted and the verified
+  output moves into the source's original path — media library
+  replaces its file in place, same name, new pixels. Guardrails: the
+  replace only runs AFTER `verify_output` passed; never when the
+  output already IS the source path (no-op); same-filesystem moves
+  are one atomic `os.replace`; cross-filesystem goes copy-first with
+  a SHA-256 verify before the original output copy is removed (a
+  hash mismatch keeps both originals — a verified copy never
+  destroys the only good data); ANY replace failure (source vanished,
+  permission, cross-fs copy error) logs `WARNING: replace-source
+  failed; keeping both files` and leaves the verified run untouched —
+  it can never crash the GUI or fail the job.
+  Surfaces: `run_file(replace_source=...)`, CLI `--replace-source`
+  (the run report gains a `source replaced:` line stating the file's
+  new location), GUI checkbox "Replace original on success (deletes
+  the source video)" with the honest irreversible-warning tooltip
+  (persisted via QSettings key `replace_source`), and the MCP bridge
+  `run` options object gains boolean `replace_source` (schema
+  validated; absent reads as False).
+
 ## [0.4.6] - 2026-10-20
 
 Read-only HTTP status API (binding design:
