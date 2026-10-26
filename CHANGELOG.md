@@ -2,7 +2,67 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
-## [0.4.7] - 2026-10-26
+## [0.4.8] - 2026-10-26
+
+The anime upscale profile (`realesr-animevideov3-x2`) for DVD-era
+cartoon rips — the seam deliberately deferred at v0.4.0, now landed
+per the binding design `docs/designs/v0.4.8-anime-upscale-profile.md`
+(Bob, approved by Eric 2026-10-26).
+
+### Added
+
+- **The "anime" upscale profile on all four surfaces** (all manual,
+  all defaulting to "live-action"):
+  - CLI: `vidlift run --upscale-profile {live-action,anime}`.
+  - GUI: an "Upscale profile" combo on the control strip
+    ("Live action (general x2plus)" / "Anime / cartoons
+    (animevideov3-x2)"), persisted under QSettings key
+    `upscale_profile` and disabled while a batch runs.
+  - Python API: `run_file(..., profile="anime")` (additive keyword;
+    the default behavior is unchanged).
+  - MCP bridge: `run` options gained `upscale_profile` (string;
+    absent → "live-action"; an unknown value fails the job naming
+    the profile, the same shape as an unknown `engine`).
+  - No auto-detection, by design (D3): every anime run is the user's
+    stated intent; VidLift never guesses content type.
+- **The model, vendored and hash-pinned like x2plus** (D1):
+  `packaging/models/realesr-animevideov3-x2.{param,bin}` (3,173 B /
+  1,247,368 B — a 1.25 MB lane next to x2plus's 33 MB), pinned in
+  `MODEL_ARTIFACTS` and verified at first use per profile. Native-2x
+  behavior verified 2026-10-26 against the actual released engine
+  binary (64x64 → exactly 128x128; 65x47 → exactly 130x94). The
+  Windows installer workflow copies the pair, asserts both sha256
+  digests at build time, and validates both files in the installed
+  payload.
+- **Honest expectation note for anime runs** (D6): when the anime
+  profile is selected, the CLI run-report and the GUI detail pane
+  append "Anime upscaling model: strong fit for flat fills and line
+  art (common in cel animation); not for live-action content." after
+  the plan's own expectation — plan expectations themselves are
+  unchanged (the profile is a run knob, not a plan knob).
+- **Validation surface (Karen's gate list, b13-b22):** registry + hash
+  pinning + plumb-through tests for every surface, the GUI
+  no-overlap geometry assertion for the new combo, the MCP schema
+  static check, the workflow hash-assert static check, the
+  v0.4.7 cleanup contract pinned under the anime profile, and a
+  real-content gate fixture:
+  `tests/fixtures/media/fixture-cartoon.vob` — a 4 s, 640x480 4:3
+  MPEG-2 (q:v 6) VOB cut from Fleischer's *Superman: The Mechanical
+  Monsters* (1941), public domain (US non-renewal; the Internet
+  Archive copy carries a CC0 dedication) — see
+  `tests/fixtures/media/LICENSE.md`. Suite: 458 tests.
+
+### Changed
+
+- **GUI layout detail:** the remote-monitor checkbox's grid span
+  narrowed from (2, 0, 1, 7) to (2, 0, 1, 5) to free the row-2 cells
+  the profile combo occupies (columns 5-6); `cancel_button` stays
+  untouched at (1, 7), pinned by the same no-overlap geometry test
+  pattern as v0.4.7's fix.
+
+### Fixed
+
+- None.
 
 Three Eric-ordered irritant fixes after the smooth v0.4.6 ship:
 output naming, success cleanup, and opt-in replace-source.
