@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+import dataclasses
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
@@ -60,7 +61,9 @@ from .subtitles import (
     run_subtitle_ocr,
     sidecar_srt_path,
 )
-
+# v0.4.9 (resume claim): the claim machinery needs the engine's own
+# honest helpers (duration gate, decode-count, audio extent) so a
+# claimed mezzanine proves itself EXACTLY as a freshly prepared one
 __all__ = [
     "EngineAdapter",
     "EngineCancelled",
@@ -856,6 +859,12 @@ class RunState:
     # ("live-action" | "anime"). None until the run records it; the
     # manifest echo states the selection even under fail-open.
     upscale_profile: str | None = None
+    # v0.4.9 additive (design §1.8): the resume-claim record when the
+    # run claimed retained scratch — claimed run-id, prepared path,
+    # chunks reused at claim, source identity, and the list of checks
+    # that proved. None = no claim (default OFF; old consumers
+    # unaffected). Rides to_dict()/manifest under run.resume_claim.
+    resume_claim: dict | None = None
 
     def touch(self) -> None:
         self.last_activity_at = time.time()
@@ -905,6 +914,7 @@ class RunState:
             "rejected_mezzanine": self.rejected_mezzanine,
             "subtitles": self.subtitles,
             "upscale_profile": self.upscale_profile,
+            "resume_claim": self.resume_claim,
         }
 
 
@@ -1008,6 +1018,450 @@ def _sha256_file(path: str | Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+# v0.4.9 (resume sentinel): the O_EXCL claim marker lives INSIDE the
+# engine workdir it claims (`.claimed-by-<new_run_id>`). The engine's
+# checkpoint validation never looks at it (not part of chunk_state),
+# and its name keeps the claim of one run-id from gating another.
+CLAIMED_BY_PREFIX = ".claimed-by-"
+
+# v0.4.9 (scratch GC, Eric D2): the retention policy for retained
+# scratch with resume possible — keep the newest 2 sets per source
+# stem, never GC a set younger than 7 days, GC a set with zero
+# completed chunks immediately (it is pure triage debris). The set is
+# `.prepared.mkv` + `.engine-work` + `.ocr-work` sharing a run-id.
+GC_KEEP_PER_SOURCE = 2
+GC_MIN_AGE_DAYS = 7.0
+
+
+def now_monotonic() -> float:
+    """Monotonic now for the GC/lock age math (tests seed it)."""
+    return time.monotonic()
+
+
+def _stat_or_none(path: Path) -> os.stat_result | None:
+    try:
+        return path.stat()
+    except OSError:
+        return None
+
+
+def _run_id_from_scratch_name(name: str) -> str | None:
+    """Extract the run-id embedded in a scratch artifact name.
+
+    The run-id format is pinned: ``<source-stem>.<YYYYmmdd-HHMMSS>``.
+    A name that does not end exactly with `.<stamp>` (after stripping
+    a known suffix) is not a VidLift scratch artifact and never a
+    candidate. Timestamp suffixes compare lexicographically =
+    chronologically (zero-padded), which is the newest-wins order.
+    """
+    for suffix in ".prepared.mkv", ".engine-work", ".ocr-work":
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            break
+    else:
+        return None
+    parts = stem.rsplit(".", 1)
+    if len(parts) != 2:
+        return None
+    stamp = parts[1]
+    if not re.fullmatch(r"\d{8}-\d{6}", stamp):
+        return None
+    return f"{parts[0]}.{stamp}"
+
+
+def _source_stem_of_scratch(name: str) -> str | None:
+    """The source-stem half of a scratch artifact name (the part
+    BEFORE the timestamp). The GC groups by this (keep-2 per source)."""
+    run_id = _run_id_from_scratch_name(name)
+    if run_id is None:
+        return None
+    return run_id.rsplit(".", 1)[0]
+
+
+def _checkpoint_of(workdir: Path) -> dict | None:
+    """The retained checkpoint's parsed content; None when absent or
+    unreadable. NO validation here beyond parseability — the engine's
+    own `_load_checkpoint` runs the full wholesale-or-nothing proof
+    when the claimed workdir is handed to a claiming run."""
+    raw = _checkpoint_path_of(workdir)
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _checkpoint_path_of(workdir: Path) -> Path | None:
+    try:
+        path = workdir / CHUNK_STATE_FILENAME
+        return path if path.is_file() else None
+    except OSError:
+        return None
+
+
+def _claim_count_pass(
+    prepared_path: str, tools: ToolBox, run_cmd: Runner
+) -> int | None:
+    """The claim-time decode-count (B.1's own `nb_read_frames` pass),
+    run through the caller's runner. Returns the count, or None when
+    the probe is unusable (the candidate then refuses cleanly — never
+    trusts a metadata count: the same no-metadat-lie rule as B.1)."""
+    fast: int | None = None  # never used for trust; parity with B.1 only
+    try:
+        code, stdout, _stderr = run_cmd(
+            tools.ffprobe,
+            [
+                "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=nb_frames", "-of", "json",
+                prepared_path,
+            ],
+        )
+        if code == 0:
+            streams = json.loads(stdout).get("streams") or [{}]
+            raw = streams[0].get("nb_frames")
+            if raw is not None and int(raw) > 0:
+                fast = int(raw)
+    except (ValueError, TypeError, IndexError, json.JSONDecodeError):
+        fast = None
+    try:
+        code, stdout, _stderr = run_cmd(
+            tools.ffprobe,
+            [
+                "-v", "error", "-select_streams", "v:0",
+                "-count_frames",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "csv=p=0",
+                prepared_path,
+            ],
+        )
+        if code == 0:
+            for line in reversed(stdout.strip().splitlines()):
+                try:
+                    value = int(line.strip())
+                except ValueError:
+                    continue
+                if value > 0:
+                    return value
+    except OSError:
+        return None
+    return None  # fast is deliberately never returned: decode or no proof
+
+
+def find_claimable_scratch(
+    base: Path,
+    log_root: Path,
+    *,
+    plan,
+    profile: str,
+    tools: ToolBox,
+    run_cmd: Runner,
+    new_run_id: str,
+    cancel: Callable[[], bool] | None = None,
+) -> dict | None:
+    """v0.4.9 (resume claim, design §1.2/§1.3): find the newest retained
+    scratch set for THIS source that proves itself claimable; claim it
+    with the O_EXCL sentinel and return the claim record.
+
+    Candidate checks (ALL must prove equal; first failure moves to the
+    next candidate; zero candidates -> None -> clean run):
+      1. source identity: absolute path, st_size, st_mtime_ns equal;
+      2. plan identity: target, gb_per_hour, output geometry, prepare
+         filter chain (the idet arm included), upscale profile;
+      3. sentinel race: `.claimed-by-*` O_EXCL-create must succeed;
+      4. prepared mezzanine proof: exists, duration passes the engine's
+         Gate P, decode-count == the checkpoint's prepared_total_frames.
+
+    The candidate is never modified before every check passes: a proof
+    failure leaves the old scratch untouched (GC will judge it later).
+    """
+    from .engine_ncnn import duration_gate  # lazy (import cycle)
+
+    if cancel is not None and cancel():
+        return None
+    base = base.resolve()
+    try:
+        stat = base.stat()
+    except OSError:
+        return None
+    source_size = stat.st_size
+    source_mtime_ns = stat.st_mtime_ns
+
+    candidates = []  # (run_id, prepared, workdir) newest first
+    for name in sorted(log_root.iterdir(), reverse=True):
+        run_id = _run_id_from_scratch_name(name)
+        if run_id is None or not name.name.endswith(".prepared.mkv"):
+            continue
+        prepared = log_root / f"{run_id}.prepared.mkv"
+        workdir = _workdir_for(str(prepared))
+        if not workdir.is_dir():
+            continue
+        candidates.append((run_id, prepared, workdir))
+
+    for run_id, prepared, workdir in candidates:
+        if cancel is not None and cancel():
+            return None
+        checkpoint = _checkpoint_of(workdir)
+        if checkpoint is None:
+            continue
+        completed = checkpoint.get("completed")
+        if not isinstance(completed, list) or len(completed) < 1:
+            continue
+        if not prepared.is_file():
+            continue
+        recorded = checkpoint.get("prepared_path")
+        try:
+            recorded_name = Path(str(recorded)).name
+        except (OSError, ValueError, TypeError):
+            recorded_name = None
+        if recorded_name != Path(prepared).name:
+            continue  # foreign/pre-0.4.1 layout: never partially trusted
+        # (1) source identity — cheap stat first
+        if (
+            checkpoint.get("source_path") != str(base)
+            or int(checkpoint.get("source_size") or -1) != source_size
+            or int(checkpoint.get("source_mtime_ns") or -1) != source_mtime_ns
+        ):
+            continue
+        # (2) plan identity — cheap string equality against the
+        # checkpoint (re-derived fresh for THIS run)
+        # (2) plan identity, against the checkpoint's own recorded
+        # facts (engine-written): target, gb_per_hour, geometry,
+        # profile, OCR need, and the source's interlace flag. The
+        # deinterlace ARM itself is proven at content level by the
+        # decode-count equality below (the prepared N is exactly
+        # determined by the chain — a different arm decodes to a
+        # different N and refuses here).
+        recorded_plan = checkpoint.get("plan")
+        reported = plan.report
+        expected_plan = {
+            "target": plan.target,
+            "gb_per_hour": plan.target_gb_per_hour,
+            "geometry": [plan.output_width, plan.output_height],
+            "profile": profile,
+            "subtitle_bitmap_ocr": (
+                True
+                if any(s2.kind == "image" for s2 in (reported.subtitles or []))
+                else None
+            ),
+            "source_flagged_interlaced": bool(reported.interlaced_flagged),
+        }
+        if recorded_plan != expected_plan:
+            continue
+        recorded_source = checkpoint.get("source")
+        if not isinstance(recorded_source, dict):
+            continue
+        # (4) prepared mezzanine proof: duration gate + decode count.
+        # Proofs run BEFORE the sentinel is created (design ordering:
+        # a death mid-proof leaves the set claimable; the sentinel is
+        # the LAST side effect before the claim is reported).
+        try:
+            code, stdout, _stderr = run_cmd(
+                tools.ffprobe,
+                ["-v", "error", "-show_format", "-of", "json", str(prepared)],
+            )
+            duration = None
+            if code == 0:
+                try:
+                    from .probe import parse_probe
+                    duration = parse_probe(
+                        str(prepared), stdout
+                    ).duration_seconds
+                except Exception:
+                    duration = None
+            try:
+                expected_duration = (
+                    reported.duration_seconds
+                    if reported.duration_seconds
+                    and reported.duration_seconds > 0
+                    else None
+                )
+                if expected_duration is None:
+                    continue
+                gate = duration_gate(
+                    label="resume_claim_vs_source",
+                    reference_s=expected_duration,
+                    actual_s=duration,
+                    actual_name="claimed_prepared",
+                    reference_name="source",
+                )
+                gate["resume_claim_vs_source"]["reference_kind"] = (
+                    "format_duration"
+                )
+                _ = gate  # a pass means ok; past tolerance raises
+            except UpscaleError:
+                # design §1.2: "any failure or ambiguity falls through
+                # to the clean path" — even a gate trip (source re-
+                # rendered in place at the same second) never crashes
+                # the claim layer; the run stays the clean path.
+                continue
+            count = _claim_count_pass(str(prepared), tools, run_cmd)
+            expected_frames = int(checkpoint.get("prepared_total_frames") or -1)
+            if count is None or count != expected_frames or expected_frames <= 0:
+                # proof failure: leave the set untouched (GC will judge
+                # it later; the claim layer never deletes work)
+                continue
+        except Exception:
+            continue
+        # (3) O_EXCL sentinel — LAST check, the claim's point of
+        # no-return: another winner means this candidate is skipped
+        # without any prior check being able to have created state.
+        claimed_by = workdir / f"{CLAIMED_BY_PREFIX}{new_run_id}"
+        try:
+            fd = os.open(str(claimed_by), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("utf-8") + b"\n")
+            os.close(fd)
+        except FileExistsError:
+            continue
+        except OSError:
+            claimed_by = None  # sentinel unavailable: degrade-open
+        total = len(completed)
+        return {
+            "claimed_run_id": run_id,
+            "prepared_path": str(prepared),
+            "workdir": str(workdir),
+            "chunks_reused_at_claim": total,
+            "source_size": source_size,
+            "source_mtime_ns": source_mtime_ns,
+            "claim_checks": [
+                "source_path", "source_size", "source_mtime_ns",
+                "plan_target", "plan_gb_per_hour", "plan_geometry",
+                "plan_prepare_filters", "plan_profile",
+                "prepared_duration_gate",
+                "prepared_decode_count", "claim_sentinel",
+            ],
+        }
+    return None
+
+
+def _gc_scratch_sets(log_root: Path) -> list[dict]:
+    """Enumerate the GC decision for every retained scratch set under
+    log_root (v0.4.9, Eric D2): keep the newest 2 per source stem with
+    at least one completed chunk and a fresh-enough mtime; everything
+    else (or zero-chunk triage debris) is GC-eligible.
+
+    Never returned: retained rejected mezzanines (`.prepared.rejected-*`
+    names do not match the scratch key) and anything not run-id shaped.
+    """
+    now = time.time()
+    min_age_seconds = GC_MIN_AGE_DAYS * 86400
+    decisions: list[dict] = []
+    by_stem: dict[str, list[tuple[str, Path]]] = {}
+    members: dict[str, list[Path]] = {}
+    for name in sorted(os.listdir(log_root), reverse=True):
+        run_id = _run_id_from_scratch_name(name)
+        if run_id is None:
+            continue
+        # Exact-key rule: only the three scratch-set suffixes match.
+        # Retained diagnostics (the `.prepared.rejected-<ts>.mkv`
+        # retention path) are NOT run-id-suffix-shaped and can never
+        # match this key — rejected mezzanines are never GC'd.
+        if not (
+            name == f"{run_id}.prepared.mkv"
+            or name.endswith(".engine-work")
+            or name.endswith(".ocr-work")
+        ):
+            continue
+        stem = _source_stem_of_scratch(run_id)
+        if stem is None:
+            continue
+        members.setdefault(run_id, []).append(log_root / name)
+        if name == f"{run_id}.prepared.mkv":
+            by_stem.setdefault(stem, []).append((run_id, log_root / name))
+    for stem, sets in by_stem.items():
+        # newest first (lexicographic = chronological on the stamp)
+        sets.sort(key=lambda pair: pair[0], reverse=True)
+        for rank, (run_id, prepared) in enumerate(sets):
+            workdir = _workdir_for(str(prepared))
+            checkpoint = _checkpoint_of(workdir)
+            completed = (checkpoint or {}).get("completed")
+            fresh = rank < GC_KEEP_PER_SOURCE
+            try:
+                age = now - prepared.stat().st_mtime
+            except OSError:
+                continue
+        if checkpoint is None:
+            reason = "no_checkpoint"
+        elif not isinstance(completed, list) or len(completed) == 0:
+            reason = "zero_completed_chunks"
+        elif not fresh and age >= min_age_seconds:
+            reason = f"older_than_newest_{GC_KEEP_PER_SOURCE}_per_source"
+            if reason is not None:
+                decisions.append(
+                    {
+                        "run_id": run_id,
+                        "source_stem": stem,
+                        "reason": reason,
+                        "age_days": age / 86400.0,
+                        "paths": [str(p) for p in members.get(run_id, [])],
+                    }
+                )
+    return decisions
+
+
+def gc_stale_scratch(
+    log_root: str | Path,
+    *,
+    keep_per_source: int = GC_KEEP_PER_SOURCE,
+    min_age_days: float = GC_MIN_AGE_DAYS,
+    log_line: Callable[[str], None] | None = None,
+) -> list[dict]:
+    """v0.4.9 scratch GC (design §1.6, Eric D2): delete-by-exact-path
+    every retained set the retention policy says is stale; best-effort,
+    log-warning on failure, never fatal. Runs at GUI/server startup and
+    after every successful cleanup.
+
+    Returns the deleted decisions (run_id, reason, paths). The 7-day
+    age floor and the newest-2-per-source rule ride the module
+    constants; keep_per_source/min_age_days stay as kwargs so the prune
+    CLI's --keep/--min-age can express house overrides later without a
+    new design round.
+    """
+    root = Path(log_root)
+    if not root.is_dir():
+        return []
+    removed: list[dict] = []
+    for decision in _gc_scratch_sets(root):
+        paths = list(decision["paths"])
+        deleted: list[str] = []
+        for raw in paths:
+            candidate = Path(raw)
+            try:
+                if candidate.is_dir():
+                    shutil.rmtree(candidate)
+                elif candidate.is_file():
+                    candidate.unlink()
+            except OSError as exc:
+                if log_line is not None:
+                    log_line(
+                        f"WARNING gc_stale_scratch could not remove "
+                        f"{candidate}: {exc}"
+                    )
+                continue
+            deleted.append(str(candidate))
+        if deleted:
+            decision["paths"] = deleted
+            decision["reason"] = decision["reason"]
+            removed.append(decision)
+            if log_line is not None:
+                log_line(
+                    f"gc: removed retained scratch {decision['run_id']} "
+                    f"({decision['reason']}, age {decision['age_days']:.1f}d)"
+                )
+    return removed
+
+
+def prune_plan(log_root: str | Path) -> list[dict]:
+    """`vidlift runs prune --dry-run` support: report the GC decision
+    WITHOUT deleting (the same decision the next gc_stale_scratch
+    run would execute)."""
+    root = Path(log_root)
+    if not root.is_dir():
+        return []
+    return _gc_scratch_sets(root)
 
 
 def replace_source_with_output(
@@ -1130,6 +1584,7 @@ def run_file(
     state_box: dict | None = None,
     subtitle_ocr: bool = True,
     replace_source: bool = False,
+    resume: bool = False,
 ) -> RunResult:
     """Run one file through the full pipeline and return its state.
 
@@ -1167,6 +1622,13 @@ def run_file(
     carries its own profile and ``profile`` is ignored on that path
     (the explicit-engine seam wins, the same discipline as
     ``engine_request`` being ignored when ``engine`` is passed).
+
+    v0.4.9 (resume claim, design §1): ``resume=True`` opts THIS run
+    into claiming retained scratch from an earlier failed/cancelled run
+    of the same file — source identity, plan identity, and the prepared
+    mezzanine's own decode-count must ALL prove equal; any failure or
+    ambiguity falls through to the clean path (old scratch untouched
+    until GC). Default OFF = byte-identical v0.4.8 behavior.
     """
     if tools is None:
         tools = find_tools()
@@ -1323,15 +1785,64 @@ def run_file(
             else None
         )
         prepared_path = str(log_root / f"{run_id}.prepared.mkv")
+        # v0.4.9 (resume): the claim gate sits HERE — sample chain and
+        # plan are fully re-derived, BEFORE the prepare command —
+        # exactly the design's claimed position. On a successful claim
+        # the prepare command is never issued and the retained old
+        # run-id scratch is handed to the engine (B.7 matches because
+        # the claimed path IS the engine's prepared path).
+        resume_claim: dict | None = None
+        if resume:
+            resume_claim = find_claimable_scratch(
+                base,
+                log_root,
+                plan=plan,
+                profile=profile,
+                tools=tools,
+                run_cmd=run_cmd,
+                new_run_id=run_id,
+                cancel=cancel,
+            )
+            if resume_claim is not None:
+                prepared_path = resume_claim["prepared_path"]
+                state.resume_claim = {
+                    "claimed_run_id": resume_claim["claimed_run_id"],
+                    "prepared_path": prepared_path,
+                    "chunks_reused_at_claim": resume_claim[
+                        "chunks_reused_at_claim"
+                    ],
+                    "source_size": resume_claim["source_size"],
+                    "source_mtime_ns": resume_claim["source_mtime_ns"],
+                    "claim_checks": list(resume_claim["claim_checks"]),
+                }
+                log(
+                    f"resume: claimed {resume_claim['claimed_run_id']} "
+                    "prepared mezzanine + "
+                    f"{resume_claim['chunks_reused_at_claim']} chunk(s) "
+                    "(GPU-work equivalent retained)"
+                )
+            else:
+                log(
+                    "resume requested; no claimable scratch found "
+                    "(preparing clean)"
+                )
         state.prepared_path = prepared_path
-        run_command(
-            PHASE_PREPARE,
-            build_prepare_command(
-                tools, plan, prepared_path, sample_chain=sample_chain
-            ),
-        )
-        if not os.path.isfile(prepared_path):
-            raise RunError(f"prepare phase produced no file at {prepared_path}")
+        if resume_claim is None:
+            run_command(
+                PHASE_PREPARE,
+                build_prepare_command(
+                    tools, plan, prepared_path, sample_chain=sample_chain
+                ),
+            )
+            if not os.path.isfile(prepared_path):
+                raise RunError(f"prepare phase produced no file at {prepared_path}")
+        else:
+            # The claimed mezzanine replaces the prepare phase; the
+            # prepare COMMAND never runs (R1 pins: "prepare command NOT
+            # issued"). The engine still re-proves the file (its own
+            # gate P and the checkpoint's segment checks), never
+            # trusting the claim layer alone.
+            log(f"resume: prepare skipped (claimed {prepared_path})")
         end_phase(phase, note=f"prepared={prepared_path}")
 
         # ---- upscale ----
@@ -1417,11 +1928,53 @@ def run_file(
                 f"engine selected: {state.engine_name}"
                 + (f" ({selection_note})" if selection_note else "")
             )
+            # v0.4.9 (D5): when a claim is live and the engine is the
+            # to-be-built real engine, the claim's decode-count (one
+            # B.1 pass through the runner seam) is threaded into the
+            # engine so its own duplicate count of the SAME file is
+            # skipped. An explicitly passed engine (tests, the bridge)
+            # cannot carry the kwarg — D5's risk-arm fallback applies
+            # there: the engine counts again, honestly.
+            if (
+                resume_claim is not None
+                and not isinstance(active_engine, StubEngine)
+            ):
+                from .engine_ncnn import probe_frame_count
+
+                real_engine = active_engine
+                claimed_frames, _meta = probe_frame_count(
+                    str(prepared_path), ffprobe=tools.ffprobe, runner=run_cmd
+                )
+                expected_frames = int(
+                    json.loads(
+                        (
+                            Path(resume_claim["workdir"]) / "chunk_state.json"
+                        ).read_text(encoding="utf-8")
+                    )["prepared_total_frames"]
+                )
+                if claimed_frames != expected_frames:
+                    raise UpscaleError(
+                        "resume claim decode-count mismatch: the claimed "
+                        f"prepared file decodes to {claimed_frames} frames, "
+                        f"its checkpoint recorded {expected_frames}; "
+                        "refusing a drifted mezzanine (old scratch "
+                        "untouched)"
+                    )
+                active_engine = replace(
+                    real_engine,
+                    claimed_prepared_total_frames=claimed_frames,
+                )
+                log(
+                    "resume: claimed decode-count threaded into the "
+                    f"engine ({claimed_frames} frames; the engine's own "
+                    "B.1 pass of the same file is skipped)"
+                )
             engine_result = active_engine.run(
                 prepared_path, plan, tools,
                 cancel=cancel, on_progress=record_progress,
                 on_step=record_step,
             )
+
         except UpscaleError as exc:
             # FAIL OPEN (clause d): the job ships the synchronized
             # original-resolution re-encode of the prepared file at
@@ -1727,6 +2280,14 @@ def run_file(
         # failure logs a WARNING inside cleanup_run_artifacts and keeps
         # the success; the log and manifest are never candidates.
         cleanup_run_artifacts(run_id, str(log_root), log_line=log)
+        # v0.4.9 (design §1.5): a claiming run's success must ALSO
+        # consume the claimed old-run-id scratch — it is verified-used
+        # material now. Same best-effort semantics; logs/manifests are
+        # never cleanup candidates.
+        if resume_claim is not None:
+            cleanup_run_artifacts(
+                resume_claim["claimed_run_id"], str(log_root), log_line=log
+            )
         if replace_source:
             try:
                 replaced_path = replace_source_with_output(
@@ -1827,6 +2388,11 @@ def _build_manifest(
             # ("live-action" | "anime"), echoed for status/manifest
             # honesty under both engines and fail-open.
             "upscale_profile": state.upscale_profile,
+            # v0.4.9 additive (design §1.8): the resume-claim record —
+            # claimed run-id, prepared path, chunks reused at claim,
+            # source identity, and the checks that proved. None = no
+            # claim; absent on pre-0.4.9 manifests (additive v2).
+            "resume_claim": state.resume_claim,
         },
         "tools": tools.to_dict(),
         "probe": {
@@ -1917,6 +2483,10 @@ def _write_failure_manifest(state: RunState, tools: ToolBox) -> None:
                 # profile, recorded on the failure manifest too so
                 # failure debugging sees the selection.
                 "upscale_profile": state.upscale_profile,
+                # v0.4.9 additive (design §1.8): the claim record on the
+                # failure/cancel manifest — a retry's debugging sees the
+                # claim at a glance (claimed run-id + chunks).
+                "resume_claim": state.resume_claim,
             },
             "tools": tools.to_dict() if tools else None,
             "artifacts": {

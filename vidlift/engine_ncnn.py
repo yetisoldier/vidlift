@@ -85,6 +85,7 @@ from .run import (
     EngineResult,
     MissingToolError,
     ToolBox,
+    UPSCALE_STEP_PREPARED_COUNT,
     UpscaleError,
 )
 from .tools_realesrgan import (
@@ -1051,12 +1052,20 @@ class NcnnVulkanEngine(EngineAdapter):
         on_progress: Callable[[int, int], None] | None = None,
         on_step: Callable[[str], None] | None = None,
         popen_factory=subprocess.Popen,
+        claimed_prepared_total_frames: int | None = None,
     ) -> None:
         spec = MODEL_TABLE.get(profile)
         if spec is None:
             raise UpscaleError(f"unknown engine profile: {profile}")
         self.profile = profile
         self.spec = spec
+        # v0.4.9 (D5, dataclass-replace threading): when the runner
+        # claims retained scratch, it hands the claim's decode-count of
+        # the SAME file to the engine, and B.1 (below) SKIPS its
+        # duplicate count. None (the default and every v0.4.8 call
+        # shape) = count exactly as before — the engine always
+        # re-proves a mezzanine nobody vouched for.
+        self.claimed_prepared_total_frames = claimed_prepared_total_frames
         self._binary = binary
         self._models_dir = models_dir
         self._artifacts = artifacts  # fixture table for tests; None = pinned
@@ -1174,12 +1183,36 @@ class NcnnVulkanEngine(EngineAdapter):
         # B.1: the authoritative decode-counted total, BEFORE any GPU
         # work. The step label keeps the state observably alive through
         # a minutes-long FFV1 decode-count (B.6).
-        self._step("prepared-count-probe")
-        prepared_total_frames, frames_from_metadata = (
-            self._probe_frame_count_alive(
-                str(prepared_path), tools=tools, label="prepared-count-probe"
+        #
+        # v0.4.9 (D5): a CLAIMED run re-proved this exact file at claim
+        # time with the same `nb_read_frames` pass AND pinned the count
+        # to the retained checkpoint's total in the same breath — the
+        # runner re-checks the equality before the engine even runs
+        # (run.py's claim arm). Skipped here: the duplicate pass of an
+        # already-proven file. The skip is recorded (diagnostic + log:
+        # "from resume claim") so the manifest never poses a vouched
+        # count as freshly measured. Every v0.4.8 call shape
+        # (claimed_prepared_total_frames=None) counts exactly as before.
+        claim_prepared_frames = self.claimed_prepared_total_frames
+        if claim_prepared_frames is not None:
+            prepared_total_frames = int(claim_prepared_frames)
+            frames_from_metadata = False
+            diagnostic["prepared_total_frames_from_resume_claim"] = (
+                prepared_total_frames
             )
-        )
+            self._log(
+                "prepared-count-probe: skipped (from resume claim: "
+                f"{prepared_total_frames} frames, decode-counted at "
+                "claim time)"
+            )
+        else:
+            self._step(UPSCALE_STEP_PREPARED_COUNT)
+            prepared_total_frames, frames_from_metadata = (
+                self._probe_frame_count_alive(
+                    str(prepared_path), tools=tools,
+                    label=UPSCALE_STEP_PREPARED_COUNT,
+                )
+            )
 
         # B.2 denominator: the shipped audio's measured extent, probed
         # on the SOURCE file's a:0 — the exact stream the encode maps
@@ -1223,6 +1256,12 @@ class NcnnVulkanEngine(EngineAdapter):
             "prepared_path": str(prepared_path),
             "prepared_total_frames": prepared_total_frames,
             "frame_count_from_metadata": frames_from_metadata,
+            # v0.4.9 (D5): present when the count came from a resume
+            # claim instead of this invocation's B.1 pass — the manifest
+            # never poses a vouched count as freshly measured.
+            "prepared_total_frames_from_resume_claim": (
+                self.claimed_prepared_total_frames
+            ),
             "audio_extent_s": stamp["audio_extent_s"],
             "audio_source": stamp["audio_source"],
             "derived_rate_raw": stamp["derived_raw"],
@@ -1235,6 +1274,11 @@ class NcnnVulkanEngine(EngineAdapter):
                 float(stamp["audio_extent_s"])
             ),
         }
+
+        # v0.4.9 (D5): when the count came from a resume claim, drop
+        # the diagnostic's None (absent = no claim; readers unaffected).
+        if self.claimed_prepared_total_frames is None:
+            diagnostic.pop("prepared_total_frames_from_resume_claim", None)
 
         gates = dict(gate_p)
         frame_gates: dict | None = None
@@ -1250,6 +1294,7 @@ class NcnnVulkanEngine(EngineAdapter):
                 models_dir=models_dir,
                 workdir=workdir,
                 output=output,
+                plan=plan,
                 cancel=cancel,
             )
             diagnostic.update(chunk_context)
@@ -1633,6 +1678,7 @@ class NcnnVulkanEngine(EngineAdapter):
         models_dir: str,
         workdir: Path,
         output: Path,
+        plan: PlannedFile,
         cancel=None,
     ) -> tuple[int, dict, dict]:
         """Extract -> engine -> reassemble per chunk; concat; returns
@@ -1882,6 +1928,7 @@ class NcnnVulkanEngine(EngineAdapter):
                             f"({frames_done}/{total_frames} frames "
                             "upscaled so far)"
                         )
+                    _source_st = _source_stat(plan.report.path)
                     self._write_checkpoint(
                         workdir=workdir,
                         prepared_path=str(prepared_path),
@@ -1893,6 +1940,42 @@ class NcnnVulkanEngine(EngineAdapter):
                         completed=sorted(
                             completed_records, key=lambda r: r["idx"]
                         ),
+                        # v0.4.9 (additive §1.8): content identity rides
+                        # every checkpoint save so a LATER run can prove
+                        # claimability (design §1.2). The deinterlace ARM
+                        # is proven at CONTENT level (the prepared total
+                        # frame count is exactly determined by the chain:
+                        # bwdif doubles the rate, IVTC decimates,
+                        # progressive does not — a wrong arm decodes to a
+                        # different N and the claim's count-equality proof
+                        # refuses), so the recorded facts are the ones
+                        # THIS engine derives truthfully from the plan.
+                        source_facts={
+                            "path": str(Path(plan.report.path).absolute()),
+                            "size": _source_st["size"],
+                            "mtime_ns": _source_st["mtime_ns"],
+                            "duration_s": plan.report.duration_seconds,
+                        },
+                        plan_facts={
+                            "target": plan.target,
+                            "gb_per_hour": plan.target_gb_per_hour,
+                            "geometry": [
+                                plan.output_width,
+                                plan.output_height,
+                            ],
+                            "profile": self.profile,
+                            "subtitle_bitmap_ocr": (
+                                True
+                                if any(
+                                    sub.kind == "image"
+                                    for sub in (plan.report.subtitles or [])
+                                )
+                                else None
+                            ),
+                            "source_flagged_interlaced": bool(
+                                plan.report.interlaced_flagged
+                            ),
+                        },
                     )
                     # v0.4.5 reassembly step rides the seam right ABOVE;
                     # this on_progress call is unchanged B.3 discipline.
@@ -1972,12 +2055,24 @@ class NcnnVulkanEngine(EngineAdapter):
         chunk_frames: int,
         params: dict,
         completed: list[dict],
+        plan_facts: dict | None = None,
+        source_facts: dict | None = None,
     ) -> None:
         """B.7: write ``chunk_state.json`` atomically (temp + replace,
         fsynced) after each completed chunk. The GPU hours live in the
         chunk engine processes; this file is what a retried run
         inherits. Best-effort: a checkpoint that cannot be written
-        costs resume, never the run."""
+        costs resume, never the run.
+
+        v0.4.9 (design §1.8, additive): ``source_facts``/``plan_facts``
+        record the run's content identity (source path/size/mtime + the
+        prepare chain; profile; OCR need) so a LATER run can prove
+        claimability without re-preparing. Written on EVERY checkpoint
+        save (cheap dict dumps, always current); pre-0.4.9 checkpoints
+        simply lack the blocks, and the claim layer only claims
+        checkpoints that carry them (everything else keeps the v0.4.8
+        path-equality behavior bit for bit).
+        """
         state = {
             "stamp_fps": stamp_token,
             "prepared_path": prepared_path,
@@ -1986,6 +2081,10 @@ class NcnnVulkanEngine(EngineAdapter):
             "completed": completed,
             "params": params,
         }
+        if plan_facts is not None:
+            state["plan"] = plan_facts
+        if source_facts is not None:
+            state["source"] = source_facts
         path = workdir / CHUNK_STATE_FILENAME
         try:
             fd, tmp_name = tempfile.mkstemp(
@@ -2045,6 +2144,33 @@ class NcnnVulkanEngine(EngineAdapter):
             or state.get("stamp_fps") != stamp_token
             or state.get("params") != params
         )
+        # v0.4.9 (design §1.3): the PREPARED-PATH check alone becomes
+        # tolerant of a different absolute location for the same
+        # validated identity (the claim arm: a checkpoint written on
+        # another mount — e.g. J:\ run from a Windows path — is
+        # re-proven content, not a foreign cache). EVERYTHING else in
+        # the checkpoint still validates exactly as before.
+        if state.get("prepared_path") is not None and prepared_path is not None:
+            path_equal = state.get("prepared_path") == prepared_path
+            identity_equal = (
+                Path(str(state.get("prepared_path"))).name
+                == Path(str(prepared_path)).name
+                and int(state.get("prepared_total_frames") or -1)
+                == prepared_total_frames
+            )
+        else:
+            path_equal = False
+            identity_equal = False
+        if (
+            int(state.get("prepared_total_frames") or -1)
+            != prepared_total_frames
+            or state.get("stamp_fps") != stamp_token
+            or state.get("params") != params
+            or not (path_equal or identity_equal)
+        ):
+            mismatch = True
+        else:
+            mismatch = False
         if mismatch:
             # stale cache by construction: delete wholesale, start clean
             shutil.rmtree(workdir, ignore_errors=True)
@@ -2081,6 +2207,19 @@ class NcnnVulkanEngine(EngineAdapter):
                 workdir.mkdir(parents=True, exist_ok=True)
                 return None
         return completed
+
+
+def _source_stat(path: str | Path) -> dict:
+    """Best-effort source-identity stat for the v0.4.9 checkpoint's
+    source block. A vanished source records explicit missing markers:
+    the checkpoint stays valid for the run in progress (B.7's trust is
+    unchanged), and a LATER run's claim check can never prove identity
+    against missing stat facts (None never equals a real size/mtime)."""
+    try:
+        st = os.stat(path)
+        return {"size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+    except OSError:
+        return {"size": None, "mtime_ns": None}
 
 
 def _workdir_for(prepared_path: str) -> Path:
