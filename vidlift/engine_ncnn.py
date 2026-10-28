@@ -2369,7 +2369,14 @@ class GpuPhaseLock:
                 and time.monotonic() - started >= deadline_seconds
             ):
                 return False
-            time.sleep(self.HEARTBEAT_SECONDS)
+            if deadline_seconds is None:
+                time.sleep(self.HEARTBEAT_SECONDS)
+            else:
+                # never overshoot a bounded wait by a full heartbeat
+                remaining = deadline_seconds - (
+                    time.monotonic() - started
+                )
+                time.sleep(max(0.0, min(self.HEARTBEAT_SECONDS, remaining)))
 
     def _read_holder_pid(self) -> int | None:
         try:

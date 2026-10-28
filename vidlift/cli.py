@@ -577,6 +577,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="remove stale retained scratch sets (newest-2 + 7-day floor)",
     )
     prune_parser.add_argument(
+        "file",
+        nargs="?",
+        default=None,
+        help="a media file whose SOURCE_DIR/.vidlift-runs is pruned",
+    )
+    prune_parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="the runs directory to prune (overrides the FILE form)",
+    )
+    prune_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="report what would be removed; delete nothing",
@@ -642,6 +653,12 @@ def main(argv: list[str] | None = None) -> int:
         if root is None:
             print(
                 "error: runs prune needs --log-dir (no FILE in this form)",
+                file=sys.stderr,
+            )
+            return 2
+        if not root.is_dir():
+            print(
+                f"error: not found: {root}",
                 file=sys.stderr,
             )
             return 2

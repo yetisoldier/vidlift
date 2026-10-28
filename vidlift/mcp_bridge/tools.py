@@ -421,6 +421,8 @@ def _activity_age_seconds(record) -> float | None:
     the persisted truth)."""
     if record.last_activity_at is None:
         return None
+    if getattr(record, "state", None) in ("succeeded", "failed", "cancelled"):
+        return None  # in-flight observability only; terminal rows are done
     return max(0.0, time.time() - float(record.last_activity_at))
 
 

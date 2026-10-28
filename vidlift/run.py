@@ -1071,13 +1071,13 @@ def _run_id_from_scratch_name(name: str) -> str | None:
     return f"{parts[0]}.{stamp}"
 
 
-def _source_stem_of_scratch(name: str) -> str | None:
-    """The source-stem half of a scratch artifact name (the part
-    BEFORE the timestamp). The GC groups by this (keep-2 per source)."""
-    run_id = _run_id_from_scratch_name(name)
-    if run_id is None:
+def _source_stem_of_scratch(run_id: str) -> str | None:
+    """The source-stem half of a RUN-ID (the part before the stamp).
+    The GC groups by this (keep-2 per source)."""
+    parts = run_id.rsplit(".", 1)
+    if len(parts) != 2:
         return None
-    return run_id.rsplit(".", 1)[0]
+    return parts[0]
 
 
 def _checkpoint_of(workdir: Path) -> dict | None:
@@ -1097,7 +1097,7 @@ def _checkpoint_of(workdir: Path) -> dict | None:
 
 def _checkpoint_path_of(workdir: Path) -> Path | None:
     try:
-        path = workdir / CHUNK_STATE_FILENAME
+        path = workdir / "chunk_state.json"
         return path if path.is_file() else None
     except OSError:
         return None
@@ -1178,7 +1178,10 @@ def find_claimable_scratch(
     The candidate is never modified before every check passes: a proof
     failure leaves the old scratch untouched (GC will judge it later).
     """
-    from .engine_ncnn import duration_gate  # lazy (import cycle)
+    from .engine_ncnn import (  # lazy (import cycle)
+        _workdir_for,
+        duration_gate,
+    )
 
     if cancel is not None and cancel():
         return None
@@ -1191,9 +1194,13 @@ def find_claimable_scratch(
     source_mtime_ns = stat.st_mtime_ns
 
     candidates = []  # (run_id, prepared, workdir) newest first
-    for name in sorted(log_root.iterdir(), reverse=True):
-        run_id = _run_id_from_scratch_name(name)
-        if run_id is None or not name.name.endswith(".prepared.mkv"):
+    try:
+        entries = sorted(log_root.iterdir(), reverse=True)
+    except OSError:
+        return None
+    for entry in entries:
+        run_id = _run_id_from_scratch_name(entry.name)
+        if run_id is None or not entry.name.endswith(".prepared.mkv"):
             continue
         prepared = log_root / f"{run_id}.prepared.mkv"
         workdir = _workdir_for(str(prepared))
@@ -1219,11 +1226,19 @@ def find_claimable_scratch(
             recorded_name = None
         if recorded_name != Path(prepared).name:
             continue  # foreign/pre-0.4.1 layout: never partially trusted
-        # (1) source identity — cheap stat first
+        # (1) source identity — cheap stat first. The checkpoint's
+        # source block (written by the engine, §1.8): path/size/mtime_ns.
+        recorded_source = checkpoint.get("source")
+        if not isinstance(recorded_source, dict):
+            continue  # pre-0.4.9 checkpoint (R10): no identity facts
+        recorded_size = recorded_source.get("size")
+        recorded_mtime = recorded_source.get("mtime_ns")
         if (
-            checkpoint.get("source_path") != str(base)
-            or int(checkpoint.get("source_size") or -1) != source_size
-            or int(checkpoint.get("source_mtime_ns") or -1) != source_mtime_ns
+            recorded_source.get("path") != str(base)
+            or not isinstance(recorded_size, int)
+            or not isinstance(recorded_mtime, int)
+            or recorded_size != source_size
+            or recorded_mtime != source_mtime_ns
         ):
             continue
         # (2) plan identity — cheap string equality against the
@@ -1250,9 +1265,6 @@ def find_claimable_scratch(
             "source_flagged_interlaced": bool(reported.interlaced_flagged),
         }
         if recorded_plan != expected_plan:
-            continue
-        recorded_source = checkpoint.get("source")
-        if not isinstance(recorded_source, dict):
             continue
         # (4) prepared mezzanine proof: duration gate + decode count.
         # Proofs run BEFORE the sentinel is created (design ordering:
@@ -1307,9 +1319,14 @@ def find_claimable_scratch(
         except Exception:
             continue
         # (3) O_EXCL sentinel — LAST check, the claim's point of
-        # no-return: another winner means this candidate is skipped
-        # without any prior check being able to have created state.
+        # no-return: claim markers for ANY other run exclude this
+        # candidate (design R9: `.claimed-by-*` present -> skipped).
         claimed_by = workdir / f"{CLAIMED_BY_PREFIX}{new_run_id}"
+        try:
+            if any(workdir.glob(f"{CLAIMED_BY_PREFIX}*")):
+                continue
+        except OSError:
+            continue
         try:
             fd = os.open(str(claimed_by), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, str(os.getpid()).encode("utf-8") + b"\n")
@@ -1371,6 +1388,8 @@ def _gc_scratch_sets(log_root: Path) -> list[dict]:
         members.setdefault(run_id, []).append(log_root / name)
         if name == f"{run_id}.prepared.mkv":
             by_stem.setdefault(stem, []).append((run_id, log_root / name))
+    from .engine_ncnn import _workdir_for  # lazy (import cycle)
+
     for stem, sets in by_stem.items():
         # newest first (lexicographic = chronological on the stamp)
         sets.sort(key=lambda pair: pair[0], reverse=True)
@@ -1383,12 +1402,13 @@ def _gc_scratch_sets(log_root: Path) -> list[dict]:
                 age = now - prepared.stat().st_mtime
             except OSError:
                 continue
-        if checkpoint is None:
-            reason = "no_checkpoint"
-        elif not isinstance(completed, list) or len(completed) == 0:
-            reason = "zero_completed_chunks"
-        elif not fresh and age >= min_age_seconds:
-            reason = f"older_than_newest_{GC_KEEP_PER_SOURCE}_per_source"
+            reason: str | None = None
+            if checkpoint is None:
+                reason = "no_checkpoint"
+            elif not isinstance(completed, list) or len(completed) == 0:
+                reason = "zero_completed_chunks"
+            elif not fresh and age >= min_age_seconds:
+                reason = f"older_than_newest_{GC_KEEP_PER_SOURCE}_per_source"
             if reason is not None:
                 decisions.append(
                     {
