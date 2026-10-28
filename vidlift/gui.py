@@ -155,6 +155,16 @@ def warnings_for(item: PlannedFile) -> list[str]:
     return warnings
 
 
+# v0.4.9 (design §2.3, Eric D4): the stale-activity warning threshold —
+# the GUI surfaces "running (no activity N min)" when the snapshot's
+# activity age exceeds this many seconds. Surface-only: never an
+# auto-cancel, never a kill (a wedged GPU process and a slow-but-healthy
+# chunk look identical from outside; the label says exactly what is
+# known). Slower GPUs may prefer 1800; the constant is the shipped
+# default.
+STALE_ACTIVITY_SECONDS = 900
+
+
 def detail_text(
     item: PlannedFile,
     *,
@@ -973,13 +983,21 @@ class MainWindow(QMainWindow):
             return
         row = rows[0].row()
         if 0 <= row < len(self.batch.files):
-            self.details.setPlainText(
-                detail_text(
-                    self.batch.files[row],
-                    subtitle_ocr_enabled=self.subtitle_ocr.isChecked(),
-                    upscale_profile=self.profile_choice,
-                )
+            text = detail_text(
+                self.batch.files[row],
+                subtitle_ocr_enabled=self.subtitle_ocr.isChecked(),
+                upscale_profile=self.profile_choice,
             )
+            # v0.4.9 (§1.4 D1): the discoverability note — when the
+            # planned source has retained scratch and Resume is OFF,
+            # the plan detail names it AT THE MOMENT IT MATTERS.
+            if not self.resume_claim.isChecked():
+                from .run import scratch_note_for_source
+
+                note = scratch_note_for_source(Path(self.batch.files[row].report.path))
+                if note:
+                    text = f"{text}\n\n{note}"
+            self.details.setPlainText(text)
 
     def _refresh_details(self) -> None:
         if self.batch is not None:
@@ -1114,7 +1132,28 @@ class MainWindow(QMainWindow):
             if row < self.file_table.rowCount():
                 status_cell = self.file_table.item(row, 0)
                 if status_cell is not None:
-                    status_cell.setText(state)
+                    # v0.4.9 (§2.3): a RUNNING row whose last activity is
+                    # older than the threshold renders the honest warning
+                    # (the same yellow family as `cancelled`; data, never
+                    # an action). BELOW the threshold the plain state —
+                    # byte-identical to v0.4.8.
+                    if state == "running":
+                        age = snapshot.get("activity_age_seconds")
+                        if (
+                            isinstance(age, (int, float))
+                            and age > STALE_ACTIVITY_SECONDS
+                        ):
+                            minutes = int(age // 60)
+                            status_cell.setText(
+                                f"running (no activity {minutes} min)"
+                            )
+                            status_cell.setForeground(
+                                Qt.GlobalColor.yellow
+                            )
+                        else:
+                            status_cell.setText(state)
+                    else:
+                        status_cell.setText(state)
             terminal = state in ("succeeded", "failed", "cancelled")
             if not terminal:
                 still_active.append(job_id)
@@ -1160,6 +1199,16 @@ class MainWindow(QMainWindow):
         if eta is not None:
             self._stage_eta = float(eta)
         progress = snapshot.get("progress") or {}
+        # v0.4.9 (progress mirror, design §2.1): the fallback arm —
+        # when the in-memory state_box is absent (reader process ≠
+        # writer process), the payload's progress falls back to the
+        # writer's PERSISTED progress_snapshot ("progress" is the
+        # mirror's payload key set by tools.py). The state-box arm is
+        # unchanged v0.4.8 rendering.
+        if not progress:
+            snapshot_progress = snapshot.get("progress")
+            if isinstance(snapshot_progress, dict):
+                progress = snapshot_progress
         frames_done = progress.get("frames_done")
         frames_total = progress.get("frames_total")
         # v0.4.5 (§3b/§3c, D-eta): the stage label's phase_note suffix
@@ -1167,6 +1216,17 @@ class MainWindow(QMainWindow):
         # _set_text, so identical values never repaint the label.
         note = progress.get("phase_note")
         rendered = f"{stage} ({note})" if note else stage
+        # v0.4.9 (§2.3): the stale-activity suffix rides the stage
+        # label (data-never-proof wording; the bar logic is untouched).
+        age = snapshot.get("activity_age_seconds")
+        if (
+            isinstance(age, (int, float))
+            and age > STALE_ACTIVITY_SECONDS
+            and snapshot.get("state") == "running"
+        ):
+            rendered = (
+                f"{rendered} — last activity {int(age // 60)} min ago"
+            )
         self._set_text(self.stage_label, rendered)
         if frames_total and frames_done is not None and frames_total > 0:
             self._stage_fraction = max(0.0, min(1.0, frames_done / frames_total))

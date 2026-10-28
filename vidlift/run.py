@@ -1464,6 +1464,42 @@ def prune_plan(log_root: str | Path) -> list[dict]:
     return _gc_scratch_sets(root)
 
 
+def scratch_note_for_source(path: str | Path) -> str | None:
+    """v0.4.9 (§1.4 D1): the plan-detail discoverability note — a
+    short human string when the source has retained scratch worth
+    claiming. None = nothing to name (the note is never rendered)."""
+    source = Path(path)
+    root = source.parent / ".vidlift-runs"
+    if not root.is_dir():
+        return None
+    stem = source.stem
+    candidates = []
+    try:
+        for entry in root.iterdir():
+            run_id = _run_id_from_scratch_name(entry.name)
+            if (
+                run_id is not None
+                and run_id.rsplit(".", 1)[0] == stem
+                and entry.name == f"{run_id}.prepared.mkv"
+                and entry.is_file()
+            ):
+                workdir = _workdir_for(str(entry))
+                checkpoint = _checkpoint_of(workdir)
+                completed = (checkpoint or {}).get("completed")
+                if isinstance(completed, list) and completed:
+                    candidates.append(run_id)
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    newest = max(candidates)
+    return (
+        "Retained partial work exists for this file "
+        f"({newest}; {len(candidates)} set(s) retained) — enable "
+        "Resume to claim it."
+    )
+
+
 def replace_source_with_output(
     source_path: str,
     output_path: str,

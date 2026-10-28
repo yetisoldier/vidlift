@@ -111,6 +111,35 @@ def _default_state_dir(explicit: str | Path | None) -> Path:
     return Path(explicit)
 
 
+def _scratch_roots_for_gc(registry) -> list[Path]:
+    """The distinct log roots referenced by the registry's job records
+    (v0.4.9 §1.6 startup GC): options["log_dir"] when a job set one,
+    else the recorded source's sibling .vidlift-runs. Best-effort
+    reads; missing paths are skipped by the GC itself."""
+    roots: list[Path] = []
+    seen: set[str] = set()
+    try:
+        records = list(registry.history())
+    except Exception:
+        return roots
+    for record in records:
+        try:
+            explicit = (record.options or {}).get("log_dir")
+            if explicit:
+                root = Path(str(explicit))
+            elif record.paths:
+                root = Path(record.paths[0]).parent / ".vidlift-runs"
+            else:
+                continue
+        except Exception:
+            continue
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            roots.append(root)
+    return roots
+
+
 def build_services(state_dir: str | Path | None = None) -> "BridgeServices":
     """The v0.4.4 unification factory (design §5): one construction
     path for the bridge's services object, used by BOTH the stdio MCP
@@ -132,6 +161,21 @@ def build_services(state_dir: str | Path | None = None) -> "BridgeServices":
     # jobs are corpses; they become failed with the binding restart
     # error, never silently succeeded. Identical for both consumers.
     registry.sweep_orphans()
+    # v0.4.9 (design §1.6): the scratch GC runs beside the restart
+    # sweep — retained scratch becomes durable state with resume
+    # shipped, and startup is where stale sets are judged and removed
+    # (best-effort, logged; never fatal to startup). The GC walks the
+    # log roots the REGISTRY's records reference (each job's
+    # options["log_dir"], else the source's .vidlift-runs).
+    from ..run import gc_stale_scratch
+
+    try:
+        for root in _scratch_roots_for_gc(registry):
+            gc_stale_scratch(root)
+    except Exception as exc:  # startup robustness: log and continue
+        print(
+            f"vidlift-registry: scratch GC skipped ({exc})", flush=True
+        )
     services = BridgeServices(registry=registry, state_dir=resolved)
     services.executor = JobExecutor(services)
     return services
