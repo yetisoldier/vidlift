@@ -400,6 +400,25 @@ class MainWindow(QMainWindow):
         )
         self.replace_source.toggled.connect(self._replace_source_changed)
 
+        # v0.4.9 (resume claim, design §1.4): opt-in claim of retained
+        # scratch from an earlier failed/cancelled run of the same file.
+        # Default OFF (the replace-source pattern); QSettings-persisted
+        # like every other GUI preference.
+        self.resume_claim = QCheckBox("Resume retained work")
+        self.resume_claim.setChecked(
+            self._settings().value("resume_claim", False, type=bool)
+        )
+        self.resume_claim.setToolTip(
+            "When a previous run of this same file was cancelled or failed, "
+            "claim its retained partial work (prepared mezzanine + completed "
+            "chunks) instead of starting over.\n\n"
+            "The retained work is used only when the source file, the "
+            "conversion plan, and the prepared content all prove identical "
+            "(a decode-count pass proves the content); otherwise the run "
+            "prepares fresh and the old scratch is left for cleanup."
+        )
+        self.resume_claim.toggled.connect(self._resume_claim_changed)
+
         # ---- engine combo (design §7): EXACT three adapters in tree ----
         self.engine_combo = QComboBox()
         for label, data in ENGINE_CHOICES:
@@ -590,6 +609,11 @@ class MainWindow(QMainWindow):
         the stored value changes here."""
         self._settings().setValue("replace_source", bool(checked))
 
+    def _resume_claim_changed(self, checked: bool) -> None:
+        """Persist the resume-claim preference (v0.4.9 §1.4, QSettings
+        house rule); only the stored value changes."""
+        self._settings().setValue("resume_claim", bool(checked))
+
     def _engine_changed(self, index: int) -> None:
         data = self.engine_combo.itemData(index)
         if data in ("auto", "stub", "ncnn"):
@@ -673,6 +697,10 @@ class MainWindow(QMainWindow):
         # column 7, where cancel_button sits; the checkbox label clipped
         # under the Cancel button.
         grid.addWidget(self.replace_source, 1, 5, 1, 2)
+        # v0.4.9 (design §1.4): the resume checkbox rides row 2 beside
+        # the profile combo (row 1 is full; the monitor span below
+        # already narrowed for exactly this reason).
+        grid.addWidget(self.resume_claim, 2, 1, 1, 2)
         # v0.4.8 (design D5): the profile combo lands on row 2 (the only
         # row 1 cells left are behind cancel_button at (1, 7)), so the
         # monitor span narrows 7 -> 5 columns to free (2, 5)/(2, 6).
@@ -983,6 +1011,9 @@ class MainWindow(QMainWindow):
             # run_file(profile=...) via the bridge's absent-defaults
             # rule (absent would read as "live-action" anyway).
             "upscale_profile": self.profile_choice,
+            # v0.4.9 (§1.4): rides into run_file(resume=...) through the
+            # bridge's absent-defaults rule (absent would read False).
+            "resume": self.resume_claim.isChecked(),
         }
         try:
             self.job_ids = self.client.enqueue_run(

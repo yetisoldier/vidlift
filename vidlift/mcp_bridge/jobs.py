@@ -213,6 +213,10 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
             # options["upscale_profile"] reads as "live-action", so
             # v0.4.7 callers are behavior-identical.
             profile=options.get("upscale_profile", "live-action"),
+            # v0.4.9 (design §1.4): the absent-defaults rule again — no
+            # options["resume"] reads as False, so v0.4.8 callers are
+            # behavior-identical (no claim attempt, clean prepare).
+            resume=bool(options.get("resume", False)),
         )
     except EngineCancelled as exc:
         state = getattr(exc, "state", None)
