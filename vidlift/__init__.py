@@ -6,4 +6,4 @@ consumes the validated bluray-to-mp4 upscale path (v0.3.0) and the
 decode-truth clock/frame-exact chunking port (v0.4.0).
 """
 
-__version__ = "0.4.8"
+__version__ = "0.4.9"

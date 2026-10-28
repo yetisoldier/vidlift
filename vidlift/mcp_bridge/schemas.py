@@ -58,6 +58,11 @@ _OPTIONS_RUN = {
     # reached; CLI/GUI refuse an unknown value outright instead).
     # Absent -> "live-action" (v0.4.7 behavior).
     "upscale_profile": {"type": "string"},
+    # v0.4.9 (design §1.4): opt-in claim of retained scratch from an
+    # earlier failed/cancelled run of the same file — source, plan, and
+    # prepared content must all prove equal; otherwise runs clean.
+    # Absent -> False (v0.4.8 behavior, the absent-defaults rule).
+    "resume": {"type": "boolean"},
 }
 
 # The binding tool surface (mcp-bridge.md Section 4, verbatim shapes).

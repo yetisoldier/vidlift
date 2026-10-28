@@ -85,6 +85,7 @@ from .run import (
     EngineResult,
     MissingToolError,
     ToolBox,
+    UPSCALE_STEP_PREPARED_COUNT,
     UpscaleError,
 )
 from .tools_realesrgan import (
@@ -1051,12 +1052,20 @@ class NcnnVulkanEngine(EngineAdapter):
         on_progress: Callable[[int, int], None] | None = None,
         on_step: Callable[[str], None] | None = None,
         popen_factory=subprocess.Popen,
+        claimed_prepared_total_frames: int | None = None,
     ) -> None:
         spec = MODEL_TABLE.get(profile)
         if spec is None:
             raise UpscaleError(f"unknown engine profile: {profile}")
         self.profile = profile
         self.spec = spec
+        # v0.4.9 (D5, dataclass-replace threading): when the runner
+        # claims retained scratch, it hands the claim's decode-count of
+        # the SAME file to the engine, and B.1 (below) SKIPS its
+        # duplicate count. None (the default and every v0.4.8 call
+        # shape) = count exactly as before — the engine always
+        # re-proves a mezzanine nobody vouched for.
+        self.claimed_prepared_total_frames = claimed_prepared_total_frames
         self._binary = binary
         self._models_dir = models_dir
         self._artifacts = artifacts  # fixture table for tests; None = pinned
@@ -1174,12 +1183,36 @@ class NcnnVulkanEngine(EngineAdapter):
         # B.1: the authoritative decode-counted total, BEFORE any GPU
         # work. The step label keeps the state observably alive through
         # a minutes-long FFV1 decode-count (B.6).
-        self._step("prepared-count-probe")
-        prepared_total_frames, frames_from_metadata = (
-            self._probe_frame_count_alive(
-                str(prepared_path), tools=tools, label="prepared-count-probe"
+        #
+        # v0.4.9 (D5): a CLAIMED run re-proved this exact file at claim
+        # time with the same `nb_read_frames` pass AND pinned the count
+        # to the retained checkpoint's total in the same breath — the
+        # runner re-checks the equality before the engine even runs
+        # (run.py's claim arm). Skipped here: the duplicate pass of an
+        # already-proven file. The skip is recorded (diagnostic + log:
+        # "from resume claim") so the manifest never poses a vouched
+        # count as freshly measured. Every v0.4.8 call shape
+        # (claimed_prepared_total_frames=None) counts exactly as before.
+        claim_prepared_frames = self.claimed_prepared_total_frames
+        if claim_prepared_frames is not None:
+            prepared_total_frames = int(claim_prepared_frames)
+            frames_from_metadata = False
+            diagnostic["prepared_total_frames_from_resume_claim"] = (
+                prepared_total_frames
             )
-        )
+            self._log(
+                "prepared-count-probe: skipped (from resume claim: "
+                f"{prepared_total_frames} frames, decode-counted at "
+                "claim time)"
+            )
+        else:
+            self._step(UPSCALE_STEP_PREPARED_COUNT)
+            prepared_total_frames, frames_from_metadata = (
+                self._probe_frame_count_alive(
+                    str(prepared_path), tools=tools,
+                    label=UPSCALE_STEP_PREPARED_COUNT,
+                )
+            )
 
         # B.2 denominator: the shipped audio's measured extent, probed
         # on the SOURCE file's a:0 — the exact stream the encode maps
@@ -1223,6 +1256,12 @@ class NcnnVulkanEngine(EngineAdapter):
             "prepared_path": str(prepared_path),
             "prepared_total_frames": prepared_total_frames,
             "frame_count_from_metadata": frames_from_metadata,
+            # v0.4.9 (D5): present when the count came from a resume
+            # claim instead of this invocation's B.1 pass — the manifest
+            # never poses a vouched count as freshly measured.
+            "prepared_total_frames_from_resume_claim": (
+                self.claimed_prepared_total_frames
+            ),
             "audio_extent_s": stamp["audio_extent_s"],
             "audio_source": stamp["audio_source"],
             "derived_rate_raw": stamp["derived_raw"],
@@ -1235,6 +1274,11 @@ class NcnnVulkanEngine(EngineAdapter):
                 float(stamp["audio_extent_s"])
             ),
         }
+
+        # v0.4.9 (D5): when the count came from a resume claim, drop
+        # the diagnostic's None (absent = no claim; readers unaffected).
+        if self.claimed_prepared_total_frames is None:
+            diagnostic.pop("prepared_total_frames_from_resume_claim", None)
 
         gates = dict(gate_p)
         frame_gates: dict | None = None
@@ -1250,6 +1294,7 @@ class NcnnVulkanEngine(EngineAdapter):
                 models_dir=models_dir,
                 workdir=workdir,
                 output=output,
+                plan=plan,
                 cancel=cancel,
             )
             diagnostic.update(chunk_context)
@@ -1633,6 +1678,7 @@ class NcnnVulkanEngine(EngineAdapter):
         models_dir: str,
         workdir: Path,
         output: Path,
+        plan: PlannedFile,
         cancel=None,
     ) -> tuple[int, dict, dict]:
         """Extract -> engine -> reassemble per chunk; concat; returns
@@ -1717,6 +1763,39 @@ class NcnnVulkanEngine(EngineAdapter):
         # frame counters ride the first on_progress below.
         if self.on_step is not None:
             self.on_step("chunk")
+
+        # v0.4.9 (design §2.2): the GPU-phase lock — acquired BEFORE the
+        # first chunk's extraction, held through the loop's concat +
+        # mezzanine existence gate (the lock's `with` below wraps the
+        # whole try), released in the finally. A second process's
+        # upscale WAITS here with a visible step label (surfaced through
+        # the progress mirror) instead of time-sharing the GPU. Probe/
+        # probe-count/prepare/encode stay outside this lock (CPU-only).
+        def _gpu_wait_label(holder_pid, held_seconds: float) -> None:
+            if self.on_step is not None:
+                self._step(
+                    "waiting for GPU — "
+                    f"held by pid {holder_pid if holder_pid else '?'} "
+                    f"for {held_seconds:.0f}s"
+                )
+
+        gpu_lock = _gpu_phase_lock()
+        lock_acquired = gpu_lock.acquire(on_wait=_gpu_wait_label)
+        if not lock_acquired:
+            # degrade-open (the design's honesty rule): the filesystem
+            # refused atomic create (or the deadline expired), so the
+            # run proceeds UNLOCKED with a logged WARNING — never a
+            # hang, never a silent loss of serialization.
+            self._log(
+                "WARNING: GPU phase lock unavailable on this filesystem; "
+                "continuing WITHOUT cross-process GPU serialization"
+            )
+        self._log(
+            f"GPU phase lock acquired: {gpu_lock.path}"
+            if lock_acquired
+            else "GPU phase lock NOT acquired (degrade-open)"
+        )
+        _ = gpu_lock  # release reference kept for the except arms below
         try:
             for idx in range(chunks):
                 if idx in completed:
@@ -1882,6 +1961,7 @@ class NcnnVulkanEngine(EngineAdapter):
                             f"({frames_done}/{total_frames} frames "
                             "upscaled so far)"
                         )
+                    _source_st = _source_stat(plan.report.path)
                     self._write_checkpoint(
                         workdir=workdir,
                         prepared_path=str(prepared_path),
@@ -1893,6 +1973,42 @@ class NcnnVulkanEngine(EngineAdapter):
                         completed=sorted(
                             completed_records, key=lambda r: r["idx"]
                         ),
+                        # v0.4.9 (additive §1.8): content identity rides
+                        # every checkpoint save so a LATER run can prove
+                        # claimability (design §1.2). The deinterlace ARM
+                        # is proven at CONTENT level (the prepared total
+                        # frame count is exactly determined by the chain:
+                        # bwdif doubles the rate, IVTC decimates,
+                        # progressive does not — a wrong arm decodes to a
+                        # different N and the claim's count-equality proof
+                        # refuses), so the recorded facts are the ones
+                        # THIS engine derives truthfully from the plan.
+                        source_facts={
+                            "path": str(Path(plan.report.path).absolute()),
+                            "size": _source_st["size"],
+                            "mtime_ns": _source_st["mtime_ns"],
+                            "duration_s": plan.report.duration_seconds,
+                        },
+                        plan_facts={
+                            "target": plan.target,
+                            "gb_per_hour": plan.target_gb_per_hour,
+                            "geometry": [
+                                plan.output_width,
+                                plan.output_height,
+                            ],
+                            "profile": self.profile,
+                            "subtitle_bitmap_ocr": (
+                                True
+                                if any(
+                                    sub.kind == "image"
+                                    for sub in (plan.report.subtitles or [])
+                                )
+                                else None
+                            ),
+                            "source_flagged_interlaced": bool(
+                                plan.report.interlaced_flagged
+                            ),
+                        },
                     )
                     # v0.4.5 reassembly step rides the seam right ABOVE;
                     # this on_progress call is unchanged B.3 discipline.
@@ -1939,6 +2055,9 @@ class NcnnVulkanEngine(EngineAdapter):
             if not output.is_file() or output.stat().st_size == 0:
                 raise UpscaleError("upscale mezzanine was not created")
         except EngineCancelled:
+            # v0.4.9 (T-gpu-2): the lock is released on the cancel path.
+            gpu_lock.release()
+            self._log("GPU phase lock released (cancelled)")
             try:
                 if output.exists():
                     output.unlink()
@@ -1946,6 +2065,9 @@ class NcnnVulkanEngine(EngineAdapter):
                 pass
             raise
         except Exception as exc:
+            # v0.4.9 (T-gpu-2): the lock is released on the failure path.
+            gpu_lock.release()
+            self._log("GPU phase lock released (failed)")
             # B.5: a mezzanine that exists at failure time is RETAINED
             # by the caller (_run_and_report) — never deleted here.
             # Pre-mezzanine failures leave no output file; the kept
@@ -1954,6 +2076,11 @@ class NcnnVulkanEngine(EngineAdapter):
             if isinstance(exc, UpscaleError):
                 raise
             raise UpscaleError(str(exc)) from exc
+        # v0.4.9 (T-gpu-2): the lock is released after the mezzanine
+        # existence gate (the design's "after the mezzanine gate" — the
+        # B.4 content gates in _run_and_report re-probe without the GPU).
+        gpu_lock.release()
+        self._log("GPU phase lock released")
         chunk_context = {
             "chunk_frames": frames_per_chunk,
             "chunks": chunks,
@@ -1972,12 +2099,24 @@ class NcnnVulkanEngine(EngineAdapter):
         chunk_frames: int,
         params: dict,
         completed: list[dict],
+        plan_facts: dict | None = None,
+        source_facts: dict | None = None,
     ) -> None:
         """B.7: write ``chunk_state.json`` atomically (temp + replace,
         fsynced) after each completed chunk. The GPU hours live in the
         chunk engine processes; this file is what a retried run
         inherits. Best-effort: a checkpoint that cannot be written
-        costs resume, never the run."""
+        costs resume, never the run.
+
+        v0.4.9 (design §1.8, additive): ``source_facts``/``plan_facts``
+        record the run's content identity (source path/size/mtime + the
+        prepare chain; profile; OCR need) so a LATER run can prove
+        claimability without re-preparing. Written on EVERY checkpoint
+        save (cheap dict dumps, always current); pre-0.4.9 checkpoints
+        simply lack the blocks, and the claim layer only claims
+        checkpoints that carry them (everything else keeps the v0.4.8
+        path-equality behavior bit for bit).
+        """
         state = {
             "stamp_fps": stamp_token,
             "prepared_path": prepared_path,
@@ -1986,6 +2125,10 @@ class NcnnVulkanEngine(EngineAdapter):
             "completed": completed,
             "params": params,
         }
+        if plan_facts is not None:
+            state["plan"] = plan_facts
+        if source_facts is not None:
+            state["source"] = source_facts
         path = workdir / CHUNK_STATE_FILENAME
         try:
             fd, tmp_name = tempfile.mkstemp(
@@ -2045,6 +2188,33 @@ class NcnnVulkanEngine(EngineAdapter):
             or state.get("stamp_fps") != stamp_token
             or state.get("params") != params
         )
+        # v0.4.9 (design §1.3): the PREPARED-PATH check alone becomes
+        # tolerant of a different absolute location for the same
+        # validated identity (the claim arm: a checkpoint written on
+        # another mount — e.g. J:\ run from a Windows path — is
+        # re-proven content, not a foreign cache). EVERYTHING else in
+        # the checkpoint still validates exactly as before.
+        if state.get("prepared_path") is not None and prepared_path is not None:
+            path_equal = state.get("prepared_path") == prepared_path
+            identity_equal = (
+                Path(str(state.get("prepared_path"))).name
+                == Path(str(prepared_path)).name
+                and int(state.get("prepared_total_frames") or -1)
+                == prepared_total_frames
+            )
+        else:
+            path_equal = False
+            identity_equal = False
+        if (
+            int(state.get("prepared_total_frames") or -1)
+            != prepared_total_frames
+            or state.get("stamp_fps") != stamp_token
+            or state.get("params") != params
+            or not (path_equal or identity_equal)
+        ):
+            mismatch = True
+        else:
+            mismatch = False
         if mismatch:
             # stale cache by construction: delete wholesale, start clean
             shutil.rmtree(workdir, ignore_errors=True)
@@ -2081,6 +2251,170 @@ class NcnnVulkanEngine(EngineAdapter):
                 workdir.mkdir(parents=True, exist_ok=True)
                 return None
         return completed
+
+
+def _source_stat(path: str | Path) -> dict:
+    """Best-effort source-identity stat for the v0.4.9 checkpoint's
+    source block. A vanished source records explicit missing markers:
+    the checkpoint stays valid for the run in progress (B.7's trust is
+    unchanged), and a LATER run's claim check can never prove identity
+    against missing stat facts (None never equals a real size/mtime)."""
+    try:
+        st = os.stat(path)
+        return {"size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+    except OSError:
+        return {"size": None, "mtime_ns": None}
+
+
+class GpuPhaseLock:
+    """v0.4.9 (design §2.2): the cross-process GPU-phase file lock.
+
+    One lock file ``<state_dir>/.gpu-phase.lock`` per MACHINE (the
+    state dir is machine-wide by construction — the same root the
+    benchmark cache and job registry use), acquired by the ENGINE at
+    the top of the upscale chunk loop and released after the chunk
+    loop's concat/gates. Probe/probe-count/prepare/encode/OCR stay
+    concurrent (CPU-only phases); a second process's upscale WAITS
+    with a visible step label instead of time-sharing the GPU.
+
+    Advisory O_EXCL create + holder pid; a holder dead longer than the
+    stale window (or a lock file with no live holder) is swept. A
+    filesystem that refuses atomic create (some SMB/NTFS shares)
+    degrades OPEN: logged WARNING + unlocked execution, never a hang.
+    """
+
+    HEARTBEAT_SECONDS = 10.0
+    STALE_AFTER_HEARTBEATS = 6  # ~60 s of silence = stale
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._fd: int | None = None
+
+    def _holder_alive(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+    def _sweep_stale(self) -> bool:
+        """Remove the lock file when its holder is provably gone.
+        Returns True when the path is clear afterwards. Read errors
+        conservatively leave the file (the wait loop times out
+        eventually; never a destructive guess)."""
+        try:
+            raw = self.path.read_text(encoding="utf-8").strip()
+            pid = int(raw.split("\n")[0])
+        except (OSError, ValueError, IndexError):
+            # unreadable holder info: not provably stale
+            return False
+        if self._holder_alive(pid):
+            return False
+        try:
+            self.path.unlink()
+            return True
+        except OSError:
+            return False
+
+    def acquire(
+        self,
+        *,
+        on_wait=None,
+        deadline_seconds: float | None = None,
+    ) -> bool:
+        """Acquire the lock, polling with the heartbeat cadence.
+
+        ``on_wait(holder_pid, held_seconds)`` is the visibility seam —
+        the engine passes its step label so the wait is surfaced ("...")",
+        never a silent stall. ``deadline_seconds`` (None = wait
+        indefinitely, the production shape; tests pass finite bounds)
+        bounds the total wait. Returns True when acquired; False only
+        when a deadline elapsed (and the caller degrades open with its
+        WARNING)."""
+        from .benchmark import state_dir
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        next_heartbeat = 0.0
+        while True:
+            try:
+                fd = os.open(
+                    str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                )
+            except FileExistsError:
+                pass
+            except OSError:
+                # the filesystem refuses atomic create (some SMB/NTFS
+                # shares): degrade OPEN, never a hang
+                self._fd = None
+                return False
+            else:
+                try:
+                    os.write(
+                        fd,
+                        f"{os.getpid()}\n{time.time()}\n".encode("utf-8"),
+                    )
+                except OSError:
+                    pass
+                self._fd = fd
+                return True
+            # lock held: stale check, then visible wait
+            if self._sweep_stale():
+                continue
+            if on_wait is not None:
+                holder_pid = self._read_holder_pid()
+                on_wait(holder_pid, time.monotonic() - started)
+            if (
+                deadline_seconds is not None
+                and time.monotonic() - started >= deadline_seconds
+            ):
+                return False
+            if deadline_seconds is None:
+                time.sleep(self.HEARTBEAT_SECONDS)
+            else:
+                # never overshoot a bounded wait by a full heartbeat
+                remaining = deadline_seconds - (
+                    time.monotonic() - started
+                )
+                time.sleep(max(0.0, min(self.HEARTBEAT_SECONDS, remaining)))
+
+    def _read_holder_pid(self) -> int | None:
+        try:
+            raw = self.path.read_text(encoding="utf-8").strip()
+            return int(raw.split("\n")[0])
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def release(self) -> None:
+        """Release idempotently; an OSError on unlink is swallowed
+        (the sweep and age rules clean it up; never fatal to the run)."""
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.release()
+        return False
+
+
+def _gpu_phase_lock() -> GpuPhaseLock:
+    """The machine-wide GPU-phase lock path (design D3: per state-dir,
+    NOT per log_root — the GUI and an MCP server on the same host
+    serialize against each other)."""
+    from .benchmark import state_dir
+
+    return GpuPhaseLock(state_dir() / ".gpu-phase.lock")
 
 
 def _workdir_for(prepared_path: str) -> Path:

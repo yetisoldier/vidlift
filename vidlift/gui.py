@@ -155,6 +155,16 @@ def warnings_for(item: PlannedFile) -> list[str]:
     return warnings
 
 
+# v0.4.9 (design §2.3, Eric D4): the stale-activity warning threshold —
+# the GUI surfaces "running (no activity N min)" when the snapshot's
+# activity age exceeds this many seconds. Surface-only: never an
+# auto-cancel, never a kill (a wedged GPU process and a slow-but-healthy
+# chunk look identical from outside; the label says exactly what is
+# known). Slower GPUs may prefer 1800; the constant is the shipped
+# default.
+STALE_ACTIVITY_SECONDS = 900
+
+
 def detail_text(
     item: PlannedFile,
     *,
@@ -400,6 +410,25 @@ class MainWindow(QMainWindow):
         )
         self.replace_source.toggled.connect(self._replace_source_changed)
 
+        # v0.4.9 (resume claim, design §1.4): opt-in claim of retained
+        # scratch from an earlier failed/cancelled run of the same file.
+        # Default OFF (the replace-source pattern); QSettings-persisted
+        # like every other GUI preference.
+        self.resume_claim = QCheckBox("Resume retained work")
+        self.resume_claim.setChecked(
+            self._settings().value("resume_claim", False, type=bool)
+        )
+        self.resume_claim.setToolTip(
+            "When a previous run of this same file was cancelled or failed, "
+            "claim its retained partial work (prepared mezzanine + completed "
+            "chunks) instead of starting over.\n\n"
+            "The retained work is used only when the source file, the "
+            "conversion plan, and the prepared content all prove identical "
+            "(a decode-count pass proves the content); otherwise the run "
+            "prepares fresh and the old scratch is left for cleanup."
+        )
+        self.resume_claim.toggled.connect(self._resume_claim_changed)
+
         # ---- engine combo (design §7): EXACT three adapters in tree ----
         self.engine_combo = QComboBox()
         for label, data in ENGINE_CHOICES:
@@ -590,6 +619,11 @@ class MainWindow(QMainWindow):
         the stored value changes here."""
         self._settings().setValue("replace_source", bool(checked))
 
+    def _resume_claim_changed(self, checked: bool) -> None:
+        """Persist the resume-claim preference (v0.4.9 §1.4, QSettings
+        house rule); only the stored value changes."""
+        self._settings().setValue("resume_claim", bool(checked))
+
     def _engine_changed(self, index: int) -> None:
         data = self.engine_combo.itemData(index)
         if data in ("auto", "stub", "ncnn"):
@@ -673,6 +707,10 @@ class MainWindow(QMainWindow):
         # column 7, where cancel_button sits; the checkbox label clipped
         # under the Cancel button.
         grid.addWidget(self.replace_source, 1, 5, 1, 2)
+        # v0.4.9 (design §1.4): the resume checkbox rides row 2 beside
+        # the profile combo (row 1 is full; the monitor span below
+        # already narrowed for exactly this reason).
+        grid.addWidget(self.resume_claim, 2, 1, 1, 2)
         # v0.4.8 (design D5): the profile combo lands on row 2 (the only
         # row 1 cells left are behind cancel_button at (1, 7)), so the
         # monitor span narrows 7 -> 5 columns to free (2, 5)/(2, 6).
@@ -945,13 +983,21 @@ class MainWindow(QMainWindow):
             return
         row = rows[0].row()
         if 0 <= row < len(self.batch.files):
-            self.details.setPlainText(
-                detail_text(
-                    self.batch.files[row],
-                    subtitle_ocr_enabled=self.subtitle_ocr.isChecked(),
-                    upscale_profile=self.profile_choice,
-                )
+            text = detail_text(
+                self.batch.files[row],
+                subtitle_ocr_enabled=self.subtitle_ocr.isChecked(),
+                upscale_profile=self.profile_choice,
             )
+            # v0.4.9 (§1.4 D1): the discoverability note — when the
+            # planned source has retained scratch and Resume is OFF,
+            # the plan detail names it AT THE MOMENT IT MATTERS.
+            if not self.resume_claim.isChecked():
+                from .run import scratch_note_for_source
+
+                note = scratch_note_for_source(Path(self.batch.files[row].report.path))
+                if note:
+                    text = f"{text}\n\n{note}"
+            self.details.setPlainText(text)
 
     def _refresh_details(self) -> None:
         if self.batch is not None:
@@ -983,6 +1029,9 @@ class MainWindow(QMainWindow):
             # run_file(profile=...) via the bridge's absent-defaults
             # rule (absent would read as "live-action" anyway).
             "upscale_profile": self.profile_choice,
+            # v0.4.9 (§1.4): rides into run_file(resume=...) through the
+            # bridge's absent-defaults rule (absent would read False).
+            "resume": self.resume_claim.isChecked(),
         }
         try:
             self.job_ids = self.client.enqueue_run(
@@ -1083,7 +1132,28 @@ class MainWindow(QMainWindow):
             if row < self.file_table.rowCount():
                 status_cell = self.file_table.item(row, 0)
                 if status_cell is not None:
-                    status_cell.setText(state)
+                    # v0.4.9 (§2.3): a RUNNING row whose last activity is
+                    # older than the threshold renders the honest warning
+                    # (the same yellow family as `cancelled`; data, never
+                    # an action). BELOW the threshold the plain state —
+                    # byte-identical to v0.4.8.
+                    if state == "running":
+                        age = snapshot.get("activity_age_seconds")
+                        if (
+                            isinstance(age, (int, float))
+                            and age > STALE_ACTIVITY_SECONDS
+                        ):
+                            minutes = int(age // 60)
+                            status_cell.setText(
+                                f"running (no activity {minutes} min)"
+                            )
+                            status_cell.setForeground(
+                                Qt.GlobalColor.yellow
+                            )
+                        else:
+                            status_cell.setText(state)
+                    else:
+                        status_cell.setText(state)
             terminal = state in ("succeeded", "failed", "cancelled")
             if not terminal:
                 still_active.append(job_id)
@@ -1129,6 +1199,16 @@ class MainWindow(QMainWindow):
         if eta is not None:
             self._stage_eta = float(eta)
         progress = snapshot.get("progress") or {}
+        # v0.4.9 (progress mirror, design §2.1): the fallback arm —
+        # when the in-memory state_box is absent (reader process ≠
+        # writer process), the payload's progress falls back to the
+        # writer's PERSISTED progress_snapshot ("progress" is the
+        # mirror's payload key set by tools.py). The state-box arm is
+        # unchanged v0.4.8 rendering.
+        if not progress:
+            snapshot_progress = snapshot.get("progress")
+            if isinstance(snapshot_progress, dict):
+                progress = snapshot_progress
         frames_done = progress.get("frames_done")
         frames_total = progress.get("frames_total")
         # v0.4.5 (§3b/§3c, D-eta): the stage label's phase_note suffix
@@ -1136,6 +1216,17 @@ class MainWindow(QMainWindow):
         # _set_text, so identical values never repaint the label.
         note = progress.get("phase_note")
         rendered = f"{stage} ({note})" if note else stage
+        # v0.4.9 (§2.3): the stale-activity suffix rides the stage
+        # label (data-never-proof wording; the bar logic is untouched).
+        age = snapshot.get("activity_age_seconds")
+        if (
+            isinstance(age, (int, float))
+            and age > STALE_ACTIVITY_SECONDS
+            and snapshot.get("state") == "running"
+        ):
+            rendered = (
+                f"{rendered} — last activity {int(age // 60)} min ago"
+            )
         self._set_text(self.stage_label, rendered)
         if frames_total and frames_done is not None and frames_total > 0:
             self._stage_fraction = max(0.0, min(1.0, frames_done / frames_total))

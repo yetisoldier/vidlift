@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 from . import __version__
 from .plan import PlanError, build_batch_plan
@@ -217,6 +218,7 @@ def _cmd_run(
     realesrgan_models: str | None,
     replace_source: bool = False,
     upscale_profile: str = "live-action",
+    resume: bool = False,
 ) -> int:
     """Drive one file through the runner and print its state.
 
@@ -241,6 +243,7 @@ def _cmd_run(
             realesrgan_models=realesrgan_models,
             replace_source=replace_source,
             profile=upscale_profile,
+            resume=resume,
         )
     except (ProbeError, PlanError, RunError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -485,6 +488,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "claim retained scratch from an earlier failed/cancelled run of "
+            "this same file when source, plan, and prepared content all "
+            "prove equal; otherwise runs clean (default: prepare fresh)"
+        ),
+    )
+    run_parser.add_argument(
         "--engine",
         choices=["auto", "stub", "ncnn"],
         default="auto",
@@ -554,6 +566,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--work-dir",
         help="scratch directory for the benchmark slice (default: a temp dir)",
     )
+    # v0.4.9 (design §1.6): the prune surface over the scratch GC.
+    runs_parser = sub.add_parser(
+        "runs",
+        help="scratch-run maintenance (prune retained scratch sets)",
+    )
+    runs_sub = runs_parser.add_subparsers(dest="runs_command")
+    prune_parser = runs_sub.add_parser(
+        "prune",
+        help="remove stale retained scratch sets (newest-2 + 7-day floor)",
+    )
+    prune_parser.add_argument(
+        "file",
+        nargs="?",
+        default=None,
+        help="a media file whose SOURCE_DIR/.vidlift-runs is pruned",
+    )
+    prune_parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="the runs directory to prune (overrides the FILE form)",
+    )
+    prune_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be removed; delete nothing",
+    )
     mcp_parser = sub.add_parser(
         "mcp-server",
         help="run the VidLift MCP bridge as a stdio server (for MCP clients)",
@@ -593,7 +631,49 @@ def main(argv: list[str] | None = None) -> int:
             realesrgan_models=args.realesrgan_models,
             replace_source=args.replace_source,
             upscale_profile=args.upscale_profile,
+            resume=args.resume,
         )
+    if args.command == "runs":
+        # v0.4.9 (design §1.6): the prune surface over the scratch GC.
+        from .run import prune_plan, gc_stale_scratch
+
+        if getattr(args, "runs_command", None) != "prune":
+            print("usage: vidlift runs prune [--dry-run]", file=sys.stderr)
+            return 2
+        file_argv = Path(args.file) if getattr(args, "file", None) else None
+        root = (
+            Path(args.log_dir)
+            if getattr(args, "log_dir", None)
+            else (
+                (file_argv.parent / ".vidlift-runs")
+                if file_argv is not None
+                else None
+            )
+        )
+        if root is None:
+            print(
+                "error: runs prune needs --log-dir (no FILE in this form)",
+                file=sys.stderr,
+            )
+            return 2
+        if not root.is_dir():
+            print(
+                f"error: not found: {root}",
+                file=sys.stderr,
+            )
+            return 2
+        decisions = (
+            prune_plan(root) if args.dry_run else gc_stale_scratch(root)
+        )
+        for decision in decisions:
+            paths = ", ".join(decision["paths"])
+            print(
+                f"{'would remove' if args.dry_run else 'removed'}: "
+                f"{decision['run_id']} ({decision['reason']}): {paths}"
+            )
+        if not decisions:
+            print("nothing to prune")
+        return 0
     if args.command == "benchmark":
         return _cmd_benchmark(
             args.file,

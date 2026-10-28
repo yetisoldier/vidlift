@@ -327,8 +327,15 @@ def test_status_payload_shape_live_passthrough(client, tmp_path):
     assert len(job["log_tail"]) == 40
     assert job["log_tail"][-1] == "line 44"
     # the served entry IS the bridge's _status_payload for this record
+    # (v0.4.9: except the computed-at-read `activity_age_seconds`, a
+    # wall-clock delta between the two payload builds — compare modulo
+    # that key).
     record = client.registry.require(job["job_id"])
-    assert job == _status_payload(client.services, record)
+    fresh = _status_payload(client.services, record)
+    served = dict(job)
+    fresh.pop("activity_age_seconds", None)
+    served.pop("activity_age_seconds", None)
+    assert served == fresh
 
 
 def test_status_includes_queued_jobs_after_running(client, tmp_path):

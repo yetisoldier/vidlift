@@ -133,9 +133,14 @@ def test_client_local_status_snapshot_is_bridge_status_payload(
     try:
         job_ids = client.enqueue_run([str(path)])
         record = client.registry.require(job_ids[0])
-        assert client.status_snapshot(job_ids[0]) == _status_payload(
-            client.services, record
-        )
+        # v0.4.9: `activity_age_seconds` is computed at read time (never
+        # persisted), so the two payload builds differ by the wall-clock
+        # slice between them; compare modulo that key.
+        served = client.status_snapshot(job_ids[0])
+        fresh = _status_payload(client.services, record)
+        served.pop("activity_age_seconds", None)
+        fresh.pop("activity_age_seconds", None)
+        assert served == fresh
         # Unknown job: None (never a raise from the GUI's 1 Hz read).
         assert client.status_snapshot("vl-00000000-unknown") is None
     finally:
