@@ -2,6 +2,63 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.9] - 2026-10-28
+
+Resume of retained work plus anti-freeze hardening, per the binding
+design `docs/designs/v0.4.9-resume-and-observability.md` (Bob,
+approved by Eric 2026-10-28).
+
+### Added
+
+- **Resume (opt-in, all four surfaces)**: a failed, cancelled, or
+  killed run leaves its retained scratch (prepared mezzanine + engine
+  workdir + checkpoint) intact under the runs directory; a later run
+  of the SAME file with resume enabled claims it after re-proving
+  every identity (source path/size/mtime, plan incl. profile and OCR
+  decision, prepared duration + decode count) — any mismatch means a
+  clean prepare, never a wrong-file stitch. Surfaces: GUI "Resume
+  retained work" checkbox (default OFF, persisted under QSettings
+  `resume`), CLI `vidlift run FILE --resume`, Python API
+  `run_file(..., resume=True)`, MCP `run` options `resume` (boolean;
+  absent -> False = v0.4.8 behavior). The claim is atomic
+  (`.claimed-by-<run>` sentinel); a verified claiming run removes the
+  claimed scratch; a failing claiming run RETAINS it (chunks
+  accumulate across attempts; the newest proving set wins). v0.4.7
+  checkpoints are never silently trusted: without identity facts the
+  set is GC-eligible but not claimable.
+- **Scratch GC** (`vidlift runs prune [--dry-run]`, plus automatic
+  GC at GUI/server startup): per source, keep the newest 2 sets with
+  completed chunks; everything older past a 7-day floor, and ANY set
+  with zero completed chunks (triage debris), is removed. Rejected
+  mezzanines, logs, and manifests are never GC'd. The prune command
+  reports every decision (`no_checkpoint`, `zero_completed_chunks`,
+  `older_than_newest_2_per_source`).
+- **Anti-freeze (design §2)**:
+  - GPU phase lock: the upscale chunk loop holds a machine-wide
+    `.gpu-phase.lock` (per state dir, shared GUI+MCP+CLI) with a
+    holder pid; a crashed holder's lock is swept; waiters surface
+    "waiting for GPU — held by pid N for Xs" instead of stalling
+    silently; on filesystems refusing atomic locks VidLift degrades
+    open with a logged WARNING (never a hang).
+  - Progress mirror: the MCP job registry persists a
+    `progress_snapshot` (progress/current_phase/last_activity) at
+    most every 10 s, so the GUI (a separate process) sees live
+    progress even when job threads run in another process.
+  - Stale-activity warning (D4): a running MCP job with no activity
+    for 900 s renders "running (no activity N min)" (yellow) in the
+    GUI and carries a computed `activity_age_seconds` in the MCP
+    status payload — observability ONLY, never an automatic action.
+  - v0.4.8's monitor behavior is unchanged; v0.4.9 adds visibility.
+
+### Fixed
+
+- The claim layer reads the checkpoint's nested `source` identity
+  block as the engine writes it.
+- A bounded GPU-lock wait no longer overshoots its deadline by a
+  full heartbeat.
+- `vidlift runs prune` accepts both the FILE (source-dir) form and
+  `--log-dir`, and exits with a clean error for missing directories.
+
 ## [0.4.8] - 2026-10-26
 
 The anime upscale profile (`realesr-animevideov3-x2`) for DVD-era
