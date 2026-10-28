@@ -86,6 +86,7 @@ class JobRecord:
         engine_simulated: bool | None = None,
         engine_note: str | None = None,
         result: dict | None = None,
+        progress_snapshot: dict | None = None,
     ) -> None:
         self.job_id = job_id
         self.kind = kind  # "run" | "benchmark"
@@ -106,6 +107,12 @@ class JobRecord:
         self.engine_simulated = engine_simulated
         self.engine_note = engine_note
         self.result = result
+        # v0.4.9 (progress mirror, design §2.1): throttled mid-run
+        # progress detail; None until a worker mirrors it (or an old
+        # jobs.json carried one). Never written by anything else.
+        self.progress_snapshot = (
+            dict(progress_snapshot) if progress_snapshot else None
+        )
 
     # -- state machine ---------------------------------------------------
 
@@ -129,6 +136,10 @@ class JobRecord:
         """Bump last-activity: called by the executor's tracked runner
         seam on every external command a live job executes."""
         self.last_activity_at = time.time()
+        # v0.4.9 (progress mirror, design §2.1): a touch is the natural
+        # liveness tick of a running job — the mirror piggybacks here
+        # (throttled inside the executor's _mirror_progress, which owns
+        # the 10 s cadence and the state_box read).
 
     def set_live(self, key: str, value) -> None:
         if not hasattr(self, "_live"):
@@ -162,6 +173,15 @@ class JobRecord:
             "engine_simulated": self.engine_simulated,
             "engine_note": self.engine_note,
             "result": self.result,
+            # v0.4.9 (progress mirror, design §2.1): the throttled
+            # mid-run progress mirror (chunk i/N, frames done/total,
+            # step, phase_note, last_activity). Absent in old files ⇒
+            # None ⇒ readers treat as "no live detail" — additive both
+            # directions (old readers drop the key on their next save;
+            # documented, matches every prior additive field).
+            "progress_snapshot": dict(self.progress_snapshot)
+            if self.progress_snapshot
+            else None,
         }
 
     @classmethod
@@ -184,6 +204,7 @@ class JobRecord:
             engine_simulated=data.get("engine_simulated"),
             engine_note=data.get("engine_note"),
             result=data.get("result"),
+            progress_snapshot=data.get("progress_snapshot"),
         )
 
 

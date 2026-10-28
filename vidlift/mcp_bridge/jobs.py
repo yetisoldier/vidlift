@@ -28,6 +28,11 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
+
+# v0.4.9 (design §2.1): the persisted-progress mirror's cadence — a
+# sidecar timer plus the tracked-runner touch path, both throttled to
+# one small atomic jobs.json write per 10 s per running job at most.
+PROGRESS_MIRROR_SECONDS = 10.0
 from pathlib import Path
 
 from .registry import JobRecord, Registry, RegistryError
@@ -174,6 +179,11 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
         if phase is not None:
             record.set_live("current_phase", phase)
         discover_log_path()
+        # v0.4.9 (progress mirror): every command boundary is a natural
+        # mirror opportunity; the 10 s throttle lives in maybe_mirror.
+        executor = getattr(services, "executor", None)
+        if executor is not None and hasattr(executor, "maybe_mirror"):
+            executor.maybe_mirror()
         runner = base_command_runner or _subprocess_runner
         return runner(binary, args)
 
@@ -184,6 +194,9 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
         if phase is not None:
             record.set_live("current_phase", phase)
         discover_log_path()
+        executor = getattr(services, "executor", None)
+        if executor is not None and hasattr(executor, "maybe_mirror"):
+            executor.maybe_mirror()
         runner = base_probe_runner or base_command_runner or _subprocess_runner
         return runner(binary, args)
 
@@ -357,6 +370,14 @@ class JobExecutor:
         self._threads: list[threading.Thread] = []
         self._wake = threading.Event()
         self._stopping = False
+        # v0.4.9 (progress mirror, design §2.1): a timer thread ticks
+        # PROGRESS_MIRROR_SECONDS while any job is running, covering the
+        # long stretches where no command boundary falls (the
+        # decode-count pass, a realesrgan chunk run); the tracked
+        # runner's touch path mirrors too (same throttle).
+        self._mirror_stop = threading.Event()
+        self._last_mirror_at = 0.0
+        self._mirror_thread: threading.Thread | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -371,11 +392,20 @@ class JobExecutor:
                 )
                 thread.start()
                 self._threads.append(thread)
+            # v0.4.9: the mirror ticker starts with the executor.
+            if self._mirror_thread is None or not self._mirror_thread.is_alive():
+                self._mirror_thread = threading.Thread(
+                    target=self._mirror_loop,
+                    daemon=True,
+                    name="vidlift-progress-mirror",
+                )
+                self._mirror_thread.start()
 
     def stop(self, *, join: bool = True) -> None:
         """Signal workers to finish their current job and exit."""
         self._stopping = True
         self._wake.set()
+        self._mirror_stop.set()
         if join:
             for thread in self._threads:
                 thread.join(timeout=5)
@@ -479,6 +509,58 @@ class JobExecutor:
     def notify_new_work(self) -> None:
         """Wake an idle worker (called after enqueue)."""
         self._wake.set()
+
+    # -- v0.4.9 progress mirror (design §2.1) -----------------------------
+
+    def _mirror_running_jobs(self) -> int:
+        """One mirror pass over every running job: copy the live
+        RunState's progress/current_phase/last_activity into the
+        record's persisted progress_snapshot and atomically save.
+        Returns the number of jobs mirrored."""
+        mirrored = 0
+        for record in self.registry.running():
+            box = record.get_live("state_box")
+            state = box.get("state") if box else None
+            if state is None:
+                continue
+            progress = getattr(state, "progress", None)
+            phase = getattr(state, "current_phase", None)
+            activity = getattr(state, "last_activity_at", None)
+            if progress is None and not phase:
+                continue
+            record.progress_snapshot = {
+                "progress": dict(progress) if progress else {},
+                "current_phase": phase,
+                "last_activity_at": activity,
+            }
+            mirrored += 1
+        if mirrored:
+            self.registry.save()
+        self._last_mirror_at = time.monotonic()
+        return mirrored
+
+    def maybe_mirror(self) -> None:
+        """Throttle gate over _mirror_running_jobs (the touch-path
+        entry point: every tracked command calls this; the 10 s
+        throttle decides whether a mirror pass actually runs)."""
+        now = time.monotonic()
+        if now - self._last_mirror_at >= PROGRESS_MIRROR_SECONDS:
+            try:
+                self._mirror_running_jobs()
+            except Exception:
+                # mirror failure never breaks the tracked command path
+                self._last_mirror_at = now
+
+    def _mirror_loop(self) -> None:
+        """The timer tick: while the executor is live, mirror any
+        running job at the throttle cadence (covers the long no-command
+        stretches). Exits when stopped."""
+        while not self._mirror_stop.wait(PROGRESS_MIRROR_SECONDS):
+            try:
+                self._mirror_running_jobs()
+            except Exception:
+                # the ticker must never die on a transient save/seam bug
+                continue
 
 
 def _now() -> float:

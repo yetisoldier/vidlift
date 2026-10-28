@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 from ..benchmark import STUB_NOTE, estimate_eta, load_estimates
@@ -413,6 +414,16 @@ def _live_state(record):
     return None
 
 
+def _activity_age_seconds(record) -> float | None:
+    """v0.4.9 (design §2.3): seconds since the record's last activity,
+    or None when the job has none (never started / unknown). Computed
+    on every payload; NEVER persisted (the record's own timestamps are
+    the persisted truth)."""
+    if record.last_activity_at is None:
+        return None
+    return max(0.0, time.time() - float(record.last_activity_at))
+
+
 def _status_payload(services: BridgeServices, record) -> dict:
     """The full runner observability contract (Section 4.5): verbatim
     RunState.to_dict() fields when the job is live; honest
@@ -430,6 +441,10 @@ def _status_payload(services: BridgeServices, record) -> dict:
         "started_at": record.started_at,
         "finished_at": record.finished_at,
         "last_activity_at": record.last_activity_at,
+        # v0.4.9 (anti-freeze, design §2.3): computed, never persisted —
+        # seconds since the record's last activity (the mirror keeps it
+        # advancing within 10 s while the worker is truly alive).
+        "activity_age_seconds": _activity_age_seconds(record),
         "log_path": record.log_path,
         "log_tail": _log_tail(services, record, state),
         "commands": record.get_live("commands") or [],
@@ -443,6 +458,18 @@ def _status_payload(services: BridgeServices, record) -> dict:
         "error": record.error,
         "eta_seconds": None,
     }
+    # v0.4.9 (progress mirror, design §2.1): when the in-memory state
+    # box is absent (reader process ≠ writer process), the payload's
+    # progress/current_phase fall back to the WRITER's persisted mirror
+    # — the exact additive fallback the design names for the GUI's
+    # `_consume_running_snapshot` and this payload alike.
+    if state is None and record.progress_snapshot:
+        snapshot = record.progress_snapshot
+        payload["progress"] = snapshot.get("progress") or {}
+        if snapshot.get("current_phase"):
+            payload["current_phase"] = snapshot["current_phase"]
+        if snapshot.get("last_activity_at"):
+            payload["last_activity_at"] = snapshot["last_activity_at"]
     if state is not None:
         data = state.to_dict()
         payload.update(
