@@ -181,6 +181,10 @@ def test_all_cancelled_is_never_a_green_full_bar(qapp):
         _apply_batch_summary = MainWindow._apply_batch_summary
         _batch_bar_palette = MainWindow._batch_bar_palette
         _consume_terminal_snapshot = MainWindow._consume_terminal_snapshot
+        # v0.4.10-fix (D2): the terminal writer resolves slots by the
+        # stable job identity; the seam carries the real helper.
+        _batch_slot_for = MainWindow._batch_slot_for
+        _batch_slot_index: dict = {}
 
     window = _RenderSeam()
     window.run_total = 1
@@ -230,6 +234,10 @@ def test_terminal_snapshot_updates_counts_per_slot(qapp):
         _consume_terminal_snapshot = MainWindow._consume_terminal_snapshot
         _apply_batch_summary = MainWindow._apply_batch_summary
         _batch_bar_palette = MainWindow._batch_bar_palette
+        # v0.4.10-fix (D2): the terminal writer resolves slots by the
+        # stable job identity; the seam carries the real helper.
+        _batch_slot_for = MainWindow._batch_slot_for
+        _batch_slot_index: dict = {}
 
     window = _RenderSeam()
     window.run_total = 2
@@ -400,9 +408,14 @@ def test_probe_garbage_stdout_is_na(tmp_path):
     binary = _fake_nvidia_smi(tmp_path, "printf 'not even csv\\\\n'\n")
     sample = _probe_once(binary)
     assert sample.utilization is None
-    # the tool DID run (exit 0, stdout present) but nothing usable
-    # came out — render the honest n/a
-    assert sample.tool_available is False or sample.device_count == 0
+    # v0.4.10-fix (D3) tightened: the tool DID run (exit 0, stdout
+    # present), so tool_available must be True — the honest n/a comes
+    # from the WIDGET's utilization gate, not from a parse-layer lie.
+    # The old assertion (tool_available is False or device_count == 0)
+    # was satisfied by device_count == 0 alone, which masked the fact
+    # that the widget then rendered a confident "0%".
+    assert sample.tool_available is True
+    assert sample.device_count == 0
 
 
 def test_probe_timeout_terminates_child(tmp_path):

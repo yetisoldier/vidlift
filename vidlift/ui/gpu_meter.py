@@ -266,10 +266,19 @@ class GpuMeterWidget(QWidget):
         pure projection of the rolling buffer for tests (no Qt paint
         needed). percent_label is None in the n/a state ("n/a"
         renders; no percent ever invents itself)."""
-        if not self._samples or not self._samples[-1].tool_available:
+        # v0.4.10-fix (D3): the n/a gate includes a missing
+        # utilization. nvidia-smi can exit 0 while printing per-device
+        # "N/A" (or garbage): tool_available=True but utilization=None
+        # — rendering an invented "0%" there broke the honesty
+        # contract; the chart already filters None the same way.
+        if (
+            not self._samples
+            or not self._samples[-1].tool_available
+            or self._samples[-1].utilization is None
+        ):
             return (None, "")
         last = self._samples[-1]
-        return (float(last.utilization or 0.0), _hint(last.device_count))
+        return (float(last.utilization), _hint(last.device_count))
 
     # -- painting ---------------------------------------------------------
 
@@ -327,13 +336,20 @@ class GpuMeterWidget(QWidget):
         value_font.setPixelSize(17)
         value_font.setBold(True)
         painter.setFont(value_font)
-        if not self._samples or not self._samples[-1].tool_available:
+        # v0.4.10-fix (D3): the same gate in the painter — a None
+        # utilization (exit-0 "N/A"/garbage stdout) renders "n/a" in
+        # the muted gray, never a confident invented "0%".
+        if (
+            not self._samples
+            or not self._samples[-1].tool_available
+            or self._samples[-1].utilization is None
+        ):
             painter.setPen(QColor("#88919a"))
             text = "n/a"
         else:
             painter.setPen(QColor("#c9b8f2"))
             last = self._samples[-1]
-            text = f"{int(round(last.utilization or 0.0))}%"
+            text = f"{int(round(last.utilization))}%"
             hint = _hint(last.device_count)
             if hint:
                 painter.setPen(QColor("#9aa5a2"))

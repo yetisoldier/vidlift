@@ -1102,13 +1102,24 @@ class MainWindow(QMainWindow):
         self.run_total = len(self.job_ids)
         # v0.4.10 (R2): batch truth accounting lives in the pure
         # summarize_batch(state list) → BatchSummary; run_counts is the
-        # GUI-side mirror of which job slot reached which terminal
-        # state (index i ↔ job_ids[i] ↔ table row i), run_summary is
-        # the last rendered BatchSummary. "Terminal" counts a job as
-        # RESOLVED (bar advances); only succeeded raises the succeeded
-        # count (bar green).
+        # GUI-side mirror of which batch slot reached which terminal
+        # state (index i ↔ batch slot i in SUBMISSION order),
+        # run_summary is the last rendered BatchSummary. "Terminal"
+        # counts a job as RESOLVED (bar advances); only succeeded
+        # raises the succeeded count (bar green).
+        # v0.4.10-fix (D2): stable per-batch slot registry —
+        # _batch_slots holds the job ids in SUBMISSION order and is
+        # never drained/reordered while the batch lives;
+        # _batch_slot_index maps job_id -> slot for the terminal
+        # writer. run_counts stays parallel to the slots (None until
+        # terminal), so summarize_batch stays correct even after a
+        # terminal job leaves self.job_ids and the rows shift down.
+        self._batch_slots: list[str] = list(self.job_ids)
+        self._batch_slot_index: dict[str, int] = {
+            job_id: index for index, job_id in enumerate(self._batch_slots)
+        }
         self.run_counts: list[str | None] = [None] * self.run_total
-        self.run_summary = summarize_batch([None] * self.run_total)
+        self.run_summary = summarize_batch(self.run_counts)
         # v0.4.10 (R2): the batch bar restarts from a KNOWN color — the
         # stale QSS chunk from a previous run must not survive into
         # this run's truth.
@@ -1177,8 +1188,12 @@ class MainWindow(QMainWindow):
         terminal_notes: list[str] = []
         # v0.4.5 (§2 Rule 4): the rendered job-set key — the leading
         # job id — force-pins the log tail once when it changes (new
-        # batch start / next job claimed / terminal drain rebase).
-        rendered_key = self.job_ids[0] if self.job_ids else None
+        # batch start; a claim rebase rides the leading id since the
+        # head slot never changes for the batch's lifetime).
+        # v0.4.10-fix (D2): the rendered job-set key rides the STABLE
+        # slot order (a drained terminal job must never rebase the
+        # log tail mid-batch).
+        rendered_key = self._batch_slots[0] if self._batch_slots else None
         if rendered_key != self._log_rendered_key:
             self._log_rendered_key = rendered_key
             if rendered_key is not None:
@@ -1319,18 +1334,65 @@ class MainWindow(QMainWindow):
         if tail:
             self._render_log_tail("\n".join(str(line) for line in tail[-40:]))
 
+    def _batch_slot_for(self, job_id: object, row: int) -> int:
+        """v0.4.10-fix (D2): the stable batch slot for a job identity.
+
+        Terminal jobs DRAIN from ``self.job_ids`` every poll tick, so
+        the CURRENT row of a surviving job shifts down and a row-
+        indexed truth write would overwrite the wrong state (the D2
+        under-count: a 2-job all-succeeded sequential batch stuck at
+        1/2, a cancelled job vanishing into a green bar). Slots are
+        pinned per batch in submission order: a job_id registered in
+        ``_batch_slot_index`` always maps back to THAT slot; an
+        unregistered id claims the next slot at-or-after its current
+        row that no other job already holds (this also heals a slate
+        that missed its head seeding); a stray id whose row lies
+        outside the slate resolves out of range so the writer drops
+        it — the slate can never be expanded by a late payload. An
+        identity-less payload keeps the legacy row write (the bare-
+        seam behavior).
+        """
+        if isinstance(job_id, str) and job_id:
+            index = self._batch_slot_index.get(job_id)
+            if index is None:
+                total = len(self.run_counts)
+                claimed = set(self._batch_slot_index.values())
+                if 0 <= row < total:
+                    index = next(
+                        (
+                            slot
+                            for slot in range(row, total)
+                            if slot not in claimed
+                        ),
+                        total,  # slate full: out of range → payload dropped
+                    )
+                else:
+                    index = total  # out-of-slate row: never fabricated
+                self._batch_slot_index[job_id] = index
+            return index
+        return row
+
     def _consume_terminal_snapshot(self, row: int, snapshot: dict) -> None:
         state = snapshot.get("state") or "finished"
+        # v0.4.10-fix (D2): the truth slate is keyed by the STABLE job
+        # identity (submission order), never by the shifting table row:
+        # terminal jobs drain from self.job_ids each tick, so surviving
+        # jobs shift down and a row-indexed write would land in the
+        # wrong slot (the under-count / cancelled-overwrite bug). The
+        # row still renders the TABLE cell (cosmetic, pre-existing
+        # shifting-row quirk); the BAR truth writes by job_id.
         # v0.4.10 (R2): the bar's truth accounting. run_counts records
-        # the terminal state per job slot (row i ↔ job_ids[i]);
+        # the terminal state per batch slot (submission order);
         # summarize_batch turns the slate into an immutable
         # BatchSummary (pure, unit-tested); _apply_batch_summary
         # paints the bar (value + QSS chunk color + honest format).
         # A cancelled/failed job advances the bar (a slot resolved)
         # but never raises a succeeded count — the bar can no longer
         # render a full-green "1/1 completed" for a cancelled run.
-        if 0 <= row < len(self.run_counts):
-            self.run_counts[row] = state
+        job_id = snapshot.get("job_id")
+        slot = self._batch_slot_for(job_id, row)
+        if 0 <= slot < len(self.run_counts):
+            self.run_counts[slot] = state
         self.run_summary = summarize_batch(self.run_counts)
         self._apply_batch_summary(self.run_summary)
         if row < self.file_table.rowCount():
