@@ -42,6 +42,8 @@ from __future__ import annotations
 import shutil
 import subprocess
 
+from .. import _proc
+
 from PyQt6.QtCore import (
     QObject,
     QRunnable,
@@ -176,6 +178,11 @@ class GpuProbeRunnable(QRunnable):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                # v0.4.11: the v0.4.4 console-suppression convention —
+                # without it every probe flashed a conhost window on
+                # Windows (~2 Hz). Empty dict on platforms other than
+                # Windows, so the call is byte-identical elsewhere.
+                **_proc.popen_kwargs(),
             )
         except OSError:
             # Missing binary / not launched at all → the honest n/a.
