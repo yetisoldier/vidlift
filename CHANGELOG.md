@@ -2,6 +2,24 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.11] - 2026-10-29
+
+### Fixed
+
+- **GPU meter console-window flash on Windows (v0.4.10 regression)**:
+  the top-bar GPU meter's nvidia-smi probe bypassed the v0.4.4
+  console-suppression convention (vidlift/_proc.py: any new
+  external-command call MUST route its subprocess kwargs through
+  `popen_kwargs()`), so the probe's raw `subprocess.Popen` spawned a
+  visible conhost window twice per second —Eric reported it live on
+  NINJABASE2 minutes after upgrading. The probe now spreads
+  `**_proc.popen_kwargs()` into its Popen call like every other
+  external command (a pure no-op off Windows). Regression tests added
+  (`tests/test_gpu_meter_no_window.py`): a cross-platform source
+  contract that the `_probe` Popen call carries the popen_kwargs
+  spread, plus Windows-only behavioral proofs of the
+  STARTF_USESHOWWINDOW + CREATE_NO_WINDOW spawn suppression.
+
 ## [0.4.10] - 2026-10-28
 
 GUI truth-and-instrumentation patch (Eric's direct request): a GPU
