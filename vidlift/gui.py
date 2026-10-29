@@ -70,6 +70,12 @@ from .run import UPSCALE_STEP_PREPARED_COUNT as PREPARED_COUNT_PROBE_STEP
 from .plan import BatchPlan, PlannedFile, build_batch_plan
 from .probe import ProbeError, probe_and_classify
 from .run import MissingToolError, find_tools
+from .run import summarize_batch, BatchSummary
+from .ui.gpu_meter import (
+    GPU_METER_HEIGHT,
+    GPU_METER_WIDTH,
+    GpuMeterWidget,
+)
 from .ui.widgets import ActivityDots, EtaProgressBar
 
 
@@ -132,6 +138,22 @@ def format_bytes(value: int | None) -> str:
     if value is None:
         return "unknown"
     return f"{value / 1_000_000_000:.2f} GB"
+
+
+# v0.4.10 (R2): the honest batch-bar format strings. Truth depends on
+# which non-zero outcomes exist (a cancelled job may NEVER ride a
+# "completed" count); mixed outcomes join with ', '. A still-running
+# batch keeps its pending tail ("x/y succeeded" while anything is
+# unresolved) so the never-lying bar reads the same mid-run and done.
+def _batch_format(summary: BatchSummary) -> str:
+    total = summary.total
+    if summary.cancelled and summary.failed:
+        return f"{summary.succeeded}/{total} succeeded, {summary.cancelled} cancelled, {summary.failed} failed"
+    if summary.cancelled:
+        return f"{summary.succeeded}/{total} succeeded, {summary.cancelled} cancelled"
+    if summary.failed:
+        return f"{summary.succeeded}/{total} succeeded, {summary.failed} failed"
+    return f"{summary.succeeded}/{total} succeeded"
 
 
 def format_duration(seconds: float | None) -> str:
@@ -329,6 +351,10 @@ class MainWindow(QMainWindow):
         # serial). The GUI is a projection: every tick re-reads status.
         self.client = client or LocalBridgeClient()
         self.job_ids: list[str] = []
+        # v0.4.10 (R2): the batch bar's chunk-color cache — changed
+        # ONLY through _apply_batch_summary so a QSS restyle fires
+        # once per color change, never per tick.
+        self._progress_chunk_color: str | None = None
 
         # v0.4.5 (progress-honesty §2, D-tail): pin-to-tail state for
         # the run log widget (Rule 1-5 contract lives in these flags;
@@ -429,6 +455,15 @@ class MainWindow(QMainWindow):
         )
         self.resume_claim.toggled.connect(self._resume_claim_changed)
 
+        # v0.4.10 (R1): the GPU meter rides the top bar — a fixed-size
+        # Task-Manager-style utilization chart (see vidlift/ui/
+        # gpu_meter.py). Sampling is QThreadPool-off-thread, ~2 Hz,
+        # hard 2 s child timeout; with nvidia-smi absent it renders
+        # "GPU n/a" and never raises. It is read-only instrumentation:
+        # the meter touches no run state and can never cancel or stall
+        # an active upscale.
+        self.gpu_meter = GpuMeterWidget()
+
         # ---- engine combo (design §7): EXACT three adapters in tree ----
         self.engine_combo = QComboBox()
         for label, data in ENGINE_CHOICES:
@@ -484,6 +519,10 @@ class MainWindow(QMainWindow):
         # v0.4.6 (§4.1): default-on start AFTER the shell exists — the
         # pill is built, so a fallback-port report can reach it.
         self._start_monitor()
+        # v0.4.10 (R1): the meter starts after the shell exists too —
+        # its first sample lands on a fully built top bar. With
+        # nvidia-smi absent it simply renders "GPU n/a" every 0.5 s.
+        self.gpu_meter.start()
 
     # -- engine persistence (design §7) ---------------------------------
 
@@ -667,6 +706,13 @@ class MainWindow(QMainWindow):
         summary.addWidget(self.summary_count, alignment=Qt.AlignmentFlag.AlignRight)
         summary.addWidget(self.summary_note, alignment=Qt.AlignmentFlag.AlignRight)
         title_row.addLayout(summary)
+        # v0.4.10 (R1): the GPU meter sits at the top bar's far right,
+        # vertically centered against the stacked title/pill column.
+        # Fixed size → the bar's geometry is decided once; samples
+        # repaint the meter only.
+        title_row.addWidget(
+            self.gpu_meter, 0, Qt.AlignmentFlag.AlignVCenter
+        )
         layout.addLayout(title_row)
 
         helper = QLabel(PLAN_HELPER_TEXT)
@@ -1054,10 +1100,25 @@ class MainWindow(QMainWindow):
         self.overall_bar.set_busy(True, "queue active ...")
         self.stage_bar.set_busy(True, "starting ...")
         self.run_total = len(self.job_ids)
-        self.run_done = 0
+        # v0.4.10 (R2): batch truth accounting lives in the pure
+        # summarize_batch(state list) → BatchSummary; run_counts is the
+        # GUI-side mirror of which job slot reached which terminal
+        # state (index i ↔ job_ids[i] ↔ table row i), run_summary is
+        # the last rendered BatchSummary. "Terminal" counts a job as
+        # RESOLVED (bar advances); only succeeded raises the succeeded
+        # count (bar green).
+        self.run_counts: list[str | None] = [None] * self.run_total
+        self.run_summary = summarize_batch([None] * self.run_total)
+        # v0.4.10 (R2): the batch bar restarts from a KNOWN color — the
+        # stale QSS chunk from a previous run must not survive into
+        # this run's truth.
+        self._progress_chunk_color = None
         self.progress.setRange(0, self.run_total)
         self.progress.setValue(0)
-        self.progress.setFormat(f"0/{self.run_total} completed")
+        # Fresh accounting: nothing succeeded yet, so even the single-
+        # job bar carries truth ("0/1 succeeded") instead of the old
+        # "0/1 completed" phrasing that counted ANY terminal state.
+        self.progress.setFormat(_batch_format(self.run_summary))
         self.progress.show()
         self._sync_run_controls()
         # Liveness: dots animate, clock ticks until the last job lands
@@ -1242,11 +1303,15 @@ class MainWindow(QMainWindow):
             # to GET an ETA (the count pass), never a bare "estimating"
             # pulse forever. A duplicated busy call is a no-op anyway.
             self.stage_bar.set_busy(True, _BUSY_MEASURING_LABEL)
-        # Overall queue: completed jobs + current fraction, over total.
-        done_units = self.run_done
+        # Overall queue: resolved jobs + current fraction, over total.
+        # v0.4.10 (R2): resolved = reached ANY terminal state (the
+        # queue position is honest even when a job cancelled/failed);
+        # the headline batch BAR renders the colored succeeded-
+        # dominated truth separately (_apply_batch_summary).
+        resolved_units = sum(1 for c in self.run_counts if c is not None)
         frac_units = self._stage_fraction or 0.0
         total_units = max(1, self.run_total)
-        overall = (done_units + frac_units) / total_units
+        overall = (resolved_units + frac_units) / total_units
         self.overall_bar.set_value(overall, None)
         # Log tail: the runner's own log (the bridge's _log_tail lives
         # inside the snapshot; render it verbatim).
@@ -1255,8 +1320,19 @@ class MainWindow(QMainWindow):
             self._render_log_tail("\n".join(str(line) for line in tail[-40:]))
 
     def _consume_terminal_snapshot(self, row: int, snapshot: dict) -> None:
-        self.run_done += 1
         state = snapshot.get("state") or "finished"
+        # v0.4.10 (R2): the bar's truth accounting. run_counts records
+        # the terminal state per job slot (row i ↔ job_ids[i]);
+        # summarize_batch turns the slate into an immutable
+        # BatchSummary (pure, unit-tested); _apply_batch_summary
+        # paints the bar (value + QSS chunk color + honest format).
+        # A cancelled/failed job advances the bar (a slot resolved)
+        # but never raises a succeeded count — the bar can no longer
+        # render a full-green "1/1 completed" for a cancelled run.
+        if 0 <= row < len(self.run_counts):
+            self.run_counts[row] = state
+        self.run_summary = summarize_batch(self.run_counts)
+        self._apply_batch_summary(self.run_summary)
         if row < self.file_table.rowCount():
             cell = self.file_table.item(row, 0)
             if cell is not None:
@@ -1272,8 +1348,32 @@ class MainWindow(QMainWindow):
                 )
                 if color is not None:
                     cell.setForeground(color)
-        self.progress.setValue(min(self.run_done, self.run_total))
-        self.progress.setFormat(f"{self.run_done}/{self.run_total} completed")
+
+    # -- v0.4.10 (R2): the batch bar's truth rendering -------------------
+
+    def _batch_bar_palette(self, summary: BatchSummary) -> str:
+        """The bar's chunk color for the MIXED multi-job bar: the worst
+        outcome so far names the bar (cancelled amber > failed red),
+        succeeded-only stays green."""
+        if summary.cancelled:
+            return "#d8a93a"  # amber: something was cancelled
+        if summary.failed:
+            return "#c4605a"  # red: something failed
+        return "#3d9865"  # green: all succeeded so far
+
+    def _apply_batch_summary(self, summary: BatchSummary) -> None:
+        """One writer for the batch bar: value, honest format string,
+        and chunk color (green succeeded / amber cancelled / red /
+        failed). No Qt paint churn on identical values."""
+        total = max(1, self.run_total)
+        self.progress.setValue(min(summary.resolved, total))
+        self.progress.setFormat(_batch_format(summary))
+        color = self._batch_bar_palette(summary)
+        if color != self._progress_chunk_color:
+            self._progress_chunk_color = color
+            self.progress.setStyleSheet(
+                f"QProgressBar::chunk {{ background: {color}; border-radius: 5px; }}"
+            )
 
     def _set_text(self, label: QLabel, text: str) -> None:
         """setText only on change: the 1 Hz pass then costs nothing on
@@ -1485,6 +1585,11 @@ class MainWindow(QMainWindow):
                     break
                 time.sleep(0.05)
         self.client.stop()
+        # v0.4.10 (R1): stop the GPU meter's cadence before teardown —
+        # no probe runs past app close; a hung child dies at its own
+        # 2 s timeout and the pool's daemon-ish thread ends with the
+        # process.
+        self.gpu_meter.stop()
         # v0.4.6 (§4.5): stop the LAN monitor beside the worker stop —
         # the sibling never leaves a listener after close. The pill is
         # refreshed too: a close-then-inspect window never shows a

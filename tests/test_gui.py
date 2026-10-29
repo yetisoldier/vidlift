@@ -579,7 +579,8 @@ def test_a2_parity_stub_row_reads_no_ai_upscale(window, tmp_path):
     # re-render from the same registry truth
     window.client.registry.jobs[0].state = "succeeded"
     window.job_ids = [job_id]
-    window.run_done = 0
+    window.run_counts = [None]
+    window._progress_chunk_color = None
     window._consume_terminal_snapshot(0, window.client.status_snapshot(job_id))
     assert window.file_table.item(0, 0).text() == "succeeded"
 

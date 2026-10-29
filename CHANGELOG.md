@@ -2,6 +2,50 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.10] - 2026-10-28
+
+GUI truth-and-instrumentation patch (Eric's direct request): a GPU
+meter in the top bar, an honest batch progress bar, and the fresh-run
+default made explicit.
+
+### Added
+
+- **GPU meter (top bar)**: a fixed-size (~180x54) Task-Manager-style
+  widget — dark panel, faint grid, filled lavender area chart of the
+  last ~90 samples, "GPU" label top-left, current utilization top-right.
+  Samples NVIDIA utilization at ~2 Hz via
+  `nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits`,
+  off the UI thread (QThreadPool worker) with a hard 2 s child timeout
+  (terminate on expiry). Multi-GPU: the MAX utilization across devices
+  with a small `x2`/`x3` device-count hint. When nvidia-smi is absent,
+  fails, or times out: renders "GPU n/a" and never crashes, never
+  logs, never stalls — it is read-only instrumentation and cannot
+  interfere with an active upscale (new module `vidlift/ui/gpu_meter.py`,
+  zero new dependencies).
+
+### Fixed
+
+- **Batch progress bar truth (R2)**: terminal-but-not-succeeded jobs
+  no longer lied. The bar previously counted ANY terminal state into
+  `run_done`, so a cancelled 1/1 batch rendered a full green
+  "1/1 completed" bar — contradicting the row table's yellow
+  cancelled row. Now `summarize_batch(states) -> BatchSummary`
+  (pure, in `vidlift/run.py`) does the counting — succeeded, failed,
+  cancelled, pending — and the bar renders truthfully: "1/2
+  succeeded, 1 cancelled" (amber chunk), "1/2 succeeded, 1 failed"
+  (red chunk), "2/2 succeeded" (green chunk). Row-table colors are
+  untouched.
+
+### Changed
+
+- **Fresh-run default (R3)**: made explicit — the GUI Start path
+  rides `resume=self.resume_claim.isChecked()` into
+  `run_file(resume=...)` (v0.4.9's explicit contract), and `resume`
+  keeps its DEFAULT-OFF run_file default. A normal Start is a clean
+  start: no retained scratch from a previous run of the same source
+  is claimed unless the opt-in "Resume retained work" checkbox is on
+  (a new unit test pins the default and the explicit ride-through).
+
 ## [0.4.9] - 2026-10-28
 
 Resume of retained work plus anti-freeze hardening, per the binding

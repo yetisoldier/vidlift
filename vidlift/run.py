@@ -90,6 +90,7 @@ __all__ = [
     "UpscaleError",
     "VideoToolError",
     "VerificationResult",
+    "BatchSummary",
     "build_encode_command",
     "build_decode_command",
     "build_prepare_command",
@@ -100,6 +101,7 @@ __all__ = [
     "run_with_heartbeat",
     "cleanup_run_artifacts",
     "replace_source_with_output",
+    "summarize_batch",
     "verify_output",
 ]
 
@@ -1618,6 +1620,81 @@ def _apply_subtitle_ocr_preference(
             subtitle_note="bitmap subtitle OCR disabled; no subtitles carried",
         )
     return plan
+
+
+# ---- v0.4.10 (R2): pure batch-truth accounting --------------------------------
+
+
+@dataclass(frozen=True)
+class BatchSummary:
+    """The immutable result of :func:`summarize_batch`.
+
+    ``total`` is the batch size (every slate slot, resolved or not);
+    ``resolved`` counts slots that reached ANY terminal state; the
+    per-state counts attribute each slot to exactly one outcome.
+    ``pending`` is total minus resolved. Invariants (asserted by the
+    v0.4.10 unit tests): ``succeeded + failed + cancelled == resolved``
+    and ``resolved + pending == total``.
+    """
+
+    total: int
+    succeeded: int
+    failed: int
+    cancelled: int
+
+    @property
+    def resolved(self) -> int:
+        return self.succeeded + self.failed + self.cancelled
+
+    @property
+    def pending(self) -> int:
+        return self.total - self.resolved
+
+    @property
+    def all_succeeded(self) -> bool:
+        """True only when every slot resolved as succeeded (the green
+        bar condition; a cancelled/failed slot always falsifies it and
+        an EMPTY batch is never a success)."""
+        return (
+            self.total > 0
+            and self.succeeded == self.total
+            and self.failed == 0
+            and self.cancelled == 0
+        )
+
+
+def summarize_batch(states) -> BatchSummary:
+    """The batch truth slate → :class:`BatchSummary` (PURE; no Qt, no
+    I/O — the R2 unit seam). ``states`` is any iterable of slot
+    labels (list/tuple of ``str | None``).
+
+    A slot is ``None``/unknown/blank until its job reaches a terminal
+    state; recognized terminal states are exactly ``succeeded``,
+    ``failed``, ``cancelled`` (the registry's vocabulary; anything
+    else — e.g. a stale non-terminal label — would be a contract bug
+    and counts as still-pending, never silently as success).
+
+    v0.4.10 truth rule: a cancelled or failed job resolves its slot
+    but must NEVER raise a succeeded count — the old ``run_done``
+    counter did exactly that, painting a cancelled 1/1 batch as a
+    full green "1/1 completed" bar.
+    """
+    total = len(states)
+    succeeded = failed = cancelled = 0
+    for state in states:
+        if state == "succeeded":
+            succeeded += 1
+        elif state == "failed":
+            failed += 1
+        elif state == "cancelled":
+            cancelled += 1
+        # None, blank, or unknown non-terminal junk all stay PENDING
+        # (never silently success). Only the registry's exact terminal
+        # vocabulary above counts as resolved; anything else would be
+        # a contract bug surfaced as a pending slot, not a lie.
+    return BatchSummary(
+        total=total, succeeded=succeeded, failed=failed, cancelled=cancelled
+    )
 
 
 def run_file(

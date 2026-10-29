@@ -219,7 +219,8 @@ class _BarHarness(QMainWindow):
         self._stage_eta = None
         self._stage_fraction = None
         self.run_total = 1
-        self.run_done = 0
+        self.run_counts = [None]
+        self._progress_chunk_color = None
         # one job, one snapshot; the log tail is empty (separate tests)
         self.snapshot = snapshot
         self.job_ids = ["vl-test-1"]
