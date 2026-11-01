@@ -72,10 +72,10 @@ class ClaimFakeRunner:
             return 0, PROBE_PAYLOAD, ""
         if "-show_streams" in args:
             # the input probe (source path last) wants the SD stream
-            # report; the verify probe (the .720p.hevc.mp4 output last)
+            # report; the verify probe (the .720p.mp4 output last)
             # wants the planned HD geometry.
             last = args[-1] if args else ""
-            if last.endswith(".720p.hevc.mp4"):
+            if last.endswith(".720p.mp4"):
                 return 0, json.dumps(
                     {
                         "streams": [
@@ -110,7 +110,7 @@ class ClaimFakeRunner:
             if self.prepare_exit == 0 and self.prepare_writes:
                 Path(args[-1]).write_bytes(b"prepared-stub")
             return self.prepare_exit, "", ""
-        if args and args[-1].endswith(".720p.hevc.mp4"):
+        if args and args[-1].endswith(".720p.mp4"):
             if self.encode_exit == 0:
                 Path(args[-1]).write_bytes(b"output-stub")
             return self.encode_exit, "", "encode boom" if self.encode_exit else ""

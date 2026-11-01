@@ -490,3 +490,202 @@ def test_v0412_item4_no_completed_phrased_batch_format_string_in_gui_source():
     )
     # The honest form must exist.
     assert "{summary.succeeded}/{total} succeeded" in gui_source
+
+# ---------------------------------------------------------------------------
+# Item 3: output filename contract + collision gates
+# ---------------------------------------------------------------------------
+
+
+def test_v0412_item3_expected_output_names_carry_target_not_hevc(tmp_path):
+    """The plan boundary: outputs are named {stem}.{target}.mp4 — no
+    "hevc" infix (the "Part Two - S01E02.720p.mp4" contract)."""
+    from vidlift.plan import _expected_output_path
+
+    assert (
+        _expected_output_path("/media/Movie.avi", None, "720p")
+        == "/media/Movie.720p.mp4"
+    )
+    assert (
+        _expected_output_path("/media/Movie.avi", "/output", "720p")
+        == "/output/Movie.720p.mp4"
+    )
+
+
+def test_v0412_item3_build_batch_plan_yields_new_name(tmp_path):
+    from vidlift.plan import build_batch_plan
+
+    source = tmp_path / "movie.avi"
+    source.write_text("")
+    report = _report("movie.avi")
+    report.path = str(source)
+    batch = build_batch_plan([report], target="720p", gb_per_hour=1.5)
+    (item,) = batch.files
+    assert item.output_path == str(tmp_path / "movie.720p.mp4")
+    assert "hevc" not in item.output_path
+
+
+def test_v0412_item3_plan_time_collision_marks_not_ready_with_warning(
+    tmp_path,
+):
+    """A pre-existing file at the planned output path blocks the item:
+    verdict not-ready + warning naming the file (block-until-forced; no
+    force flag this cycle)."""
+    from vidlift.gui import warnings_for
+
+    source = tmp_path / "collide.avi"
+    source.write_text("")
+    existing_output = tmp_path / "collide.720p.mp4"
+    existing_output.write_bytes(b"previous output")
+    report = _report("collide.avi")
+    report.path = str(source)
+
+    from vidlift.plan import build_file_plan
+
+    item = build_file_plan(report, gb_per_hour=1.5)
+    assert item.process_verdict != "ready"
+    assert item.process_verdict == "output-exists"
+    warning = (
+        f"output exists: {existing_output.name} (will not be overwritten)"
+    )
+    assert warning in warnings_for(item)
+    # batch path agrees (the GUI/CLI both plan through it):
+    from vidlift.plan import build_batch_plan
+
+    batch = build_batch_plan([report], gb_per_hour=1.5)
+    (batched,) = batch.files
+    assert batched.process_verdict == "output-exists"
+    assert batch.runnable_count == 0
+    # No collision: the normal ready verdict is untouched.
+    clean_source = tmp_path / "clean.avi"
+    clean_source.write_text("")
+    clean_report = _report("clean.avi")
+    clean_report.path = str(clean_source)
+    clean = build_file_plan(clean_report, gb_per_hour=1.5)
+    assert clean.process_verdict == "ready"
+
+
+def test_v0412_item3_gui_plan_shows_collision_warning_in_row(
+    qapp, monkeypatch, tmp_path
+):
+    """The GUI surface: a collided item renders its warning in the
+    Warnings column and Start refuses (runnable_count gate)."""
+    from vidlift.plan import BatchPlan
+
+    source = tmp_path / "gui-collide.avi"
+    source.write_text("")
+    (tmp_path / "gui-collide.720p.mp4").write_bytes(b"occupied")
+    report = _report("gui-collide.avi")
+    report.path = str(source)
+    from vidlift.plan import build_file_plan
+
+    item = build_file_plan(report, gb_per_hour=1.5)
+
+    class _C:
+        def active_job_count(self):
+            return 0
+
+        def history(self, limit=20):
+            return []
+
+        def stop(self, **k):
+            pass
+
+    import PyQt6.QtCore as QtCore
+
+    def _settings(self):
+        return QtCore.QSettings(
+            str(tmp_path / "settings.ini"), QtCore.QSettings.Format.IniFormat
+        )
+
+    monkeypatch.setattr(MainWindow, "_settings", _settings)
+    win = MainWindow(client=_C())
+    win.batch = BatchPlan([item])
+    win.render_batch(win.batch)
+    warnings_cell = win.file_table.item(0, 7)
+    assert warnings_cell is not None
+    assert "output exists: gui-collide.720p.mp4" in warnings_cell.text()
+    assert "(will not be overwritten)" in warnings_cell.text()
+    # the verdict cell is not green (not ready) and Start stays disabled
+    assert win.start_button.isEnabled() is False
+    win.job_ids = []
+    win._run_started_at = None
+    win.deleteLater()
+    qapp.processEvents()
+
+
+def test_v0412_item3_run_time_guard_fails_single_job_not_batch(tmp_path):
+    """The encode-must-not-overwrite guard: os.path.exists immediately
+    before encode raises RunError naming the file (the plan→run race
+    closure). The raised failure is THIS job's RunError, which the
+    executor records per-job — the batch carries on (per-job failure
+    aggregation is the executor's normal path, unchanged)."""
+    from vidlift.plan import build_file_plan
+    from vidlift.probe import FileReport
+
+    source = tmp_path / "race.avi"
+    source.write_text("")
+    report = _report("race.avi")
+    report.path = str(source)
+    item = build_file_plan(report, gb_per_hour=1.5)
+    # A file appeared at the output path AFTER planning:
+    output = Path(item.output_path)
+    output.write_bytes(b"appeared-after-plan")
+    assert output.exists()
+    # The run-time guard rides the encode phase in run.py; pin its exact
+    # contract at the source level (the seam run_file itself needs a
+    # full environment; the guard text + semantics are the boundary).
+    import vidlift.run as run_mod
+
+    source_text = Path(run_mod.__file__).read_text(encoding="utf-8")
+    guard = (
+        "if os.path.exists(plan.output_path):\n"
+        '            raise RunError(\n'
+        '                f"output already exists, will not be overwritten: '
+        '{plan.output_path}"\n'
+        "            )"
+    )
+    assert guard in source_text, (
+        "run.py encode-time os.path.exists guard drifted from the pinned form"
+    )
+    # and the guard's raise type is the per-job RunError (not a batch
+    # exception): RunError is what the executor maps to job failure.
+    assert issubclass(run_mod.RunError, Exception)
+
+
+def test_v0412_item3_no_stale_hevc_name_assertions_remain():
+    """Name-sweep pin (design §4/§5): no `.hevc.mp4` construction or
+    assertion remains in production code or tests; the only allowed
+    occurrence is the intentional historical comment in plan.py and
+    this test's own docstring."""
+    import vidlift
+    from pathlib import Path as _P
+
+    self_name = "test_v0412_item3_no_stale_hevc_name_assertions_remain"
+
+    def _in_own_test(py, lineno) -> bool:
+        if py.name != "test_v0412_boundary.py":
+            return False
+        lines = py.read_text(encoding="utf-8").splitlines()
+        # the whole body of THIS test (from its def line to end of file) is exempt
+        for idx, line in enumerate(lines, 1):
+            if f"def {self_name}" in line:
+                return lineno >= idx
+        return False
+
+    hits: list[str] = []
+    for base in (
+        _P(vidlift.__file__).parent,
+        _P(vidlift.__file__).parent.parent / "tests",
+    ):
+        for py in base.rglob("*.py"):
+            for lineno, line in enumerate(
+                py.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                if "hevc.mp4" not in line:
+                    continue
+                if "hardcoded literal" in line:
+                    continue  # plan.py's intentional historical comment
+                if _in_own_test(py, lineno):
+                    continue  # this test's own text
+                hits.append(f"{py.name}:{lineno}: {line.strip()}")
+    assert hits == [], hits

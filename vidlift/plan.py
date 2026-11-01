@@ -143,10 +143,19 @@ def _audio_plan(report: FileReport) -> AudioPlan:
     return AudioPlan(channels=channels, bitrate_kbps=bitrate, label=label)
 
 
-def _expected_output_path(input_path: str, output_dir: str | None) -> str:
+def _expected_output_path(
+    input_path: str, output_dir: str | None, target: str
+) -> str:
+    # v0.4.12 (item 3): the output name carries the REAL target, not a
+    # hardcoded literal: `Movie.720p.hevc.mp4` → `Movie.720p.mp4`. The
+    # ".hevc" infix made collisions with user files nearly impossible;
+    # the plain `.{target}.mp4` name does not, so the collision life of
+    # this name is handled at plan time (the not-ready pre-flight in
+    # build_batch_plan) and at run time (the encode-must-not-overwrite
+    # guard in run.py).
     source = Path(input_path)
     directory = Path(output_dir) if output_dir else source.parent
-    return str(directory / f"{source.stem}.720p.hevc.mp4")
+    return str(directory / f"{source.stem}.{target}.mp4")
 
 
 def _expectation(report: FileReport) -> str:
@@ -325,8 +334,16 @@ def build_file_plan(
     target: str = "720p",
     gb_per_hour: float = DEFAULT_GB_PER_HOUR,
     output_dir: str | None = None,
+    check_collision: bool = True,
 ) -> PlannedFile:
-    """Build a pre-flight plan for one classified file."""
+    """Build a pre-flight plan for one classified file.
+
+    v0.4.12 (item 3): plan-time collision pre-flight — when the computed
+    output path already exists on disk the item is marked not-ready with a
+    warning (block-until-forced; no silent overwrite of a pre-existing
+    file). ``check_collision`` exists so a caller that has already dealt
+    with the disk state can skip the probe; the default keeps the gate on.
+    """
     if gb_per_hour <= 0:
         raise PlanError("gb_per_hour must be greater than zero")
     if report.video is None:
@@ -348,10 +365,10 @@ def build_file_plan(
         and subtitle_plan.kind == "text"
         and subtitle_plan.codec_name in ("ass", "ssa")
     )
-    return PlannedFile(
+    planned = PlannedFile(
         report=report,
         target=target,
-        output_path=_expected_output_path(report.path, output_dir),
+        output_path=_expected_output_path(report.path, output_dir, target),
         output_width=width,
         output_height=height,
         target_gb_per_hour=gb_per_hour,
@@ -364,6 +381,17 @@ def build_file_plan(
         subtitle_plan=subtitle_plan,
         subtitle_style_loss=style_loss,
     )
+    if check_collision and os.path.exists(planned.output_path):
+        # v0.4.12 (item 3): the new plain name can legitimately collide
+        # with a pre-existing file (a previous VidLift run, a hand encode,
+        # a download) and the encoder's -y would erase it silently. Plan
+        # truth: the item is NOT ready until the collision is resolved;
+        # the warning names the file so the Warnings column shows it.
+        return replace(
+            planned,
+            process_verdict="output-exists",
+        )
+    return planned
 
 
 def build_batch_plan(
@@ -373,18 +401,30 @@ def build_batch_plan(
     gb_per_hour: float = DEFAULT_GB_PER_HOUR,
     output_dir: str | None = None,
 ) -> BatchPlan:
-    """Build a batch pre-flight plan from classified probe reports."""
-    return BatchPlan(
-        [
-            build_file_plan(
-                report,
-                target=target,
-                gb_per_hour=gb_per_hour,
-                output_dir=output_dir,
+    """Build a batch pre-flight plan from classified probe reports.
+
+    v0.4.12 (item 3): the plan-time collision pre-flight lives here (the
+    batch owner of the target string): each file whose computed output
+    name already exists on disk is returned NOT-ready with the warning —
+    the GUI treats it exactly like every other non-ready verdict (yellow
+    row, excluded from Start).
+    """
+    files: list[PlannedFile] = []
+    for report in reports:
+        item = build_file_plan(
+            report,
+            target=target,
+            gb_per_hour=gb_per_hour,
+            output_dir=output_dir,
+            check_collision=False,
+        )
+        if item.process_verdict == "ready" and os.path.exists(item.output_path):
+            item = replace(
+                item,
+                process_verdict="output-exists",
             )
-            for report in reports
-        ]
-    )
+        files.append(item)
+    return BatchPlan(files)
 
 
 def attach_estimate(

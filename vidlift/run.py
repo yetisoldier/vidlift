@@ -2163,6 +2163,19 @@ def run_file(
         phase = begin_phase(PHASE_ENCODE)
         record_step("encode")
 
+        # v0.4.12 (item 3): the run-time collision guard. The plan-time
+        # pre-flight gates the ordinary flow, but a file can APPEAR
+        # between plan and run (another VidLift run, a copy, a download).
+        # The encoder's -y would erase it silently. Cheap os.path.exists
+        # check before encode: fail THIS job (never the batch) with an
+        # error that names the file. No force flag ships this cycle — a
+        # deliberate over-write is out of scope until the force path
+        # exists.
+        if os.path.exists(plan.output_path):
+            raise RunError(
+                f"output already exists, will not be overwritten: {plan.output_path}"
+            )
+
         def _encode_hint(elapsed: float) -> None:
             # B.6: an elapsed-time hint, honestly labeled — the pump is
             # touch+log only (B.10(4) discipline), no stdout parsing.

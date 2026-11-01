@@ -135,7 +135,15 @@ def _render_plan(item) -> str:
         lines.append("  warning: PAL speedup suspected; VidLift will process as-is")
     if report.interlaced_flagged:
         lines.append("  warning: interlace flagged; engine must deinterlace before upscale")
-    if item.process_verdict != "ready":
+    if item.process_verdict == "output-exists":
+        # v0.4.12 (item 3): plan-time collision gate — block-until-forced;
+        # no force flag ships this cycle, so the action names the fix.
+        lines.append(
+            f"  warning: output exists: {os.path.basename(item.output_path)} "
+            "(will not be overwritten)"
+        )
+        lines.append("  action: resolve the existing file, then re-plan")
+    elif item.process_verdict != "ready":
         lines.append("  action: skip unless explicitly forced in a later pipeline version")
     return "\n".join(lines)
 

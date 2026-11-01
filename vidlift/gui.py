@@ -172,7 +172,16 @@ def warnings_for(item: PlannedFile) -> list[str]:
         warnings.append("PAL speedup suspected; VidLift will process as-is")
     if report.interlaced_flagged:
         warnings.append("Interlace flagged; engine must deinterlace before upscale")
-    if item.process_verdict != "ready":
+    if item.process_verdict == "output-exists":
+        # v0.4.12 (item 3): the plan-time collision gate. The planned
+        # output name sits on disk already; the encoder's -y would erase
+        # it silently. The warning NAMES the file (the acceptance
+        # wording); resolution is a user decision — no force flag ships
+        # this cycle.
+        warnings.append(
+            f"output exists: {Path(item.output_path).name} (will not be overwritten)"
+        )
+    elif item.process_verdict != "ready":
         warnings.append("Skipped unless explicitly forced in a later pipeline version")
     return warnings
 
