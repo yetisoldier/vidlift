@@ -2,6 +2,29 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.12] - 2026-11-01
+
+### Changed
+
+- **Output filename: `<source>.720p.hevc.mp4` → `<source>.<target>.mp4`**
+  (e.g. `Part Two - S01E02.720p.mp4`). The name now carries the real
+  plan target instead of a hardcoded `720p.hevc` infix. NO retroactive
+  renaming of past outputs — existing `.720p.hevc.mp4` files on disk
+  stay as they are (policy: migration is a separate, explicit decision).
+
+### Added
+
+- **Plan-time output collision gate**: when the computed output name
+  already exists on disk at plan time, the item plans NOT-ready with
+  the warning `output exists: <name> (will not be overwritten)` —
+  the encoder's `-y` must never erase a pre-existing file silently.
+  Block-until-forced; no force flag ships this cycle (resolution is a
+  user decision: move/remove the file, then re-plan).
+- **Run-time collision guard**: a cheap `os.path.exists` check on the
+  planned output immediately before encode fails THAT single job (not
+  the batch) with a clear error if a file appeared between plan and
+  run — closing the plan→run race the plan-time gate cannot see.
+
 ## [0.4.11] - 2026-10-29
 
 ### Fixed

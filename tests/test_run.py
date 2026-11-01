@@ -114,7 +114,7 @@ class FakeRunner:
 
     - ffprobe input probe ("-show_format"): returns the canned payload.
     - prepare (last arg *.prepared.mkv): writes a placeholder file.
-    - encode (last arg *.hevc.mp4): writes a placeholder output.
+    - encode (last arg *.720p.mp4): writes a placeholder output.
     - verify ("-show_streams" on the output): reports canned geometry.
     """
 
@@ -171,7 +171,7 @@ class FakeRunner:
             if self.prepare_exit == 0:
                 Path(args[-1]).write_bytes(b"prepared-stub")
             return self.prepare_exit, "", "prepare boom" if self.prepare_exit else ""
-        if args and args[-1].endswith(".720p.hevc.mp4") and "-i" in args and any(a.endswith(".srt") for a in args):
+        if args and args[-1].endswith(".720p.mp4") and "-i" in args and any(a.endswith(".srt") for a in args):
             # v0.4.1: the mov_text mux into the finished MP4 writes a
             # temp sibling that mux_srt_into_mp4 then replaces over the
             # output (temp-then-replace atomicity)
@@ -183,7 +183,7 @@ class FakeRunner:
             if self.prepare_exit == 0:
                 Path(args[-1]).write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n")
             return self.prepare_exit, "", "srt boom" if self.prepare_exit else ""
-        if args and args[-1].endswith(".720p.hevc.mp4"):
+        if args and args[-1].endswith(".720p.mp4"):
             if self.encode_exit == 0 and self.encode_writes_output:
                 Path(args[-1]).write_bytes(b"output-stub")
             return self.encode_exit, "", "encode boom" if self.encode_exit else ""
@@ -479,7 +479,7 @@ class TestRunFilePhases:
         plan = result.plan
         assert plan.process_verdict == "ready"
         assert plan.video_bitrate_kbps > 0
-        assert Path(plan.output_path).name == "movie.720p.hevc.mp4"
+        assert Path(plan.output_path).name == "movie.720p.mp4"
         assert result.state.output_path == plan.output_path
         # v0.4.7 (success cleanup): the prepared scratch is GONE after a
         # verified run; the state field still records where it was.
@@ -558,7 +558,7 @@ class TestOutputDirectoryCreation:
     """
 
     def test_ensure_output_dir_creates_missing_parents(self, tmp_path):
-        target = tmp_path / "a" / "b" / "c" / "movie.720p.hevc.mp4"
+        target = tmp_path / "a" / "b" / "c" / "movie.720p.mp4"
         ensure_output_dir(str(target))
         assert (tmp_path / "a" / "b" / "c").is_dir()
         ensure_output_dir(str(target))  # an existing directory is a no-op
@@ -567,7 +567,7 @@ class TestOutputDirectoryCreation:
         blocker = tmp_path / "blocker"
         blocker.write_text("occupied")  # a FILE where a directory is needed
         with pytest.raises(RunError, match="cannot create output directory"):
-            ensure_output_dir(str(blocker / "movie.720p.hevc.mp4"))
+            ensure_output_dir(str(blocker / "movie.720p.mp4"))
 
     def test_run_creates_missing_output_dir_and_writes_there(self, tmp_path):
         path = make_media_file(tmp_path)
@@ -1104,7 +1104,7 @@ class TestReplaceSourceV047:
         import vidlift.run as run_mod
 
         src = tmp_path / "movie.avi"
-        out = tmp_path / "movie.720p.hevc.mp4"
+        out = tmp_path / "movie.720p.mp4"
         src.write_bytes(b"source-bytes")
         out.write_bytes(b"output-bytes")
         real_stat = run_mod.os.stat
@@ -1309,7 +1309,7 @@ class TestReplaceSourceV047:
         import vidlift.run as run_mod
 
         src = tmp_path / "movie.avi"
-        out = tmp_path / "movie.720p.hevc.mp4"
+        out = tmp_path / "movie.720p.mp4"
         src.write_bytes(b"source-bytes")
         out.write_bytes(b"output-bytes")
         real_stat = run_mod.os.stat
@@ -1779,7 +1779,7 @@ class TestEngineCancelOutcome:
             )
         # a cancelled run never leaves a claimed-complete output
         assert not os.path.isfile(
-            str(Path(path).with_name("movie.720p.hevc.mp4"))
+            str(Path(path).with_name("movie.720p.mp4"))
         )
 
 
@@ -1790,11 +1790,11 @@ class TestFullDecodeVerification:
     def test_decode_command_shape_is_pinned(self):
         marker("b12")
         tools = ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe")
-        cmd = build_decode_command(tools, "/out/movie.720p.hevc.mp4")
+        cmd = build_decode_command(tools, "/out/movie.720p.mp4")
         assert cmd == [
             "ffmpeg",
             "-v", "error", "-nostdin",
-            "-i", "/out/movie.720p.hevc.mp4",
+            "-i", "/out/movie.720p.mp4",
             "-f", "null", "-",
         ]
 
@@ -1967,9 +1967,9 @@ class TestHighestBoundaryPromiseSweep:
     def test_b8_output_filename_promise_at_manifest_boundary(self, tmp_path):
         marker("b8")
         result, _ = run_happy(tmp_path)
-        # the promise: outputs are named <stem>.720p.hevc.mp4
+        # the promise: outputs are named <stem>.720p.mp4
         assert Path(result.plan.output_path).name == (
-            "movie.720p.hevc.mp4"
+            "movie.720p.mp4"
         )
         manifest = json.loads(Path(result.manifest_path).read_text())
         assert manifest["plan"]["output_path"] == result.plan.output_path
@@ -2041,7 +2041,7 @@ class TestHighestBoundaryPromiseSweep:
             engine=engine, log_dir=str(tmp_path / "runs"),
         )
         assert Path(result.plan.output_path).name == (
-            "movie.720p.hevc.mp4"
+            "movie.720p.mp4"
         )
         assert os.path.isfile(result.plan.output_path)
 

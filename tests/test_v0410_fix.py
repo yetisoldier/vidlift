@@ -487,6 +487,9 @@ class _Seam:
     _apply_batch_summary = MainWindow._apply_batch_summary
     _batch_bar_palette = MainWindow._batch_bar_palette
     _batch_slot_for = MainWindow._batch_slot_for
+    # v0.4.12: the row identity map the terminal writer keys on; seams
+    # seed it per-test like a real batch (submission order).
+    _batch_row_for_job = {}
 
 
 def _seam_with(run_total, rows=2):
