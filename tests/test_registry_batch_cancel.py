@@ -114,3 +114,113 @@ def test_r2_claim_next_vs_cancel_batch_race_gate(tmp_path):
 
         # Post-state: a follow-up claim never resurrects a batch id.
         assert registry.claim_next() is None, iteration
+
+# ---------------------------------------------------------------------------
+# R1: cancel_batch atomicity/ordering (design §7.1)
+# ---------------------------------------------------------------------------
+
+
+def test_r1_cancel_batch_running_and_queued(tmp_path):
+    """J1 running + J2/J3 queued: one cancel_batch call flips J1's flag
+    (\"cancelling\"), marks J2/J3 cancelled with the binding error/ok,
+    persists once, and a follow-up claim finds nothing."""
+    registry, ids = _fresh_registry(tmp_path, "r1")
+    j1, j2, j3 = ids
+    record = registry.require(j1)
+    registry.claim_next()  # claims J1 (oldest) -> running + live flag
+
+    results = registry.cancel_batch(ids)
+
+    assert results == {j1: "cancelling", j2: "cancelled", j3: "cancelled"}
+    assert registry.get_cancel_flag(j1).is_set()
+    j1r = registry.require(j1)
+    assert j1r.state == "running"  # dies later via the flag (worker path)
+    for job_id in (j2, j3):
+        queued_record = registry.require(job_id)
+        assert queued_record.state == "cancelled"
+        assert queued_record.error == "batch cancelled by user"
+        assert queued_record.ok is False
+    # The persisted file already reflects the cancelled truth.
+    reloaded = Registry(tmp_path / "r1")
+    assert reloaded.require(j2).state == "cancelled"
+    assert reloaded.require(j2).error == "batch cancelled by user"
+    assert reloaded.require(j2).ok is False
+    assert reloaded.require(j1).state == "running"
+    # The claim loop's next read finds nothing from the set.
+    assert registry.claim_next() is None
+
+
+def test_r1_cancel_batch_active_job_count_reaches_zero(tmp_path):
+    """After the running job's flag-driven death and the queued marks,
+    queued+running shrink so Start/Plan can re-enable (§3.4 choke 8)."""
+    from vidlift.mcp_bridge.client_local import LocalBridgeClient
+
+    client = LocalBridgeClient(state_dir=tmp_path / "r1c", start_executor=False)
+    paths = []
+    for i in range(2):
+        path = tmp_path / f"v{i}.avi"
+        path.write_text("")
+        paths.append(path)
+    ids = [
+        client.enqueue_run([str(path)], options={})[0]
+        for path in paths
+    ]
+    # Simulate: first job running (claim), then GUI-side batch cancel.
+    client.registry.claim_next()
+    client.registry.get(ids[0]).state == "running"
+    client.registry.cancel_batch(ids)
+    assert client.active_job_count() == 1  # only the dying head remains
+
+
+def test_r1_cancel_batch_verdicts_for_terminal_and_unknown(tmp_path):
+    """Terminal ids -> already-finished; unknown ids -> not-found;
+    queued ids still cancel. Full per-id verdict map, no exceptions."""
+    registry, ids = _fresh_registry(tmp_path, "r1b", count=3)
+    j1, j2, j3 = ids
+    registry.transition(registry.require(j1), "cancelled")  # terminal
+    results = registry.cancel_batch([j1, j2, j3, "vl-nope-404"])
+    assert results == {
+        j1: "already-finished",
+        j2: "cancelled",
+        j3: "cancelled",
+        "vl-nope-404": "not-found",
+    }
+    assert registry.require(j1).state == "cancelled"  # untouched
+
+
+def test_r1_cancel_batch_double_call_is_cancelling(tmp_path):
+    """Idempotency belt-and-suspenders (§4.4): the running job's flag
+    already set -> second call degrades to \"cancelling\" via the
+    client's conflict rule; queued jobs read already-finished."""
+    from vidlift.mcp_bridge.client_local import LocalBridgeClient
+
+    client = LocalBridgeClient(state_dir=tmp_path / "r1d", start_executor=False)
+    paths = []
+    for i in range(2):
+        path = tmp_path / f"w{i}.avi"
+        path.write_text("")
+        paths.append(path)
+    ids = [
+        client.enqueue_run([str(path)], options={})[0]
+        for path in paths
+    ]
+    client.registry.claim_next()
+    first = client.cancel_batch(ids)
+    assert first == {ids[0]: "cancelling", ids[1]: "cancelled"}
+    second = client.cancel_batch(ids)
+    assert second == {ids[0]: "cancelling", ids[1]: "already-finished"}
+
+
+def test_r1_cancel_batch_include_running_variant_seam(tmp_path):
+    """§4.6 seam, not surfaced: include_running=False marks ONLY queued
+    jobs; the running job keeps running (flag untouched)."""
+    registry, ids = _fresh_registry(tmp_path, "r1e")
+    registry.claim_next()  # J1 -> running
+    results = registry.cancel_batch(ids, include_running=False)
+    assert results == {
+        ids[0]: "conflict",
+        ids[1]: "cancelled",
+        ids[2]: "cancelled",
+    }
+    assert registry.get_cancel_flag(ids[0]).is_set() is False
+    assert registry.require(ids[0]).state == "running"
