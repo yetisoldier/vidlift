@@ -233,6 +233,22 @@ class _BarHarness(QMainWindow):
         )
         self._set_text = MainWindow._set_text.__get__(self)
         self._render_log_tail = MainWindow._render_log_tail.__get__(self)
+        # v0.4.12 (item 2): the ETA seam the running-snapshot consume
+        # now touches; the harness starts with EMPTY ETA state (no
+        # fabricated history) and the pure render helpers bound.
+        self._eta_state = {}
+        self._eta_phase_now = None
+        self._eta_rendered = None
+        self._batch_eta_rendered = None
+        self._eta_current_job = MainWindow._eta_current_job.__get__(self)
+        self._eta_suffix_for_stage = MainWindow._eta_suffix_for_stage.__get__(self)
+        self._render_damped_eta = MainWindow._render_damped_eta.__get__(self)
+        self._eta_state_key = MainWindow._eta_state_key.__get__(self)
+        self._ETA_EWMA_ALPHA = MainWindow._ETA_EWMA_ALPHA
+        self._ETA_DAMPING_FRACTION = MainWindow._ETA_DAMPING_FRACTION
+        self._reset_eta_for_phase = MainWindow._reset_eta_for_phase.__get__(self)
+        self._duration_for_snapshot = MainWindow._duration_for_snapshot.__get__(self)
+        self._fmt_eta = MainWindow._fmt_eta.__get__(self)
         self._consume_running_snapshot(0, snapshot, run_stage_label(snapshot))
 
 

@@ -371,6 +371,24 @@ class MainWindow(QMainWindow):
         # the table on clear_files/_render_pending_files).
         self._batch_row_for_job: dict[str, int] = {}
 
+        # v0.4.12 (item 2): per-current-job ETA state — EWMA of the
+        # measured phase rate, keyed on CHUNK boundaries (a long
+        # disk-bound lull must not bleed into the GPU rate), reset at
+        # every phase transition and at every batch start. Seeded empty:
+        # ETA digits appear only after >=2 chunk samples, never
+        # fabricated.
+        self._eta_state: dict = {}
+        # v0.4.12 (item 2): the phase the ETA window belongs to (the
+        # stage's first word); a change wipes the window.
+        self._eta_phase_now: str | None = None
+        # Display damping for the current-job ETA: when the newly
+        # computed value is within 25% of the last rendered one (and the
+        # rate did not truly change), render the previous value — the
+        # number must not visibly jitter at 1 Hz.
+        self._eta_rendered: float | None = None
+        # Batch label damping mirrors the same rule across ticks.
+        self._batch_eta_rendered: float | None = None
+
         # v0.4.5 (progress-honesty §2, D-tail): pin-to-tail state for
         # the run log widget (Rule 1-5 contract lives in these flags;
         # the helpers read/reset them). Started disconnected; the
@@ -1183,6 +1201,11 @@ class MainWindow(QMainWindow):
         self._stage_now = "queued"
         self._stage_eta = None
         self._stage_fraction = None
+        # v0.4.12 (item 2): ETA state starts fresh with every batch.
+        self._eta_state = {}
+        self._eta_phase_now = None
+        self._eta_rendered = None
+        self._batch_eta_rendered = None
         self.time_elapsed.setText("Elapsed 0:00")
         # Seed the forecast immediately instead of waiting one tick.
         self._forecast_total()
@@ -1311,9 +1334,22 @@ class MainWindow(QMainWindow):
         # live ETA starts empty per the sibling rule); the busy label
         # for the count pass is the Measuring label (§3c state 1).
         key = _stage_label_text(stage)
+        # v0.4.12 (item 2): the ETA window keys on the PHASE (the first
+        # word of the stage segment — upscale/encode/verify...), never
+        # the sub-stage label: chunk labels ("upscaling chunk 3/12")
+        # change per chunk, and resetting on them would wipe the EWMA
+        # exactly at the boundaries where its samples arrive.
+        phase_key = key.split(" ", 1)[0]
         if self._stage_now != key:
             self._stage_eta = None
             self._stage_fraction = None
+            if self._eta_phase_now != phase_key:
+                # the EWMA window resets at every PHASE transition (a new
+                # phase starts with no samples: ETA digits reappear only
+                # after >=2 fresh chunk samples).
+                self._eta_state = {}
+                self._eta_rendered = None
+                self._eta_phase_now = phase_key
             self._stage_now = key
             if PREPARED_COUNT_PROBE_STEP in stage:
                 self.stage_bar.set_busy(True, _BUSY_MEASURING_LABEL)
@@ -1344,6 +1380,13 @@ class MainWindow(QMainWindow):
         # _set_text, so identical values never repaint the label.
         note = progress.get("phase_note")
         rendered = f"{stage} ({note})" if note else stage
+        # v0.4.12 (item 2): the honest per-file ETA suffix — computed from
+        # the phase-aware `_eta_current_job` (chunk-boundary EWMA in
+        # upscale, encode-seconds rate in encode); verify/finalize get NO
+        # digits (their elapsed rendering rides the existing heartbeat
+        # seconds in the label). The damped value rides the suffix.
+        eta = self._eta_current_job(snapshot)
+        eta_suffix = self._eta_suffix_for_stage(eta)
         # v0.4.9 (§2.3): the stale-activity suffix rides the stage
         # label (data-never-proof wording; the bar logic is untouched).
         age = snapshot.get("activity_age_seconds")
@@ -1355,7 +1398,7 @@ class MainWindow(QMainWindow):
             rendered = (
                 f"{rendered} — last activity {int(age // 60)} min ago"
             )
-        self._set_text(self.stage_label, rendered)
+        self._set_text(self.stage_label, rendered + eta_suffix)
         if frames_total and frames_done is not None and frames_total > 0:
             self._stage_fraction = max(0.0, min(1.0, frames_done / frames_total))
             # §3c: honest ETA the moment it exists. The bridge's
@@ -1559,12 +1602,235 @@ class MainWindow(QMainWindow):
         scrollbar = self.run_log_tail.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    # -- v0.4.12 (item 2): honest, phase-aware ETA -----------------------
+
+    _ETA_EWMA_ALPHA = 1 / 8  # rolling window over the last ~8 chunks
+    _ETA_DAMPING_FRACTION = 0.25  # ≤25% drift ⇒ keep the previous value
+
+    def _eta_state_key(self, job_id: object) -> str:
+        """One job's ETA state lives under its stable id (a batch has
+        exactly one RUNNING job, but the state must not alias when a
+        claim rebase renames the leading id)."""
+        return str(job_id)
+
+    def _reset_eta_for_phase(self, job_id: object) -> None:
+        """Phase transition: the EWMA window starts empty (a new phase's
+        rate has nothing to do with the previous one's); the damped
+        render clears too."""
+        self._eta_state.pop(self._eta_state_key(job_id), None)
+        self._eta_rendered = None
+
+    def _eta_current_job(self, snapshot: dict) -> float | None:
+        """The current job's ETA for THIS tick, or None (honest: no
+        number is invented).
+
+        Phase-aware per the v0.4.12 design:
+        - upscale: frames are the work. Rate = EWMA(Δframes/Δt) over
+          chunk boundaries (α=1/8); ETA = (frames_total − frames_done)/
+          rate. Needs >=2 chunk samples before any digits appear.
+        - encode: output seconds are the work. rate = encode_seconds/Δt
+          over the same EWMA; ETA = (duration − encode_seconds)/rate.
+        - verify/finalize: NO ETA number ever (ffprobe −count_frames on
+          a 200 GB file at 0% GPU — naive extrapolation lies badly);
+          callers render elapsed time instead.
+        - probe/count-pass/queued: unknown; existing honest markers.
+        - engine_simulated stubs never pose as measurements.
+        """
+        if not snapshot or snapshot.get("state") not in ("running",):
+            return None
+        if snapshot.get("engine_simulated"):
+            return None
+        phase = snapshot.get("current_phase") or ""
+        if phase in ("verify", "finalize", "probe", "subtitles", "done", ""):
+            return None
+        progress = snapshot.get("progress") or {}
+        now = time.time()
+        key = self._eta_state_key(snapshot.get("job_id"))
+        alpha = self._ETA_EWMA_ALPHA
+
+        if phase == "upscale":
+            frames_done = progress.get("frames_done")
+            frames_total = progress.get("frames_total")
+            chunk_index = progress.get("chunk_index")
+            if (
+                not isinstance(frames_done, (int, float))
+                or not isinstance(frames_total, (int, float))
+                or frames_total <= 0
+            ):
+                return None
+            state = self._eta_state.get(key) or {}
+            if not isinstance(state, dict):
+                state = {}
+            # Key on CHUNK boundaries: a new chunk is a sample point. A
+            # tick inside the same chunk refines nothing (Δframes vs
+            # Δt inside one chunk is chunked engine-internal noise);
+            # sample at boundaries only.
+            prev_state = state.get("upscale") or {}
+            prev_chunk = prev_state.get("chunk_index")
+            if (
+                not isinstance(chunk_index, int)
+                or (prev_chunk is not None and chunk_index == prev_chunk)
+            ):
+                # no boundary: ETA stays the previous computation
+                return prev_state.get("eta") if prev_state else None
+            if prev_chunk is None:
+                # first sample: seed, wait for the second
+                self._eta_state[key] = {
+                    "upscale": {
+                        "chunk_index": chunk_index,
+                        "frames_done": frames_done,
+                        "t": now,
+                        "eta": None,
+                    }
+                }
+                return None
+            prev_frames = prev_state.get("frames_done")
+            prev_t = prev_state.get("t")
+            d_frames = frames_done - prev_frames if prev_frames is not None else 0
+            d_t = now - prev_t if prev_t is not None else 0.0
+            if d_frames <= 0 or d_t <= 0:
+                # no measurable progress between boundaries: keep the
+                # previous rate (a stalled chunk has no honest ETA)
+                self._eta_state[key] = {
+                    "upscale": {
+                        "chunk_index": chunk_index,
+                        "frames_done": frames_done,
+                        "t": now,
+                        "eta": prev_state.get("eta"),
+                        "rate": prev_state.get("rate"),
+                    }
+                }
+                return prev_state.get("eta")
+            rate_inst = d_frames / d_t  # frames per second
+            rate_prev = prev_state.get("rate")
+            rate = (
+                rate_inst
+                if rate_prev is None
+                else rate_prev + alpha * (rate_inst - rate_prev)
+            )
+            remaining_frames = max(0.0, float(frames_total - frames_done))
+            eta = remaining_frames / rate if rate > 0 else None
+            self._eta_state[key] = {
+                "upscale": {
+                    "chunk_index": chunk_index,
+                    "frames_done": frames_done,
+                    "t": now,
+                    "rate": rate,
+                    "eta": eta,
+                }
+            }
+            return eta
+
+        if phase == "encode":
+            encode_seconds = progress.get("encode_seconds")
+            duration = self._duration_for_snapshot(snapshot)
+            if (
+                not isinstance(encode_seconds, (int, float))
+                or encode_seconds < 0
+                or duration is None
+                or duration <= 0
+            ):
+                return None
+            state = self._eta_state.get(key) or {}
+            if not isinstance(state, dict):
+                state = {}
+            prev_state = state.get("encode") or {}
+            prev_enc = prev_state.get("encode_seconds")
+            prev_t = prev_state.get("t")
+            if prev_enc is None:
+                self._eta_state[key] = {
+                    "encode": {"encode_seconds": encode_seconds, "t": now, "eta": None}
+                }
+                return None
+            d_enc = encode_seconds - prev_enc
+            d_t = now - prev_t if prev_t is not None else 0.0
+            if d_enc <= 0 or d_t <= 0:
+                self._eta_state[key] = {
+                    "encode": {
+                        "encode_seconds": encode_seconds,
+                        "t": now,
+                        "eta": prev_state.get("eta"),
+                        "rate": prev_state.get("rate"),
+                    }
+                }
+                return prev_state.get("eta")
+            rate_inst = d_enc / d_t  # output seconds per wall second
+            rate_prev = prev_state.get("rate")
+            rate = (
+                rate_inst
+                if rate_prev is None
+                else rate_prev + alpha * (rate_inst - rate_prev)
+            )
+            remaining_out = max(0.0, float(duration - encode_seconds))
+            eta = remaining_out / rate if rate > 0 else None
+            self._eta_state[key] = {
+                "encode": {
+                    "encode_seconds": encode_seconds,
+                    "t": now,
+                    "rate": rate,
+                    "eta": eta,
+                }
+            }
+            return eta
+        return None
+
+    def _duration_for_snapshot(self, snapshot: dict) -> float | None:
+        """The plan-time probe duration for the running file (the encode
+        phase's denominator; known from the plan's own probe, not a
+        guess)."""
+        plan = self.batch
+        if plan is None:
+            return None
+        file_path = snapshot.get("file_path") or ""
+        for item in plan.files:
+            if str(item.report.path) == file_path:
+                return item.report.duration_seconds
+        return None
+
+    def _render_damped_eta(
+        self, new_eta: float | None, previous: float | None
+    ) -> float | None:
+        """Display damping (design §3): a new ETA within 25% of the last
+        rendered one keeps the previous value (the number must not
+        visibly jitter tick-to-tick); only a real change beyond the
+        threshold updates the rendered value."""
+        if new_eta is None:
+            return previous if previous is not None else None
+        if previous is None:
+            return new_eta
+        if previous > 0 and abs(new_eta - previous) / previous <= self._ETA_DAMPING_FRACTION:
+            return previous
+        return new_eta
+
+    def _eta_suffix_for_stage(self, eta: float | None) -> str:
+        """The stage-label suffix ` — ETA ~H:MM:SS` when computable; NO
+        digits during verify/finalize (elapsed-only surfaces those
+        phases); '' otherwise."""
+        if eta is None or eta <= 0:
+            return ""
+        damped = self._render_damped_eta(eta, self._eta_rendered)
+        self._eta_rendered = damped
+        if damped is None:
+            return ""
+        return f" — ETA ~{self._fmt_eta(damped)}"
+
+    def _fmt_eta(self, seconds: float) -> str:
+        """ETA clock form H:MM:SS (or M:SS under an hour)."""
+        m, s = divmod(max(0, int(seconds)), 60)
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
     def _forecast_total_seconds(self) -> float | None:
-        """Forecast the whole remaining batch (design §1.5): the live
-        per-file eta_seconds from the bridge contract when available,
-        plus benchmark-cache estimates for the files ahead; honest
-        ``None`` stays ``None`` — the UI shows "…", never a made-up
-        number."""
+        """v0.4.12 (item 2): the phase-aware batch ETA — the current
+        job's REAL eta (from `_eta_current_job`: measured chunk-rate
+        EWMA in upscale, encode-seconds rate in encode) plus each queued
+        job's benchmark-cache estimate; queued jobs WITHOUT duration
+        data contribute nothing and make the batch honestly unknown.
+
+        Honest rules (unchanged from the previous forecast):
+        - a stub-sourced benchmark constant never poses as a measurement;
+        - no estimate at all ⇒ None (the UI keeps the honest "…" form).
+        """
         if not self.job_ids:
             return None
         total: float | None = 0.0
@@ -1576,10 +1842,27 @@ class MainWindow(QMainWindow):
             state = snapshot.get("state")
             if state in ("succeeded", "failed", "cancelled"):
                 continue
-            live_eta = snapshot.get("eta_seconds")
-            if index == 0 and live_eta is not None:
-                total = (total or 0.0) + float(live_eta)
-                seen_estimate = True
+            if index == 0:
+                # the CURRENT job: its real ETA when measurable
+                # (chunk-rate/encode-rate); the measured benchmark
+                # constant remains the honest fallback while no chunk
+                # samples exist yet; a stub-sourced constant still reads
+                # unknown via _benchmark_eta_for_job.
+                current_eta = self._eta_current_job(snapshot)
+                if current_eta is not None:
+                    eta = self._render_damped_eta(
+                        current_eta, self._batch_eta_rendered
+                    )
+                else:
+                    live_eta = snapshot.get("eta_seconds")
+                    eta = (
+                        float(live_eta)
+                        if live_eta is not None
+                        else self._benchmark_eta_for_job(snapshot)
+                    )
+                if eta is not None:
+                    total = (total or 0.0) + eta
+                    seen_estimate = True
                 continue
             plan_eta = self._benchmark_eta_for_job(snapshot)
             if plan_eta is not None:
@@ -1619,7 +1902,29 @@ class MainWindow(QMainWindow):
 
     def _forecast_total(self) -> None:
         secs = self._forecast_total_seconds()
+        # v0.4.12 (item 2): the batch label carries the honest unknown/
+        # queued marker when some queued jobs lack estimates while the
+        # current job HAS a real ETA (never a fabricated total).
         if secs is None:
+            queued_unknown = self._unknown_queued_count()
+            if queued_unknown and self._batch_running_eta() is not None:
+                marker = (
+                    f"{queued_unknown} queued (ETA unknown)"
+                    if queued_unknown > 1
+                    else "queued (ETA unknown)"
+                )
+                current = self._batch_running_eta()
+                if current is not None:
+                    self._set_text(
+                        self.total_remaining,
+                        f"Current ~{self._fmt_eta(current)} + {marker}",
+                    )
+                    if self._run_started_at is not None and self._stage_now != "done":
+                        self._set_text(
+                            self.total_pill,
+                            f"Current ~{self._fmt_eta(current)} + {marker}",
+                        )
+                    return
             self._set_text(self.total_remaining, "Total remaining … (all steps)")
             self._set_text(self.total_pill, "")
             return
@@ -1629,6 +1934,38 @@ class MainWindow(QMainWindow):
         )
         if self._run_started_at is not None and self._stage_now != "done":
             self._set_text(self.total_pill, f"Total remaining ~{self._fmt_hm(secs)}")
+
+    def _unknown_queued_count(self) -> int:
+        """Queued jobs (after the running one) with NO benchmark estimate
+        — the honest 'unknown' marker's count."""
+        unknown = 0
+        for index, job_id in enumerate(self.job_ids):
+            if index == 0:
+                continue
+            snapshot = self.client.status_snapshot(job_id)
+            if snapshot is None:
+                continue
+            if snapshot.get("state") in ("succeeded", "failed", "cancelled"):
+                continue
+            if self._benchmark_eta_for_job(snapshot) is None:
+                unknown += 1
+        return unknown
+
+    def _batch_running_eta(self) -> float | None:
+        """The current job's REAL eta for the batch label (damped), or
+        None when it is not measurable."""
+        if not self.job_ids:
+            return None
+        snapshot = self.client.status_snapshot(self.job_ids[0])
+        if snapshot is None:
+            return None
+        current = self._eta_current_job(snapshot)
+        if current is None:
+            live = snapshot.get("eta_seconds")
+            current = float(live) if live is not None else None
+        if current is None:
+            return None
+        return self._render_damped_eta(current, self._batch_eta_rendered)
 
     @staticmethod
     def _fmt_hm(seconds: "float | None") -> str:
@@ -1650,6 +1987,13 @@ class MainWindow(QMainWindow):
 
     def _batch_finished(self, notes: list[str]) -> None:
         self._stop_liveness()
+        # v0.4.12 (item 2): the batch is over — the ETA state and the
+        # damped render values reset with it (a new batch must never
+        # inherit the previous one's rate history).
+        self._eta_state = {}
+        self._eta_phase_now = None
+        self._eta_rendered = None
+        self._batch_eta_rendered = None
         # v0.4.12 (item 1, companion fix): the stage label must not outlive
         # the batch — the last job's mid-phase text ("subtitles — OCR/carry
         # (reassembly chunk 44/44 …)") persisted because nothing resets the

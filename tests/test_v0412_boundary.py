@@ -689,3 +689,325 @@ def test_v0412_item3_no_stale_hevc_name_assertions_remain():
                     continue  # this test's own text
                 hits.append(f"{py.name}:{lineno}: {line.strip()}")
     assert hits == [], hits
+
+
+# ---------------------------------------------------------------------------
+# Item 2: honest ETA (per-file + batch), Qt boundary + pure math
+# ---------------------------------------------------------------------------
+
+
+class _EtaProbe:
+    """A running-job snapshot builder with controllable clock/ticks so
+    the EWMA tests are deterministic (time.time is monkeypatched)."""
+
+    def __init__(self, job_id="EJ", phase="upscale", file_path="/media/e.avi",
+                 duration=None):
+        self.job_id = job_id
+        self.phase = phase
+        self.file_path = file_path
+        self.duration = duration
+        self.now = 1000.0
+
+    def snapshot(self, *, frames_done=None, frames_total=None,
+                 chunk_index=None, chunk_total=None, encode_seconds=None,
+                 eta_seconds=None):
+        snap = {
+            "job_id": self.job_id,
+            "state": "running",
+            "current_phase": self.phase,
+            "file_path": self.file_path,
+            "progress": {},
+        }
+        if eta_seconds is not None:
+            snap["eta_seconds"] = eta_seconds
+        if frames_done is not None:
+            snap["progress"]["frames_done"] = frames_done
+        if frames_total is not None:
+            snap["progress"]["frames_total"] = frames_total
+        if chunk_index is not None:
+            snap["progress"]["chunk_index"] = chunk_index
+        if chunk_total is not None:
+            snap["progress"]["chunk_total"] = chunk_total
+        if encode_seconds is not None:
+            snap["progress"]["encode_seconds"] = encode_seconds
+        if self.phase == "verify":
+            snap["progress"]["decode_seconds"] = 30.0
+        return snap
+
+
+def _eta_window(monkeypatch, tmp_path):
+    """A REAL MainWindow with controllable time + a plan whose report
+    declares duration 1800 s (the encode denominator)."""
+    import PyQt6.QtCore as QtCore
+
+    class _C:
+        def active_job_count(self):
+            return 0
+
+        def history(self, limit=20):
+            return []
+
+        def stop(self, **k):
+            pass
+
+    def _settings(self):
+        return QtCore.QSettings(
+            str(tmp_path / "settings.ini"), QtCore.QSettings.Format.IniFormat
+        )
+
+    monkeypatch.setattr(MainWindow, "_settings", _settings)
+    win = MainWindow(client=_C())
+    report = _report("e.avi")
+    report.duration_seconds = 1800.0
+    report.path = "/media/e.avi"
+    from vidlift.plan import build_file_plan
+
+    win.batch = BatchPlan([build_file_plan(report, gb_per_hour=1.5)])
+    yield win
+    win.job_ids = []
+    win._run_started_at = None
+    win.deleteLater()
+    QApplication.instance().processEvents()
+
+
+def test_v0412_item2_upscale_eta_after_two_chunks(
+    qapp, monkeypatch, tmp_path
+):
+    """upscale: >=2 chunk samples BEFORE digits; then ETA ≈ remaining/rate
+    within tolerance; no digits after only ONE sample."""
+    gen = _eta_window(monkeypatch, tmp_path)
+    win = next(gen)
+    probe = _EtaProbe()
+    times = iter(float(1000 + 60 * i) for i in range(20))
+    monkeypatch.setattr(time, "time", lambda: next(times, 5000.0))
+
+    # chunk 1 sample (boundary, first) — no ETA digits yet
+    assert win._eta_current_job(probe.snapshot(frames_done=600, frames_total=72000,
+                                               chunk_index=1, chunk_total=12)) is None
+    # tick inside the same chunk — no new samples, no ETA
+    assert win._eta_current_job(probe.snapshot(frames_done=600, frames_total=72000,
+                                               chunk_index=1, chunk_total=12)) is None
+    # chunk 2 boundary 60 s later: 1800 frames / 60 s = 30 fps →
+    # ETA = (72000-2400)/30
+    wait_times = iter(float(1060 + 60 * i) for i in range(20))
+    monkeypatch.setattr(time, "time", lambda: next(wait_times, 9000.0))
+    eta = win._eta_current_job(
+        probe.snapshot(frames_done=2400, frames_total=72000, chunk_index=2,
+                       chunk_total=12)
+    )
+    assert eta is not None
+    assert eta == (72000 - 2400) / 30.0
+    next(gen, None)
+
+
+def test_v0412_item2_encode_eta_uses_output_seconds(qapp, monkeypatch, tmp_path):
+    """encode: work = output seconds; ETA = (duration − encode_seconds)/rate
+    with duration from the plan-time probe."""
+    gen = _eta_window(monkeypatch, tmp_path)
+    win = next(gen)
+    probe = _EtaProbe(phase="encode")
+    times = iter(float(2000 + 30 * i) for i in range(20))
+    monkeypatch.setattr(time, "time", lambda: next(times, 9000.0))
+    # first sample: no ETA
+    assert win._eta_current_job(probe.snapshot(encode_seconds=60.0)) is None
+    # +30 s wall, +30 output-seconds → rate 1.0 → ETA 1800-90
+    times2 = iter(float(2030 + 30 * i) for i in range(20))
+    monkeypatch.setattr(time, "time", lambda: next(times2, 9000.0))
+    eta = win._eta_current_job(probe.snapshot(encode_seconds=90.0))
+    assert eta == 1800.0 - 90.0
+    next(gen, None)
+
+
+def test_v0412_item2_verify_phase_never_shows_eta_digits(
+    qapp, monkeypatch, tmp_path
+):
+    """Honesty requirement: verify/finalize render elapsed time only —
+    NO ETA suffix digits may appear in the stage label."""
+    gen = _eta_window(monkeypatch, tmp_path)
+    win = next(gen)
+    # the overall-bar arm needs the run accounting a live batch carries
+    win.run_total = 1
+    win.run_counts = [None]
+    probe = _EtaProbe(phase="verify")
+    snap = probe.snapshot()
+    eta = win._eta_current_job(snap)
+    assert eta is None
+    # The REAL consume path: the label keeps the elapsed heartbeat form,
+    # never an "ETA ~" suffix.
+    from vidlift.gui import run_stage_label
+
+    stage = run_stage_label(snap)
+    win._consume_running_snapshot(0, snap, stage)
+    assert "ETA ~" not in win.stage_label.text()
+    next(gen, None)
+
+
+def test_v0412_item2_stage_label_carries_eta_suffix_when_computable(
+    qapp, monkeypatch, tmp_path
+):
+    """The stage label appends ' — ETA ~H:MM:SS' once the EWMA has
+    samples; the value is damped (within 25% stays the previous)."""
+    gen = _eta_window(monkeypatch, tmp_path)
+    win = next(gen)
+    win.run_total = 1
+    win.run_counts = [None]
+    probe = _EtaProbe()
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    win._eta_current_job(probe.snapshot(frames_done=600, frames_total=72000,
+                                        chunk_index=1, chunk_total=12))
+    monkeypatch.setattr(time, "time", lambda: 1060.0)
+    win._eta_current_job(probe.snapshot(frames_done=2400, frames_total=72000,
+                                        chunk_index=2, chunk_total=12))
+
+    from vidlift.gui import run_stage_label
+
+    # consume 1: phase transition (queued -> upscaling) RESETS the EWMA
+    # and seeds sample 1 (chunk 1) — no digits yet by design.
+    snap1 = probe.snapshot(frames_done=600, frames_total=72000, chunk_index=1,
+                           chunk_total=12)
+    win._consume_running_snapshot(0, snap1, run_stage_label(snap1))
+    assert "ETA ~" not in win.stage_label.text()
+    # consume 2 (chunk 2 boundary): the second sample completes the
+    # window — digits appear.
+    monkeypatch.setattr(time, "time", lambda: 1120.0)
+    snap2 = probe.snapshot(frames_done=2400, frames_total=72000, chunk_index=2,
+                           chunk_total=12)
+    win._consume_running_snapshot(0, snap2, run_stage_label(snap2))
+    text = win.stage_label.text()
+    assert "ETA ~" in text
+    # damped stability: a small drift keeps the same rendered value
+    monkeypatch.setattr(time, "time", lambda: 1120.0)
+    eta2 = win._eta_current_job(probe.snapshot(frames_done=4200, frames_total=72000,
+                                               chunk_index=3, chunk_total=12))
+    # (72000-4200)/30 — within 25% of the previous → the rendered value
+    # must be the PREVIOUS one (damping).
+    damped = win._render_damped_eta(eta2, win._eta_rendered)
+    assert damped == win._eta_rendered
+    next(gen, None)
+
+
+def test_v0412_item2_ewma_resets_on_phase_change(qapp, monkeypatch, tmp_path):
+    """Window reset contract: switching stage keys wipes the EWMA state
+    (a new phase starts with no samples)."""
+    gen = _eta_window(monkeypatch, tmp_path)
+    win = next(gen)
+    win.run_total = 1
+    win.run_counts = [None]
+    win._eta_state = {"EJ": {"upscale": {"chunk_index": 3, "eta": 42.0}}}
+    win._consume_running_snapshot(
+        0,
+        {"job_id": "EJ", "state": "running", "current_phase": "encode",
+         "progress": {"encode_seconds": 5.0}},
+        "encoding",
+    )
+    assert win._eta_state == {}
+    assert win._eta_rendered is None
+    next(gen, None)
+
+
+def test_v0412_item2_batch_label_known_rate_plus_queued_unknown(
+    qapp, monkeypatch, tmp_path
+):
+    """Batch honesty: 1 running job with a measured rate + 1 queued job
+    with NO duration data contributes NOTHING and the label says
+    'queued (ETA unknown)' — never a fabricated total."""
+    plan_run = _plan_for(tmp_path, "running.avi")
+    plan_q = _plan_for(tmp_path, "queued.avi")
+    client = _ScriptedClient()
+    client.prepare("RJ", plan_run.report.path)
+    client.prepare("QJ", plan_q.report.path)
+    client.push("RJ", {"state": "running", "current_phase": "upscale",
+                       "progress": {"frames_done": 72000, "frames_total": 72000,
+                                    "chunk_index": 12, "chunk_total": 12}})
+    client.push("RJ", {"state": "running", "current_phase": "upscale",
+                       "progress": {"frames_done": 72000, "frames_total": 72000,
+                                    "chunk_index": 12, "chunk_total": 12}})
+    client.push("QJ", {"state": "queued"})
+    client.push("QJ", {"state": "queued"})
+    client.push("QJ", {"state": "queued"})
+    client.push("QJ", {"state": "queued"})
+    client.push("QJ", {"state": "queued"})
+
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.batch = BatchPlan([plan_run, plan_q])
+    win.render_batch(win.batch)
+    win.start_upscale()
+    # give the running job a measured chunk rate: two boundary samples,
+    # 600 frames in 10 s (60 fps), ETA = 0 (done)... use partial instead:
+    win.client.sequences["RJ"] = [
+        {"job_id": "RJ", "state": "running", "current_phase": "upscale",
+         "progress": {"frames_done": 600, "frames_total": 72000,
+                      "chunk_index": 1, "chunk_total": 12}},
+        {"job_id": "RJ", "state": "running", "current_phase": "upscale",
+         "progress": {"frames_done": 1200, "frames_total": 72000,
+                      "chunk_index": 2, "chunk_total": 12}},
+        {"job_id": "RJ", "state": "running", "current_phase": "upscale",
+         "progress": {"frames_done": 1200, "frames_total": 72000,
+                      "chunk_index": 2, "chunk_total": 12}},
+        {"job_id": "RJ", "state": "running", "current_phase": "upscale",
+         "progress": {"frames_done": 1800, "frames_total": 72000,
+                      "chunk_index": 3, "chunk_total": 12}},
+    ]
+    win.client.cursor["RJ"] = 0
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    win._tick_elapsed()  # transition tick (EWMA seeds with chunk 1)
+    monkeypatch.setattr(time, "time", lambda: 1010.0)
+    win._tick_elapsed()  # chunk-2 sample: rate measured, ETA exists
+    monkeypatch.setattr(time, "time", lambda: 1020.0)
+    win._tick_elapsed()  # the label/batch reads the measured state
+
+    # now the queued job's snapshot exists with no eta → unknown marker
+    label = win.total_remaining.text()
+    assert ("queued (ETA unknown)" in label) or (
+        "Total remaining ~" in label
+    ), label
+    # the queued job has no benchmark estimate (no constants) → the
+    # honest form; no number was invented for the queued job:
+    if "queued (ETA unknown)" in label:
+        # "Current ~M:SS + queued (ETA unknown)" pattern (singular marker)
+        import re as _re
+
+        assert _re.search(r"Current ~\d+:\d+(:\d+)? \+ queued \(ETA unknown\)", label)
+        # and the label never carries a fabricated "Total remaining" number
+        assert "Total remaining ~" not in label
+    else:
+        # a pure-unknown label is NOT ok here — the current job HAS an
+        # eta; the batch line must carry the queued marker.
+        raise AssertionError(f"batch label lost the queued marker: {label!r}")
+    next(gen, None)
+
+
+def test_v0412_item2_queued_no_duration_contributes_nothing():
+    """Unit: the queued-estimate honesty — no duration ⇒ None (the
+    benchmark estimate seam), i.e. nothing is added for that job."""
+    from vidlift.plan import build_file_plan
+
+    report = _report("nodur.avi")
+    report.duration_seconds = None
+    plan = build_file_plan(report, gb_per_hour=1.5)
+    # eta_estimate absent entirely (attach_estimate never ran): None
+    assert plan.eta_estimate is None
+    # _benchmark_eta_for_job maps None → no contribution:
+    # (unit-level: the dict's absence is the no-data case the design
+    # calls 'contributing nothing')
+    assert plan.eta_estimate is None
+
+
+def test_v0412_item2_damping_keeps_previous_value(qapp, tmp_path):
+    """Pure damping contract: within 25% ⇒ previous; beyond ⇒ new."""
+    gen = _eta_window(MonkeyPatchShim(), tmp_path)
+    win = next(gen)
+    assert win._render_damped_eta(None, 100.0) == 100.0
+    assert win._render_damped_eta(110.0, None) == 110.0
+    assert win._render_damped_eta(110.0, 100.0) == 100.0  # 10% drift → keep
+    assert win._render_damped_eta(130.0, 100.0) == 130.0  # 30% > 25% → new
+    assert win._render_damped_eta(120.0, 100.0) == 100.0  # 20% → keep
+    assert win._render_damped_eta(126.0, 100.0) == 126.0  # 26% → new
+    next(gen, None)
+
+
+class MonkeyPatchShim:
+    """Minimal monkeypatch stand-in for direct helper calls."""
+    def setattr(self, obj, name, val):
+        setattr(obj, name, val)
