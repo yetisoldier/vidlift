@@ -431,6 +431,45 @@ class Registry:
         (None before claim or after the job closes)."""
         return self._cancel_flags.get(job_id)
 
+    def claim_next(self) -> JobRecord | None:
+        """Claim the oldest queued job (submission order), atomically.
+
+        The v0.4.13 race gate (design §3.3): the view→transition pair
+        the executor used to run as two separately-locked steps —
+        ``queued()`` snapshotted under the lock and released before the
+        ``running`` transition re-acquired it — gave no ordering
+        primitive against another writer's marks. Moving BOTH halves
+        under ONE ``_lock`` hold serializes the claim against
+        ``Registry.cancel_batch`` on the same lock: either the claim
+        lands first (the job is legitimately ``running`` and a batch
+        cancel flips its flag) or the cancel marks land first (this
+        finds nothing claimable from that set). Behavior-preserving
+        otherwise: same sorted view, same skip-on-cancelled rule, and
+        the claim transition creates/registers the CancelFlag exactly
+        the way ``transition("running")`` always has — inlined here
+        because ``transition()``/``save()`` acquire ``_lock``
+        themselves (a plain, non-reentrant ``threading.Lock``).
+        """
+        self._maybe_reload()
+        with self._lock:
+            queued = [
+                r for r in self._jobs.values() if r.state == "queued"
+            ]
+            queued.sort(key=lambda r: r.submitted_at)
+            claimed: JobRecord | None = None
+            for job in queued:
+                try:
+                    job.transition("running")
+                except RegistryError:
+                    continue  # cancelled between view and claim
+                from .jobs import CancelFlag  # deferred: jobs imports registry
+                self._cancel_flags[job.job_id] = CancelFlag()
+                claimed = job
+                break
+        if claimed is not None:
+            self.save()
+        return claimed
+
     # -- queue views -----------------------------------------------------------
 
     def queued(self) -> list[JobRecord]:
