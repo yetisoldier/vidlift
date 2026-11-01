@@ -185,6 +185,8 @@ def test_all_cancelled_is_never_a_green_full_bar(qapp):
         # stable job identity; the seam carries the real helper.
         _batch_slot_for = MainWindow._batch_slot_for
         _batch_slot_index: dict = {}
+        # v0.4.12: the terminal writer keys the CELL on the batch row map.
+        _batch_row_for_job: dict = {}
 
     window = _RenderSeam()
     window.run_total = 1
@@ -238,6 +240,8 @@ def test_terminal_snapshot_updates_counts_per_slot(qapp):
         # stable job identity; the seam carries the real helper.
         _batch_slot_for = MainWindow._batch_slot_for
         _batch_slot_index: dict = {}
+        # v0.4.12: the terminal writer keys the CELL on the batch row map.
+        _batch_row_for_job: dict = {}
 
     window = _RenderSeam()
     window.run_total = 2

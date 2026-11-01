@@ -356,6 +356,12 @@ class MainWindow(QMainWindow):
         # once per color change, never per tick.
         self._progress_chunk_color: str | None = None
 
+        # v0.4.12 (item 1): the stable job_id->table-row map for the
+        # batch's cosmetic cell writes; empty until a batch starts
+        # (seeded in start_upscale beside the slot index, cleared with
+        # the table on clear_files/_render_pending_files).
+        self._batch_row_for_job: dict[str, int] = {}
+
         # v0.4.5 (progress-honesty §2, D-tail): pin-to-tail state for
         # the run log widget (Rule 1-5 contract lives in these flags;
         # the helpers read/reset them). Started disconnected; the
@@ -882,6 +888,10 @@ class MainWindow(QMainWindow):
 
     def _render_pending_files(self) -> None:
         self.batch = None
+        # v0.4.12 (item 1): the table just became pending rows — clear the
+        # previous batch's job_id->row map with it (back-to-back-batches
+        # hygiene; see the v0.4.12 boundary test).
+        self._batch_row_for_job = {}
         self.start_button.setEnabled(False)
         self.file_table.setRowCount(len(self.files))
         for row, path in enumerate(self.files):
@@ -928,6 +938,9 @@ class MainWindow(QMainWindow):
             return
         self.files = []
         self.batch = None
+        # v0.4.12 (item 1): the table is gone — a stale job_id->row map from
+        # the previous batch must never map into a fresh one.
+        self._batch_row_for_job = {}
         self.start_button.setEnabled(False)
         self.file_table.setRowCount(0)
         self.details.clear()
@@ -1118,6 +1131,27 @@ class MainWindow(QMainWindow):
         self._batch_slot_index: dict[str, int] = {
             job_id: index for index, job_id in enumerate(self._batch_slots)
         }
+        # v0.4.12 (item 1): the stable ROW map — job_id -> table row, seeded
+        # ONCE in submission order and immutable for the batch's lifetime.
+        # The table is built by render_batch in plan order and never
+        # reordered while the batch runs; submission order == plan row order
+        # by construction (enqueue_run returns ids in path order,
+        # client_local.py). The cosmetic cell writes key on THIS map, never
+        # on the draining job_ids index (the v0.4.11 escape: surviving jobs
+        # shift down as terminal jobs drain, so a row-indexed write lands on
+        # the wrong physical row and the last job's home row is left frozen
+        # at "running").
+        self._batch_row_for_job: dict[str, int] = {
+            job_id: index for index, job_id in enumerate(self._batch_slots)
+        }
+        if len(self._batch_row_for_job) != len(self._batch_slots):
+            # A duplicate job_id would silently alias rows — a contract bug,
+            # loudly raised at seed time, never silently zipped.
+            raise RuntimeError(
+                "batch row map seeding mismatch: "
+                f"{len(self._batch_row_for_job)} rows for "
+                f"{len(self._batch_slots)} job ids"
+            )
         self.run_counts: list[str | None] = [None] * self.run_total
         self.run_summary = summarize_batch(self.run_counts)
         # v0.4.10 (R2): the batch bar restarts from a KNOWN color — the
@@ -1199,13 +1233,22 @@ class MainWindow(QMainWindow):
             if rendered_key is not None:
                 self._log_force_pin_next = True
         for index, (job_id, snapshot) in enumerate(zip(self.job_ids, snapshots)):
-            row = index  # row i of the table ↔ job_ids[i] while a run is live
+            # v0.4.12 (item 1): the cell row comes from the STABLE
+            # job_id->row map seeded at start, never from this loop index —
+            # terminal jobs drain from self.job_ids every tick, so surviving
+            # jobs shift down and an index-keyed write lands on the wrong
+            # physical row (the v0.4.11 escape). A snapshot whose id is
+            # missing from the map is dropped from cell writes; the BAR
+            # accounting still keys it via _batch_slot_for (which may
+            # legitimately claim a late slate slot), so nothing is invented
+            # and nothing is lost there.
+            row = self._batch_row_for_job.get(job_id) if isinstance(job_id, str) else None
             if snapshot is None:
                 still_active.append(job_id)
                 continue
             state = snapshot.get("state") or "queued"
             stage = run_stage_label(snapshot)
-            if row < self.file_table.rowCount():
+            if row is not None and row < self.file_table.rowCount():
                 status_cell = self.file_table.item(row, 0)
                 if status_cell is not None:
                     # v0.4.9 (§2.3): a RUNNING row whose last activity is
@@ -1250,7 +1293,7 @@ class MainWindow(QMainWindow):
             # repro: timer dead, rows never update).
             self._batch_finished(terminal_notes)
 
-    def _consume_running_snapshot(self, row: int, snapshot: dict, stage: str) -> None:
+    def _consume_running_snapshot(self, row: int | None, snapshot: dict, stage: str) -> None:
         # §3b: the phase-change busy/reset keys on the stage's PHASE
         # FACTS (the label renders progress detail per tick — heartbeat
         # seconds tick inside one and the same stage — so comparing
@@ -1372,15 +1415,17 @@ class MainWindow(QMainWindow):
             return index
         return row
 
-    def _consume_terminal_snapshot(self, row: int, snapshot: dict) -> None:
+    def _consume_terminal_snapshot(self, row: int | None, snapshot: dict) -> None:
         state = snapshot.get("state") or "finished"
         # v0.4.10-fix (D2): the truth slate is keyed by the STABLE job
         # identity (submission order), never by the shifting table row:
         # terminal jobs drain from self.job_ids each tick, so surviving
         # jobs shift down and a row-indexed write would land in the
-        # wrong slot (the under-count / cancelled-overwrite bug). The
-        # row still renders the TABLE cell (cosmetic, pre-existing
-        # shifting-row quirk); the BAR truth writes by job_id.
+        # wrong slot (the under-count / cancelled-overwrite bug).
+        # v0.4.12 (item 1): the CELL write keys on the same stable
+        # identity — the row derives from `_batch_row_for_job` (seeded in
+        # submission order == plan row order), not the draining index.
+        # ONE behavior, one keying story for bar and cell alike.
         # v0.4.10 (R2): the bar's truth accounting. run_counts records
         # the terminal state per batch slot (submission order);
         # summarize_batch turns the slate into an immutable
@@ -1390,12 +1435,14 @@ class MainWindow(QMainWindow):
         # but never raises a succeeded count — the bar can no longer
         # render a full-green "1/1 completed" for a cancelled run.
         job_id = snapshot.get("job_id")
-        slot = self._batch_slot_for(job_id, row)
+        if isinstance(job_id, str) and job_id in self._batch_row_for_job:
+            row = self._batch_row_for_job[job_id]
+        slot = self._batch_slot_for(job_id, row if row is not None else -1)
         if 0 <= slot < len(self.run_counts):
             self.run_counts[slot] = state
         self.run_summary = summarize_batch(self.run_counts)
         self._apply_batch_summary(self.run_summary)
-        if row < self.file_table.rowCount():
+        if row is not None and row < self.file_table.rowCount():
             cell = self.file_table.item(row, 0)
             if cell is not None:
                 color = {
@@ -1594,6 +1641,15 @@ class MainWindow(QMainWindow):
 
     def _batch_finished(self, notes: list[str]) -> None:
         self._stop_liveness()
+        # v0.4.12 (item 1, companion fix): the stage label must not outlive
+        # the batch — the last job's mid-phase text ("subtitles — OCR/carry
+        # (reassembly chunk 44/44 …)") persisted because nothing resets the
+        # stage state after the final terminal drain. Clear the label and
+        # reset the stage keys so the next batch starts clean.
+        self._set_text(self.stage_label, "")
+        self._stage_now = "queued"
+        self._stage_eta = None
+        self._stage_fraction = None
         self.engine_combo.setEnabled(True)
         # v0.4.8 (D5): re-enable the profile combo with its honest tooltip.
         self.profile_combo.setEnabled(True)

@@ -1,0 +1,492 @@
+"""v0.4.12 boundary regression contracts (design §5) — driven through the
+REAL `_poll_jobs` consume path on an offscreen MainWindow.
+
+These are the highest-boundary tests per the v0.4.12 design, written from
+the two defects v0.4.10/v0.4.11 let escape:
+
+1. Item 1 (stable row mapping): the GUI used to address table status cells
+   by the job's position in the SHRINKING `job_ids` list, so every job after
+   the first terminal write wrote to the WRONG physical row and the last
+   job to finish left its own home row frozen at "running". The scripted
+   sequence below is the exact observed repro: [J1 running, J2 running] →
+   [J1 succeeded, J2 running] → [J2 running] ×N → [J2 succeeded]; each
+   physical row (keyed by filename) must show its OWN job's true state and
+   finish with both rows "succeeded".
+
+2. Item 4 (green-bar boundary): a cancelled/failed terminal payload must
+   render the bar text exactly ("0/1 succeeded, 1 cancelled") AND apply the
+   amber palette, never green; the failed variant red; the all-succeeded
+   variant green. Plus a source sweep: no "completed"-phrased batch format
+   string may exist in gui.py (the counting-lie is format-level too).
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import time
+import types
+from types import SimpleNamespace
+
+import pytest
+
+pytest.importorskip("PyQt6")
+
+os.environ.setdefault("VIDLIFT_MONITOR_AUTOSTART", "0")
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt6.QtWidgets import QApplication, QMessageBox
+
+from vidlift.gui import MainWindow
+from vidlift.plan import BatchPlan, build_file_plan
+from vidlift.probe import classify, parse_probe
+
+
+@pytest.fixture
+def qapp():
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+_alive: list = []
+
+
+def _report(name):
+    payload = """
+    {
+      "streams": [
+        {"index": 0, "codec_type": "video", "codec_name": "mpeg4",
+         "width": 640, "height": 360, "sample_aspect_ratio": "1:1",
+         "field_order": "progressive", "r_frame_rate": "25/1",
+         "avg_frame_rate": "25/1"},
+        {"index": 1, "codec_type": "audio", "codec_name": "mp3", "channels": 2}
+      ],
+      "format": {"format_name": "avi", "duration": "3600.0"}
+    }
+    """
+    report = classify(parse_probe(f"/media/{name}", payload))
+    return report
+
+
+def _plan_for(tmp_path, name):
+    report = _report(name)
+    report.path = str(tmp_path / name)
+    Path(str(report.path)).write_text("")  # the real client validates existence
+    return build_file_plan(report, gb_per_hour=1.5)
+
+
+class _ScriptedClient:
+    """The GUI's bridge seam with a fully SCRIPTED snapshot sequence per
+    job id: the test enqueues exactly the observed payload sequence and
+    `enqueue_snapshots` replays it tick by tick (like the real bridge's
+    1 Hz reads of a live registry)."""
+
+    def __init__(self):
+        self.sequences: dict[str, list] = {}
+        self.cursor: dict[str, int] = {}
+        self.job_order: list[str] = []
+        self.jobs: dict[str, dict] = {}
+        self.cancel_calls: list[str] = []
+        self.armed = False  # active_job_count() reads 0 until enqueue_run
+        self.submitted: list[str] = []  # ids handed out by enqueue_run
+
+    # -- scripting helpers (test side) --
+    def prepare(self, job_id, file_path):
+        self.sequences[job_id] = []
+        self.cursor[job_id] = 0
+        self.job_order.append(job_id)
+        self.jobs[job_id] = {"file_path": file_path}
+
+    def push(self, job_id, snapshot):
+        # snapshots always carry the stable job_id (the identity the row
+        # map and slot index key on).
+        self.sequences[job_id].append({"job_id": job_id, **snapshot})
+
+    # -- LocalBridgeClient contract (GUI side) --
+    def active_job_count(self):
+        if not self.armed:
+            # nothing enqueued yet: the real client counts zero.
+            return 0
+        # mirrors the real client: active until every SUBMITTED job
+        # reached a terminal state in its sequence (an enqueuing that has
+        # not happened yet cannot make anything active).
+        active = 0
+        for job_id in self.submitted:
+            seq = self.sequences[job_id]
+            curs = self.cursor[job_id]
+            current = seq[min(curs, len(seq) - 1)] if seq else None
+            if curs < len(seq) and current is not None and current.get(
+                "state"
+            ) not in ("succeeded", "failed", "cancelled"):
+                active += 1
+        return active
+
+    def enqueue_run(self, paths, options=None, engine="auto"):
+        # The real client validates the submitted paths.
+        for path in paths:
+            if not Path(path).is_file():
+                raise FileNotFoundError(f"no such file on this machine: {path}")
+        self.armed = True
+        # Submission order: the not-yet-submitted prepared ids (the real
+        # client CREATES a new JobRecord per path here — pre-registering a
+        # job that was never enqueued is not a thing the registry does).
+        fresh = [jid for jid in self.job_order if jid not in self.submitted]
+        chosen = fresh[: len(paths)]
+        self.submitted.extend(chosen)
+        return list(chosen)
+
+    def status_snapshot(self, job_id):
+        seq = self.sequences.get(job_id) or []
+        curs = self.cursor.get(job_id, 0)
+        if curs < len(seq):
+            return seq[curs]
+        # a drained terminal job reads like the real client: the record
+        # is gone from the live query path.
+        return None
+
+    def enqueue_snapshots(self, job_ids):
+        ticks = []
+        for job_id in job_ids:
+            ticks.append(self.status_snapshot(job_id))
+            if self.cursor.get(job_id, 0) < len(self.sequences.get(job_id, [])):
+                self.cursor[job_id] += 1
+        return ticks
+
+    def cancel(self, job_id):
+        self.cancel_calls.append(job_id)
+        return "cancelled"
+
+    def history(self, limit=20):
+        return []
+
+    def stop(self, **kwargs):
+        pass
+
+
+def _window(qapp, monkeypatch, tmp_path, client):
+    import PyQt6.QtCore as QtCore
+
+    def _settings(self):
+        return QtCore.QSettings(
+            str(tmp_path / "settings.ini"), QtCore.QSettings.Format.IniFormat
+        )
+
+    monkeypatch.setattr(MainWindow, "_settings", _settings)
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    )
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    _alive.append(MainWindow(client=client))
+    win = _alive[-1]
+    yield win
+    win.job_ids = []
+    win._run_started_at = None
+    win.deleteLater()
+    qapp.processEvents()
+    _alive.clear()
+    qapp.processEvents()
+
+
+def _row_by_filename(win, filename: str) -> int:
+    """The PHYSICAL row that displays this video's filename (column 1;
+    cells render the full path, so match the distinct file name at the
+    end)."""
+    for row in range(win.file_table.rowCount()):
+        cell = win.file_table.item(row, 1)
+        if cell is not None and cell.text().endswith(filename):
+            return row
+    raise AssertionError(f"no row displays {filename!r}")
+
+
+def _row_state(win, filename: str) -> str:
+    row = _row_by_filename(win, filename)
+    cell = win.file_table.item(row, 0)
+    return cell.text() if cell is not None else ""
+
+
+# ---------------------------------------------------------------------------
+# Item 1: the exact observed drain sequence — every row shows its own truth
+# ---------------------------------------------------------------------------
+
+
+def test_v0412_item1_two_job_drain_each_row_shows_its_own_state(
+    qapp, monkeypatch, tmp_path
+):
+    """[J1 running, J2 running] → [J1 succeeded, J2 running] → [J2 running]
+    ×N → [J2 succeeded]. Final: row0 AND row1 both "succeeded"; row1 NEVER
+    stuck at "running" (the v0.4.11 escape) and row0 never flip-flops back
+    to "running" after J1's terminal write."""
+    plan_a = _plan_for(tmp_path, "part-one.avi")
+    plan_b = _plan_for(tmp_path, "part-two.avi")
+    client = _ScriptedClient()
+    client.prepare("J1", plan_a.report.path)
+    client.prepare("J2", plan_b.report.path)
+    # The exact observed sequence (design §1 timeline):
+    client.push("J1", {"state": "running", "current_phase": "upscale"})
+    client.push("J1", {"state": "succeeded", "current_phase": "done"})
+    client.push(
+        "J2", {"state": "running", "current_phase": "upscale"}
+    )  # the T₁ tick reads running for BOTH (J1's LAST seq entry is the terminal)
+    client.push(
+        "J2", {"state": "running", "current_phase": "upscale"}
+    )  # the T₁+1..T₂-1 ticks: J2 alone at index 0
+    client.push(
+        "J2", {"state": "running", "current_phase": "upscale"}
+    )  # more intermediate running ticks
+    client.push(
+        "J2", {"state": "running", "current_phase": "upscale"}
+    )  # and the next tick still running
+    client.push("J2", {"state": "succeeded", "current_phase": "done"})
+
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+
+    win.batch = BatchPlan([plan_a, plan_b])
+    win.render_batch(win.batch)
+    win.start_upscale()
+    assert win.job_ids == ["J1", "J2"]
+    assert win._batch_row_for_job == {"J1": 0, "J2": 1}
+
+    # Tick T: both running, each on its own row.
+    win._tick_elapsed()
+    assert _row_state(win, "part-one.avi") == "running"
+    assert _row_state(win, "part-two.avi") == "running"
+
+    # Tick T₁: J1's terminal snapshot → row0 "succeeded"; J2 running → row1.
+    win._tick_elapsed()
+    assert _row_state(win, "part-one.avi") == "succeeded"
+    assert _row_state(win, "part-two.avi") == "running"
+
+    # Ticks T₁+1 .. T₂−1: J2 alone (shifting to index 0) — its running
+    # writes must land on ROW 1, never re-overwrite row 0.
+    win._tick_elapsed()
+    assert _row_state(win, "part-one.avi") == "succeeded"
+    assert _row_state(win, "part-two.avi") == "running"
+    win._tick_elapsed()
+    assert _row_state(win, "part-one.avi") == "succeeded"
+    assert _row_state(win, "part-two.avi") == "running"
+
+    # Tick T₂: J2's terminal snapshot → ROW 1 "succeeded" (its own row).
+    win._tick_elapsed()
+    assert _row_state(win, "part-two.avi") == "succeeded"
+    # ...and row0 stays "succeeded" — the flip-flop is dead.
+    assert _row_state(win, "part-one.avi") == "succeeded"
+    # The bar reaches "2/2 succeeded" green, and NO row reads "running".
+    assert win.progress.format() == "2/2 succeeded"
+    assert win._progress_chunk_color == "#3d9865"
+    for row in range(win.file_table.rowCount()):
+        assert win.file_table.item(row, 0).text() != "running"
+
+    # After finish, the stage line no longer shows the last job's
+    # mid-phase text (the companion fix).
+    assert "upscale" not in win.stage_label.text().lower()
+    next(gen, None)
+
+
+def test_v0412_item1_three_job_batch_every_row_lands_own_truth(
+    qapp, monkeypatch, tmp_path
+):
+    """N-sequential variant: 3 jobs, one terminal per tick, later jobs
+    drifting up the list — every physical row ends at its own job's state
+    and none stays "running"."""
+    names = ["a-one.avi", "b-two.avi", "c-three.avi"]
+    plans = [_plan_for(tmp_path, n) for n in names]
+    client = _ScriptedClient()
+    for jid, n in zip(("JA", "JB", "JC"), names):
+        client.prepare(jid, plans[names.index(n)].report.path)
+        client.push(jid, {"state": "running", "current_phase": "upscale"})
+        client.push(jid, {"state": "succeeded", "current_phase": "done"})
+
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.batch = BatchPlan(plans)
+    win.render_batch(win.batch)
+    win.start_upscale()
+    for _ in range(6):  # enough ticks for three staggered terminals
+        win._tick_elapsed()
+    for name in names:
+        assert _row_state(win, name) == "succeeded", name
+    assert win.progress.format() == "3/3 succeeded"
+    next(gen, None)
+
+
+def test_v0412_item1_back_to_back_batches_map_is_resent_not_stale(
+    qapp, monkeypatch, tmp_path
+):
+    """Batch hygiene: `_batch_row_for_job` seeds at every start_upscale and
+    clears when the table is rebuilt (clear_files / _render_pending_files);
+    a stale entry from batch 1 must never map into batch 2."""
+    plan_a = _plan_for(tmp_path, "first.avi")
+    client = _ScriptedClient()
+    client.prepare("B1J", plan_a.report.path)
+    client.push("B1J", {"state": "running", "current_phase": "upscale"})
+    client.push("B1J", {"state": "succeeded", "current_phase": "done"})
+
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.batch = BatchPlan([plan_a])
+    win.render_batch(win.batch)
+    win.start_upscale()
+    assert win._batch_row_for_job == {"B1J": 0}
+    win.client.registry_cancel_all = True
+    win._tick_elapsed()
+    win._tick_elapsed()
+    assert win.job_ids == []
+    assert win._batch_row_for_job == {"B1J": 0}  # still pinned for ITS batch
+
+    # Batch 2: adding fresh files clears the map (render_pending path).
+    win.files = [str(tmp_path / "second.avi")]
+    win._render_pending_files()
+    assert win._batch_row_for_job == {}
+    # ...and clear_files too.
+    win._batch_row_for_job = {"stale": 0}
+    win.clear_files()
+    assert win._batch_row_for_job == {}
+    # A fresh batch reseeds cleanly: simulate by setting job_ids the way
+    # enqueue_run does, then start_upscale's own job path.
+    plan_b = _plan_for(tmp_path, "second.avi")
+    client.prepare("B2J", plan_b.report.path)
+    client.push("B2J", {"state": "running", "current_phase": "upscale"})
+    client.push("B2J", {"state": "succeeded", "current_phase": "done"})
+    client.job_order.append("B2J")
+    win.batch = BatchPlan([plan_b])
+    win.render_batch(win.batch)
+    win.start_upscale()
+    assert win._batch_row_for_job == {"B2J": 0}
+    assert "stale" not in win._batch_row_for_job
+    win._tick_elapsed()
+    assert _row_state(win, "second.avi") == "running"
+    win._tick_elapsed()
+    assert _row_state(win, "second.avi") == "succeeded"
+    next(gen, None)
+
+
+def test_v0412_item1_stage_label_cleared_after_batch_finish(
+    qapp, monkeypatch, tmp_path
+):
+    """The last job's mid-phase stage text must not outlive the batch:
+    after the final terminal drain, the stage label holds no phase text."""
+    plan = _plan_for(tmp_path, "solo.avi")
+    client = _ScriptedClient()
+    client.prepare("SJ", plan.report.path)
+    client.push(
+        "SJ",
+        {
+            "state": "running",
+            "current_phase": "subtitles",
+            "progress": {"phase_note": "OCR/carry (reassembly chunk 44/44)"},
+        },
+    )
+    client.push("SJ", {"state": "succeeded", "current_phase": "done"})
+
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.batch = BatchPlan([plan])
+    win.render_batch(win.batch)
+    win.start_upscale()
+    win._tick_elapsed()
+    assert "subtitles" in win.stage_label.text().lower()
+    win._tick_elapsed()
+    assert win.job_ids == []
+    assert win.stage_label.text() == ""
+    assert win._stage_now == "queued"  # reset, ready for the next batch
+    assert win._stage_fraction is None
+    next(gen, None)
+
+
+# ---------------------------------------------------------------------------
+# Item 4: cancelled/failed never paints full green (GUI consume boundary)
+# ---------------------------------------------------------------------------
+
+
+def test_v0412_item4_cancelled_terminal_bar_is_amber_not_green(
+    qapp, monkeypatch, tmp_path
+):
+    """1-job batch through the REAL `_poll_jobs` path: a cancelled terminal
+    payload renders bar text "0/1 succeeded, 1 cancelled" AND the amber
+    palette — never green."""
+    plan = _plan_for(tmp_path, "cancel-me.avi")
+    client = _ScriptedClient()
+    client.prepare("CJ", plan.report.path)
+    client.push("CJ", {"state": "running", "current_phase": "upscale"})
+    client.push("CJ", {"state": "cancelled", "current_phase": "done"})
+
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.batch = BatchPlan([plan])
+    win.render_batch(win.batch)
+    win.start_upscale()
+    win._tick_elapsed()  # running
+    win._tick_elapsed()  # cancelled terminal
+    assert win.progress.format() == "0/1 succeeded, 1 cancelled"
+    assert win._progress_chunk_color == "#d8a93a"  # amber, NOT green
+    assert _row_state(win, "cancel-me.avi") == "cancelled"
+    next(gen, None)
+
+
+def test_v0412_item4_failed_terminal_bar_is_red(qapp, monkeypatch, tmp_path):
+    plan = _plan_for(tmp_path, "fail-me.avi")
+    client = _ScriptedClient()
+    client.prepare("FJ", plan.report.path)
+    client.push("FJ", {"state": "running", "current_phase": "upscale"})
+    client.push("FJ", {"state": "failed", "current_phase": "done"})
+
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.batch = BatchPlan([plan])
+    win.render_batch(win.batch)
+    win.start_upscale()
+    win._tick_elapsed()
+    win._tick_elapsed()
+    assert win.progress.format() == "0/1 succeeded, 1 failed"
+    assert win._progress_chunk_color == "#c4605a"  # red, NOT green
+    assert _row_state(win, "fail-me.avi") == "failed"
+    next(gen, None)
+
+
+def test_v0412_item4_two_job_all_succeeded_bar_is_green(
+    qapp, monkeypatch, tmp_path
+):
+    plan_a = _plan_for(tmp_path, "green-a.avi")
+    plan_b = _plan_for(tmp_path, "green-b.avi")
+    client = _ScriptedClient()
+    for jid, p in (("GA", plan_a), ("GB", plan_b)):
+        client.prepare(jid, p.report.path)
+        client.push(jid, {"state": "running", "current_phase": "upscale"})
+        client.push(jid, {"state": "succeeded", "current_phase": "done"})
+
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.batch = BatchPlan([plan_a, plan_b])
+    win.render_batch(win.batch)
+    win.start_upscale()
+    for _ in range(4):
+        win._tick_elapsed()
+    assert win.progress.format() == "2/2 succeeded"
+    assert win._progress_chunk_color == "#3d9865"  # green
+    assert _row_state(win, "green-a.avi") == "succeeded"
+    assert _row_state(win, "green-b.avi") == "succeeded"
+    # item 1's guarantee rides along: no row stuck "running".
+    for row in range(win.file_table.rowCount()):
+        assert win.file_table.item(row, 0).text() != "running"
+    next(gen, None)
+
+
+def test_v0412_item4_no_completed_phrased_batch_format_string_in_gui_source():
+    """The v0.4.10 counting-lie is pinned at the SOURCE level: no
+    "N/N completed"-style batch format string may exist in gui.py."""
+    import re
+    import vidlift
+    from pathlib import Path
+
+    gui_source = (Path(vidlift.__file__).parent / "gui.py").read_text(
+        encoding="utf-8"
+    )
+    completed_formats = re.findall(
+        r"f?\"[^\"]*\{[^}]+\}/\{[^}]+\}\s*completed[^\"]*\"", gui_source
+    )
+    assert completed_formats == [], (
+        f"'completed'-phrased batch format string(s) in gui.py: {completed_formats}"
+    )
+    # The honest form must exist.
+    assert "{summary.succeeded}/{total} succeeded" in gui_source
