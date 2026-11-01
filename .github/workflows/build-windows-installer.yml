@@ -151,7 +151,8 @@ jobs:
             "$install\tools\realesrgan\models\realesr-animevideov3-x2.param",
             "$install\tools\realesrgan\models\realesr-animevideov3-x2.bin",
             "$install\tools\SubtitleEdit\seconv.exe",
-            "$install\tools\SubtitleEdit\Tesseract\tesseract.exe"
+            "$install\tools\SubtitleEdit\Tesseract\tesseract.exe",
+            "$install\tools\SubtitleEdit\Tesseract\tessdata\eng.traineddata"
           )) {
             if (-not (Test-Path $file)) { throw "Installed payload missing: $file" }
           }
