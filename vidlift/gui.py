@@ -2134,10 +2134,10 @@ class MainWindow(QMainWindow):
                         current_eta, self._batch_eta_rendered
                     )
                 else:
-                    live_eta = snapshot.get("eta_seconds")
+                    # T6: tolerant conversion (was bare float(live_eta)).
                     eta = (
-                        float(live_eta)
-                        if live_eta is not None
+                        self._tolerant_live_eta(snapshot)
+                        if snapshot.get("eta_seconds") is not None
                         else self._benchmark_eta_for_job(snapshot)
                     )
                 if eta is not None:
@@ -2156,6 +2156,19 @@ class MainWindow(QMainWindow):
         if not seen_estimate:
             return None
         return total
+
+    def _tolerant_live_eta(self, snapshot: dict) -> float | None:
+        """v0.4.13 addendum (T6): the ONE tolerant float(eta) conversion
+        for the forecast/label paths — the payload contract is
+        None-or-float, but shape drift degrades to 'no digits', never a
+        raised ValueError out of the 1 Hz heartbeat."""
+        live = snapshot.get("eta_seconds")
+        if live is None:
+            return None
+        try:
+            return float(live)
+        except (TypeError, ValueError):
+            return None
 
     def _benchmark_eta_for_job(self, snapshot: dict) -> float | None:
         """Benchmark-cache ETA for one queued ahead-of-us job, from the
@@ -2241,14 +2254,10 @@ class MainWindow(QMainWindow):
             return None
         current = self._eta_current_job(snapshot)
         if current is None:
-            live = snapshot.get("eta_seconds")
-            if live is not None:
+            if snapshot.get("eta_seconds") is not None:
                 # v0.4.13 addendum (T6 arm 2): the wrapper reads the same
                 # payload — the same "no digits" degrade as the tick path.
-                try:
-                    current = float(live)
-                except (TypeError, ValueError):
-                    current = None
+                current = self._tolerant_live_eta(snapshot)
         if current is None:
             return None
         return self._render_damped_eta(current, self._batch_eta_rendered)
