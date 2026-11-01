@@ -536,6 +536,15 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.cancel_button.setToolTip("Stop the running job safely; queued jobs stay queued.")
         self.cancel_button.clicked.connect(self.cancel_upscale)
+        # v0.4.13 (design §4.1): the batch-wide cancel — one action stops
+        # the running job AND cancels every queued job in this batch
+        # (registry-side atomicity; the GUI makes ONE client call).
+        self.cancel_batch_button = QPushButton("Cancel Batch")
+        self.cancel_batch_button.setEnabled(False)
+        self.cancel_batch_button.setToolTip(
+            "Stop the running job and cancel every queued job in this batch."
+        )
+        self.cancel_batch_button.clicked.connect(self.cancel_batch_upscale)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
@@ -798,6 +807,9 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.monitor_check, 2, 0, 1, 5)
         self.monitor_check.toggled.connect(self._toggle_monitor)
         grid.addWidget(self.cancel_button, 1, 7)
+        # v0.4.13 (design §4.1): Cancel Batch lands immediately right of
+        # Cancel Current — column 8, row 1, was free (Start owns (0, 8)).
+        grid.addWidget(self.cancel_batch_button, 1, 8)
         grid.setColumnStretch(6, 1)
         layout.addWidget(controls)
         layout.addWidget(self.progress)
@@ -1222,9 +1234,53 @@ class MainWindow(QMainWindow):
         self.stage_label.setText("Cancelling...")
         self._set_summary("Cancelling", "Stopping the current file safely.")
 
+    def cancel_batch_upscale(self) -> None:
+        """The v0.4.13 batch-wide cancel (design §4.1): ONE client call —
+        the atomicity lives registry-side (§3.2), the GUI never touches
+        the registry. Every job in this batch whose registry state is
+        queued lands cancelled; the running job's claim-time CancelFlag
+        flips and dies through the proven terminate path. The drain,
+        per-row truth rendering, and batch cleanup then ride the
+        EXISTING _poll_jobs -> _consume_terminal_snapshot ->
+        _batch_finished pipeline — no new render path; both per-id
+        verdicts (cancelling/cancelled) mean "lands cancelled"."""
+        ids = list(self.job_ids)  # snapshot the batch set
+        if not ids:
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Cancel Batch",
+                "Cancel the entire batch? The running file stops and "
+                f"{len(ids)} queued file(s) will not run.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,  # ship default: Yes (§4.3)
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        self.client.cancel_batch(ids)
+        # Belt-and-suspenders (§4.4): both cancel buttons disable on the
+        # first click; a second can only find already-finished work.
+        self.cancel_batch_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        self.stage_label.setText("Cancelling batch...")
+        self._set_summary(
+            "Cancelling batch",
+            "Stopping the current file and clearing the queue.",
+        )
+
     def _sync_run_controls(self) -> None:
         active = self.client.active_job_count() > 0 and bool(self.job_ids)
         self.cancel_button.setEnabled(active)
+        # v0.4.13 (design §4.2): Cancel Batch enabled iff this window
+        # owns a live batch set — INCLUDING the idle-queue case (nothing
+        # running right now, queued jobs remain): cancel_batch marks all
+        # queued and the batch drains. Independent of Cancel Current's
+        # rule (which additionally requires an active count); the
+        # asymmetry is honest — Cancel Current targets nothing when idle,
+        # Cancel Batch still has queued targets.
+        self.cancel_batch_button.setEnabled(bool(self.job_ids))
         if active:
             self.start_button.setEnabled(False)
             self.plan_button.setEnabled(False)
