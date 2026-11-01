@@ -2,6 +2,26 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.13] - 2026-11-01
+
+### Added
+
+- **Cancel Batch (GUI)**: a new button immediately right of Cancel
+  Current stops the running file AND cancels every queued job in the
+  batch with one action — confirm before it acts ("Cancel the entire
+  batch?"). Queued jobs land `cancelled` without ever starting (error:
+  "batch cancelled by user"); the running job dies through the same
+  cooperative terminate path as Cancel Current; the bar lands amber
+  ("0/N succeeded, N cancelled") and every row shows its own truth.
+  Enabled whenever this window owns a batch set — including the
+  idle-queue moment between files. Closing the window keeps its
+  previous semantics (unchanged by this release).
+- Registry-side atomicity: the new `Registry.cancel_batch` marks/flags
+  and persists under ONE lock hold, and claiming (`Registry.claim_next`,
+  the executor's claim path) runs on the same lock — nothing from the
+  batch can start after a Cancel Batch returns, even when a job finishes
+  at the exact tick of the click.
+
 ## [0.4.12] - 2026-11-01
 
 ### Changed

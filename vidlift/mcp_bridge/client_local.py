@@ -180,6 +180,16 @@ class LocalBridgeClient:
             return "cancelling"
         return result
 
+    def cancel_batch(self, job_ids) -> dict[str, str]:
+        """``Registry.cancel_batch`` per-id, with the SAME per-job
+        conflict-degrade rule as ``cancel()``: a ``conflict`` verdict
+        (one flag already in flight) reads as ``cancelling`` to the
+        caller — one cancel is already doing the job."""
+        return {
+            job_id: ("cancelling" if result == "conflict" else result)
+            for job_id, result in self.registry.cancel_batch(job_ids).items()
+        }
+
     # -- history -----------------------------------------------------------
 
     def history(self, limit: int = 20) -> list[dict]:

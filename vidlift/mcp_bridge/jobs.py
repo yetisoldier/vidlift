@@ -413,17 +413,15 @@ class JobExecutor:
     # -- queue ---------------------------------------------------------------
 
     def _claim_next(self) -> JobRecord | None:
-        """Claim the oldest queued job (submission order)."""
-        queued = sorted(
-            self.registry.queued(), key=lambda r: r.submitted_at
-        )
-        for job in queued:
-            try:
-                self.registry.transition(job, "running")
-                return job
-            except RegistryError:
-                continue  # cancelled between view and claim
-        return None
+        """Claim the oldest queued job (submission order).
+
+        v0.4.13 (design §3.3): the claim is the registry's
+        ``claim_next()`` — the view→transition pair runs under ONE
+        ``Registry._lock`` hold so a claim can never interleave between
+        ``Registry.cancel_batch``'s marks (and vice versa). The
+        executor calls IN to the registry; never the reverse.
+        """
+        return self.registry.claim_next()
 
     def _worker_loop(self) -> None:
         # The N1 amendment to layer c: the guard must cover the CLAIM

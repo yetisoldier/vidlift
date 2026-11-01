@@ -371,6 +371,23 @@ class MainWindow(QMainWindow):
         # the table on clear_files/_render_pending_files).
         self._batch_row_for_job: dict[str, int] = {}
 
+        # v0.4.13 addendum (selection-follow, design §3.2): the follow
+        # state machine. _follow_mode True = the selection tracks the
+        # RUNNING job (auto-select on claim edges); a user selection
+        # (mouse or keyboard) disengages it until the next claim edge
+        # ("stay on the selected item until the running item switches
+        # then adjust it" — Eric's rule). _follow_job_id is the running
+        # identity last followed/observed; None resets at batch start so
+        # the FIRST claim is always an identity EDGE. _programmatic_select
+        # distinguishes the follow's own selectRow writes from user
+        # selection in itemSelectionChanged (any NEW programmatic
+        # selection writer MUST use _follow_select_row or replicate this
+        # guard — the fail-safe direction is follow-disengage, T3-class
+        # tests catch violators).
+        self._follow_mode: bool = True
+        self._follow_job_id: str | None = None
+        self._programmatic_select: bool = False
+
         # v0.4.12 (item 2): per-current-job ETA state — EWMA of the
         # measured phase rate, keyed on CHUNK boundaries (a long
         # disk-bound lull must not bleed into the GPU rate), reset at
@@ -536,6 +553,15 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self.cancel_button.setToolTip("Stop the running job safely; queued jobs stay queued.")
         self.cancel_button.clicked.connect(self.cancel_upscale)
+        # v0.4.13 (design §4.1): the batch-wide cancel — one action stops
+        # the running job AND cancels every queued job in this batch
+        # (registry-side atomicity; the GUI makes ONE client call).
+        self.cancel_batch_button = QPushButton("Cancel Batch")
+        self.cancel_batch_button.setEnabled(False)
+        self.cancel_batch_button.setToolTip(
+            "Stop the running job and cancel every queued job in this batch."
+        )
+        self.cancel_batch_button.clicked.connect(self.cancel_batch_upscale)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
@@ -798,6 +824,9 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.monitor_check, 2, 0, 1, 5)
         self.monitor_check.toggled.connect(self._toggle_monitor)
         grid.addWidget(self.cancel_button, 1, 7)
+        # v0.4.13 (design §4.1): Cancel Batch lands immediately right of
+        # Cancel Current — column 8, row 1, was free (Start owns (0, 8)).
+        grid.addWidget(self.cancel_batch_button, 1, 8)
         grid.setColumnStretch(6, 1)
         layout.addWidget(controls)
         layout.addWidget(self.progress)
@@ -919,6 +948,10 @@ class MainWindow(QMainWindow):
         # previous batch's job_id->row map with it (back-to-back-batches
         # hygiene; see the v0.4.12 boundary test).
         self._batch_row_for_job = {}
+        # v0.4.13 addendum (§3.3-g): the follow state resets with the row
+        # map — a NEW batch's first claim must always be an identity edge.
+        self._follow_mode = True
+        self._follow_job_id = None
         self.start_button.setEnabled(False)
         self.file_table.setRowCount(len(self.files))
         for row, path in enumerate(self.files):
@@ -968,6 +1001,10 @@ class MainWindow(QMainWindow):
         # v0.4.12 (item 1): the table is gone — a stale job_id->row map from
         # the previous batch must never map into a fresh one.
         self._batch_row_for_job = {}
+        # v0.4.13 addendum (§3.3-g): the follow state resets with the row
+        # map — a NEW batch's first claim must always be an identity edge.
+        self._follow_mode = True
+        self._follow_job_id = None
         self.start_button.setEnabled(False)
         self.file_table.setRowCount(0)
         self.details.clear()
@@ -1062,32 +1099,150 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(allowed)
 
     def _sync_details(self) -> None:
+        # v0.4.13 addendum (ITEM 1, design §2.3 D-selection-2): the slot
+        # boundary. In the frozen --windowed Windows build any exception
+        # escaping a Qt slot has no console and kills the process
+        # silently (the Eric crash family §1.1). This slot is
+        # user-triggered, rare, idempotent — the ONE place a logged
+        # swallow is justified; the poll heartbeat keeps its explicit-
+        # guard style (§2.3: no wholesale wrapper there). The boundary
+        # LOGS AND SWALLOWS, never silently — and also carries the
+        # v0.4.13 §3.4 user-selection edge (follow disengage; ITEM 2).
+        if getattr(self, "_programmatic_select", False):
+            # The follow-write's own selectRow delivers this signal
+            # synchronously — a programmatic write, never a user
+            # selection: the follow path renders detail for that row
+            # itself. Any NEW programmatic selection writer MUST use
+            # _follow_select_row or replicate this guard (R4), else the
+            # machine misreads it as a user override (fail-safe
+            # direction: follow disengages; T3-class tests catch it).
+            return
+        # §3.4: anything reaching here IS a user selection (mouse or
+        # keyboard — arrows fire the same itemSelectionChanged), the
+        # USER_SELECT edge: the user stays on their row until the next
+        # claim edge re-engages follow (Eric: "stay on the selected item
+        # until the running item switches then adjust it").
+        self._follow_mode = False
+        try:
+            self._render_detail_for_row()
+        except Exception:
+            import sys as _sys
+            import traceback
+
+            print("VidLift: detail render survived an exception:", file=_sys.stderr)
+            traceback.print_exc()
+
+    # -- v0.4.13 addendum ITEM 1 (design §2.1 D-selection-1): the ONE detail renderer
+    # every selection detail write goes through. Plan body from detail_text (already
+    # fully None-guarded, v0.4.12 §1.3-verified), optional scratch note, plus a LIVE
+    # overlay when the row maps to a job in `_batch_row_for_job` (identity-keyed —
+    # never the draining index). Tolerates the FULL state matrix (§2.2): only `state`
+    # and `job_id` keys are assumed on a non-None snapshot; everything else uses the
+    # poll path's tolerant `.get(...) or default` getters; a None snapshot renders an
+    # honest "(no data)" line instead of raising. Safe for queued (no snapshot data),
+    # running mid-transition, cancelled, succeeded, failed, and lookup-failed rows.
+    def _render_detail_for_row(self, row: int | None = None) -> None:
         if self.batch is None:
             return
-        rows = self.file_table.selectionModel().selectedRows()
-        if not rows:
+        if row is None:
+            rows = self.file_table.selectionModel().selectedRows()
+            if not rows:
+                return
+            row = rows[0].row()
+        # Keep the v0.4.12 bounds guard: a row outside the plan renders
+        # nothing rather than inventing data (§2.1 step 1).
+        if not (0 <= row < len(self.batch.files)):
             return
-        row = rows[0].row()
-        if 0 <= row < len(self.batch.files):
-            text = detail_text(
-                self.batch.files[row],
-                subtitle_ocr_enabled=self.subtitle_ocr.isChecked(),
-                upscale_profile=self.profile_choice,
-            )
-            # v0.4.9 (§1.4 D1): the discoverability note — when the
-            # planned source has retained scratch and Resume is OFF,
-            # the plan detail names it AT THE MOMENT IT MATTERS.
-            if not self.resume_claim.isChecked():
-                from .run import scratch_note_for_source
+        item = self.batch.files[row]
+        text = detail_text(
+            item,
+            subtitle_ocr_enabled=self.subtitle_ocr.isChecked(),
+            upscale_profile=self.profile_choice,
+        )
+        # v0.4.9 (§1.4 D1), unchanged call — but now inside the _sync_details
+        # slot boundary (belt-and-braces over scratch_note_for_source's own
+        # OSError/JSONDecodeError guards: a Windows locked-file transient
+        # must never escape a slot in the frozen build, §2.1 step 3).
+        if not self.resume_claim.isChecked():
+            from .run import scratch_note_for_source
 
-                note = scratch_note_for_source(Path(self.batch.files[row].report.path))
-                if note:
-                    text = f"{text}\n\n{note}"
+            note = scratch_note_for_source(Path(item.report.path))
+            if note:
+                text = f"{text}\n\n{note}"
+        # LIVE overlay (§2.1 step 4): additive, tolerant, identity-keyed.
+        job_id = next(
+            (
+                jid
+                for jid, mapped_row in self._batch_row_for_job.items()
+                if mapped_row == row
+            ),
+            None,
+        )
+        if job_id is None:
+            self._set_details_text(text)
+            return
+        try:
+            snapshot = self.client.status_snapshot(job_id)
+        except Exception:
+            # §2.3: bridge reads stay inside the boundary too — degrade to
+            # plan body, never raise out of a render.
+            snapshot = None
+        if snapshot is None:
+            self._set_details_text(
+                f"{text}\n\n── LIVE ─────────────────────\nState: (no data — job lookup failed)"
+            )
+            return
+        state = snapshot.get("state") or "queued"
+        stage = run_stage_label(snapshot)
+        rendered = f"{stage}" if stage else state
+        eta = snapshot.get("eta_seconds")
+        eta_suffix = ""
+        if eta is not None:
+            try:
+                eta_val = float(eta)
+                eta_suffix = f" — ~{self._fmt_hm(eta_val)} remaining"
+            except (TypeError, ValueError):
+                eta_suffix = ""
+        lines = [
+            "── LIVE ─────────────────────",
+            f"Job: {job_id}   State: {state} — {rendered}{eta_suffix}",
+        ]
+        progress = snapshot.get("progress") or {}
+        if isinstance(progress, dict) and progress:
+            frames_done = progress.get("frames_done")
+            frames_total = progress.get("frames_total")
+            if frames_done is not None:
+                total = frames_total if frames_total else "?"
+                lines.append(f"Frames: {frames_done}/{total}")
+        tail = snapshot.get("log_tail") or []
+        if tail:
+            last = tail[-1]
+            lines.append(f"Log: {last}")
+        self._set_details_text("\n".join([text, "", *lines]))
+
+    def _set_details_text(self, text: str) -> None:
+        """§3.3-f: the details QTextEdit has no change-guard — setPlainText
+        resets the user's scroll. Compare-before-write so a paused/idle
+        running job does not repaint-kick the panel every second."""
+        if self.details.toPlainText() != text:
             self.details.setPlainText(text)
 
     def _refresh_details(self) -> None:
-        if self.batch is not None:
-            self.render_batch(self.batch)
+        if self.batch is None:
+            return
+        # v0.4.13 addendum ITEM 1 (design §2.4 D-selection-3): the C1
+        # re-entrancy class dies structurally — while a batch is LIVE with
+        # in-flight jobs, render_batch (full setRowCount/setItem rebuild)
+        # must never run: it can disturb a tracked selection mid
+        # itemSelectionChanged delivery and segfault in the Qt binary
+        # (§1.4 C1). The subtitle_ocr toggle's refresh degrades to a
+        # DETAIL-ONLY re-render of the current row; the table's plan
+        # columns already carry the same subtitle strings render_batch
+        # would write, so nothing is lost. Contract pinned by T5.
+        if self.job_ids:
+            self._render_detail_for_row()
+            return
+        self.render_batch(self.batch)
 
     # ---- Start: enqueue through the unified bridge path (design §5) ----
 
@@ -1181,6 +1336,10 @@ class MainWindow(QMainWindow):
             )
         self.run_counts: list[str | None] = [None] * self.run_total
         self.run_summary = summarize_batch(self.run_counts)
+        # v0.4.13 addendum (§3.2 BATCH_START): follow engages with
+        # _follow_job_id=None so the FIRST claim is an identity edge.
+        self._follow_mode = True
+        self._follow_job_id = None
         # v0.4.10 (R2): the batch bar restarts from a KNOWN color — the
         # stale QSS chunk from a previous run must not survive into
         # this run's truth.
@@ -1222,9 +1381,53 @@ class MainWindow(QMainWindow):
         self.stage_label.setText("Cancelling...")
         self._set_summary("Cancelling", "Stopping the current file safely.")
 
+    def cancel_batch_upscale(self) -> None:
+        """The v0.4.13 batch-wide cancel (design §4.1): ONE client call —
+        the atomicity lives registry-side (§3.2), the GUI never touches
+        the registry. Every job in this batch whose registry state is
+        queued lands cancelled; the running job's claim-time CancelFlag
+        flips and dies through the proven terminate path. The drain,
+        per-row truth rendering, and batch cleanup then ride the
+        EXISTING _poll_jobs -> _consume_terminal_snapshot ->
+        _batch_finished pipeline — no new render path; both per-id
+        verdicts (cancelling/cancelled) mean "lands cancelled"."""
+        ids = list(self.job_ids)  # snapshot the batch set
+        if not ids:
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Cancel Batch",
+                "Cancel the entire batch? The running file stops and "
+                f"{len(ids)} queued file(s) will not run.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,  # ship default: Yes (§4.3)
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        self.client.cancel_batch(ids)
+        # Belt-and-suspenders (§4.4): both cancel buttons disable on the
+        # first click; a second can only find already-finished work.
+        self.cancel_batch_button.setEnabled(False)
+        self.cancel_button.setEnabled(False)
+        self.stage_label.setText("Cancelling batch...")
+        self._set_summary(
+            "Cancelling batch",
+            "Stopping the current file and clearing the queue.",
+        )
+
     def _sync_run_controls(self) -> None:
         active = self.client.active_job_count() > 0 and bool(self.job_ids)
         self.cancel_button.setEnabled(active)
+        # v0.4.13 (design §4.2): Cancel Batch enabled iff this window
+        # owns a live batch set — INCLUDING the idle-queue case (nothing
+        # running right now, queued jobs remain): cancel_batch marks all
+        # queued and the batch drains. Independent of Cancel Current's
+        # rule (which additionally requires an active count); the
+        # asymmetry is honest — Cancel Current targets nothing when idle,
+        # Cancel Batch still has queued targets.
+        self.cancel_batch_button.setEnabled(bool(self.job_ids))
         if active:
             self.start_button.setEnabled(False)
             self.plan_button.setEnabled(False)
@@ -1252,6 +1455,10 @@ class MainWindow(QMainWindow):
         snapshots = self.client.enqueue_snapshots(self.job_ids)
         still_active: list[str] = []
         terminal_notes: list[str] = []
+        # v0.4.13 addendum ITEM 2 (§3.3-g): the RUNNING identity observed
+        # on THIS tick's pre-drain pairing (at most one under the serial
+        # executor); None on idle/terminal-only ticks.
+        running_now: str | None = None
         # v0.4.5 (§2 Rule 4): the rendered job-set key — the leading
         # job id — force-pins the log tail once when it changes (new
         # batch start; a claim rebase rides the leading id since the
@@ -1309,6 +1516,12 @@ class MainWindow(QMainWindow):
             if not terminal:
                 still_active.append(job_id)
                 if state == "running":
+                    # v0.4.13 §3.3-g: running_now keys on the PRE-drain
+                    # pairing (this loop IS the pre-drain pairing), since
+                    # the just-claimed job is present here and the drain
+                    # assignment below would misalign ids to snapshots.
+                    if isinstance(job_id, str):
+                        running_now = job_id  # at most one (serial executor)
                     self._consume_running_snapshot(row, snapshot, stage)
             else:
                 self._consume_terminal_snapshot(row, snapshot)
@@ -1316,6 +1529,12 @@ class MainWindow(QMainWindow):
                     f"{Path(snapshot.get('file_path') or '?').name}: {state}"
                 )
         self.job_ids = still_active if still_active else []
+        # v0.4.13 addendum ITEM 2 (§3.3-g): the follow logic lives HERE
+        # (evented on poll data — a selection-side hook could never
+        # distinguish a fresh claim from a stale read without this tick's
+        # snapshots). running_now was captured on the PRE-drain pairing;
+        # the edge check runs against _follow_job_id now.
+        self._follow_claim_edge(running_now)
         if self._run_started_at is not None and not self.job_ids:
             # The batch actually finished (every job reached a terminal
             # state and was drained above). Running this on every tick
@@ -1324,6 +1543,60 @@ class MainWindow(QMainWindow):
             # freeze at "queued" forever (the v0.4.4 validation D1
             # repro: timer dead, rows never update).
             self._batch_finished(terminal_notes)
+            return
+        # §3.3-f: the detail LIVE-updates per tick for the SELECTED row —
+        # riding this same poll (one extra status_snapshot per second, the
+        # identical read the tick already does elsewhere — R3: cheap). This
+        # covers BOTH follow selections and manual overrides, with no
+        # second timer. Skipped on the batch-end tick (selected row's own
+        # terminal state was just written by _batch_finished's summary
+        # path; the next user click re-renders). A batch-end tick with
+        # selection would also re-snap nothing — BATCH_END writes no
+        # selection (§3.2).
+        self._render_selected_detail_on_tick()
+
+    def _follow_claim_edge(self, running_now: str | None) -> None:
+        """§3.2 CLAIM edge: a running observation whose IDENTITY differs
+        from _follow_job_id (an EDGE, not a level — a level would fight
+        R-B's user override by re-selecting every tick). On an edge:
+        following re-engages, the identity is recorded, and the row is
+        programmatically selected THROUGH the guard so itemSelectionChanged
+        never misreads our own write as a user override (§3.4). Nothing
+        running (idle gap, §3.3-b) or a stale id is a TICK — no writes."""
+        if running_now is None or running_now == self._follow_job_id:
+            return
+        self._follow_job_id = running_now
+        self._follow_mode = True
+        row = self._batch_row_for_job.get(running_now)
+        if row is None:
+            return
+        self._follow_select_row(row)
+        self._render_detail_for_row(row)
+
+    def _follow_select_row(self, row: int) -> None:
+        """§3.4: the ONLY sanctioned programmatic selection writer. The
+        guard flag is synchronous-safe because selectRow delivers the
+        itemSelectionChanged signal before returning in Qt6; blockSignals
+        is rejected (it also swallows selection-model maintenance Qt
+        relies on). Keep default item flags — the guard flag, not item
+        flags, carries the programmatic/user distinction."""
+        self._programmatic_select = True
+        try:
+            self.file_table.selectRow(row)
+        finally:
+            self._programmatic_select = False
+
+    def _render_selected_detail_on_tick(self) -> None:
+        """§3.3-f: re-render the selected row's detail (plan body + live
+        overlay) on poll data. Compare-before-write lives in
+        _set_details_text — an unchanged running job costs nothing and
+        never scrolls the panel."""
+        if self.batch is None or not self._batch_row_for_job:
+            return
+        rows = self.file_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        self._render_detail_for_row(rows[0].row())
 
     def _consume_running_snapshot(self, row: int | None, snapshot: dict, stage: str) -> None:
         # §3b: the phase-change busy/reset keys on the stage's PHASE
@@ -1361,7 +1634,14 @@ class MainWindow(QMainWindow):
                 self.stage_bar.set_busy(True, "estimating ...")
         eta = snapshot.get("eta_seconds")
         if eta is not None:
-            self._stage_eta = float(eta)
+            # v0.4.13 addendum (CONFIRMED-defect fix, design R6/T6): the
+            # payload contract says None-or-float, but a future shape
+            # drift must degrade to "no ETA digits", never kill the
+            # heartbeat mid-tick.
+            try:
+                self._stage_eta = float(eta)
+            except (TypeError, ValueError):
+                self._stage_eta = None
         progress = snapshot.get("progress") or {}
         # v0.4.9 (progress mirror, design §2.1): the fallback arm —
         # when the in-memory state_box is absent (reader process ≠
@@ -1854,10 +2134,10 @@ class MainWindow(QMainWindow):
                         current_eta, self._batch_eta_rendered
                     )
                 else:
-                    live_eta = snapshot.get("eta_seconds")
+                    # T6: tolerant conversion (was bare float(live_eta)).
                     eta = (
-                        float(live_eta)
-                        if live_eta is not None
+                        self._tolerant_live_eta(snapshot)
+                        if snapshot.get("eta_seconds") is not None
                         else self._benchmark_eta_for_job(snapshot)
                     )
                 if eta is not None:
@@ -1876,6 +2156,19 @@ class MainWindow(QMainWindow):
         if not seen_estimate:
             return None
         return total
+
+    def _tolerant_live_eta(self, snapshot: dict) -> float | None:
+        """v0.4.13 addendum (T6): the ONE tolerant float(eta) conversion
+        for the forecast/label paths — the payload contract is
+        None-or-float, but shape drift degrades to 'no digits', never a
+        raised ValueError out of the 1 Hz heartbeat."""
+        live = snapshot.get("eta_seconds")
+        if live is None:
+            return None
+        try:
+            return float(live)
+        except (TypeError, ValueError):
+            return None
 
     def _benchmark_eta_for_job(self, snapshot: dict) -> float | None:
         """Benchmark-cache ETA for one queued ahead-of-us job, from the
@@ -1961,8 +2254,10 @@ class MainWindow(QMainWindow):
             return None
         current = self._eta_current_job(snapshot)
         if current is None:
-            live = snapshot.get("eta_seconds")
-            current = float(live) if live is not None else None
+            if snapshot.get("eta_seconds") is not None:
+                # v0.4.13 addendum (T6 arm 2): the wrapper reads the same
+                # payload — the same "no digits" degrade as the tick path.
+                current = self._tolerant_live_eta(snapshot)
         if current is None:
             return None
         return self._render_damped_eta(current, self._batch_eta_rendered)

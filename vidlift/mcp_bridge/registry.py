@@ -37,6 +37,7 @@ __all__ = [
     "Registry",
     "RESTART_ERROR",
     "VALID_TRANSITIONS",
+    "BATCH_CANCELLED_ERROR",
 ]
 
 JOBS_FILENAME = "jobs.json"
@@ -57,6 +58,11 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
 }
 
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+
+# v0.4.13 (design §3.4): the per-record error string a queue-cancelled
+# job carries — naming the batch action makes history rows
+# self-explanatory ("cancelled, never failed" reporting).
+BATCH_CANCELLED_ERROR = "batch cancelled by user"
 
 
 class RegistryError(RuntimeError):
@@ -352,26 +358,35 @@ class Registry:
         our own write.
         """
         with self._lock:
-            payload = json.dumps(
-                {
-                    "jobs": [record.to_dict() for record in self._jobs.values()],
-                },
-                indent=2,
-            ) + "\n"
-            fd, tmp_name = tempfile.mkstemp(
-                dir=str(self.path.parent), prefix=".jobs-", suffix=".tmp"
-            )
+            self._save_unlocked()
+
+    def _save_unlocked(self) -> None:
+        """The atomic write body, called by ``save()`` under its own
+        ``_lock`` hold. ``claim_next``/``cancel_batch`` (v0.4.13) call
+        this directly while ALREADY holding ``_lock`` — the lock is a
+        plain non-reentrant ``threading.Lock``, so those paths must not
+        go through ``save()``; the post-write mtime update keeps their
+        save→read sequences from triggering a spurious reload."""
+        payload = json.dumps(
+            {
+                "jobs": [record.to_dict() for record in self._jobs.values()],
+            },
+            indent=2,
+        ) + "\n"
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(self.path.parent), prefix=".jobs-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp_name, self.path)
+        except OSError:
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(payload)
-                os.replace(tmp_name, self.path)
+                os.unlink(tmp_name)
             except OSError:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
-                raise
-            self._loaded_mtime = self._stat_mtime_or_none()
+                pass
+            raise
+        self._loaded_mtime = self._stat_mtime_or_none()
 
     # -- job operations -------------------------------------------------------
 
@@ -430,6 +445,46 @@ class Registry:
         """The claim-time registered CancelFlag for a running job
         (None before claim or after the job closes)."""
         return self._cancel_flags.get(job_id)
+
+    def claim_next(self) -> JobRecord | None:
+        """Claim the oldest queued job (submission order), atomically.
+
+        The v0.4.13 race gate (design §3.3): the view→transition pair
+        the executor used to run as two separately-locked steps —
+        ``queued()`` snapshotted under the lock and released before the
+        ``running`` transition re-acquired it — gave no ordering
+        primitive against another writer's marks. Moving BOTH halves
+        under ONE ``_lock`` hold serializes the claim against
+        ``Registry.cancel_batch`` on the same lock: either the claim
+        lands first (the job is legitimately ``running`` and a batch
+        cancel flips its flag) or the cancel marks land first (this
+        finds nothing claimable from that set). Behavior-preserving
+        otherwise: same sorted view, same skip-on-cancelled rule, and
+        the claim transition creates/registers the CancelFlag exactly
+        the way ``transition("running")`` always has — inlined here
+        because ``transition()``/``save()`` acquire ``_lock``
+        themselves (a plain, non-reentrant ``threading.Lock``).
+        """
+        self._maybe_reload()
+        with self._lock:
+            queued = [
+                r for r in self._jobs.values() if r.state == "queued"
+            ]
+            queued.sort(key=lambda r: r.submitted_at)
+            claimed: JobRecord | None = None
+            for job in queued:
+                try:
+                    job.transition("running")
+                except RegistryError:
+                    continue  # cancelled between view and claim
+                from .jobs import CancelFlag  # deferred: jobs imports registry
+                self._cancel_flags[job.job_id] = CancelFlag()
+                claimed = job
+                break
+        if claimed is not None:
+            with self._lock:
+                self._save_unlocked()
+        return claimed
 
     # -- queue views -----------------------------------------------------------
 
@@ -533,6 +588,66 @@ class Registry:
         # same honest sweep semantics.
         self.transition(record, "cancelled")
         return "cancelled"
+
+    def cancel_batch(self, job_ids, *, include_running: bool = True) -> dict:
+        """Cancel an entire batch atomically w.r.t. the claim loop
+        (v0.4.13 design §3.2/§3.3).
+
+        Under ONE ``_lock`` hold:
+          a) running jobs in the id set -> their claim-time CancelFlags
+             flip (collected then set INSIDE the lock; the worker's
+             terminal transition happens later, jobs.py's D1 layer b);
+          b) queued jobs in the id set -> ``cancelled`` immediately
+             (legal per VALID_TRANSITIONS) with
+             ``error=BATCH_CANCELLED_ERROR`` and ``ok=False`` (design
+             §3.4 — "cancelled, never failed");
+          c) terminal/unknown ids -> counted, untouched.
+
+        Returns ``{job_id: "cancelling"|"cancelled"|"already-finished"|"not-found"}``
+        — the same vocabulary as ``cancel()``, one entry per requested
+        id. ONE save under the same lock (``_save_unlocked``): the file
+        reflects batch-cancelled truth before the call returns, and the
+        claim loop's next ``claim_next()`` — gated on the same lock —
+        finds nothing from the set (the §3.3 total order).
+
+        ``include_running=False`` is the §4.6 variant seam
+        (cancel-queued-but-keep-current): only queued jobs are marked
+        and the running job keeps running. NOT surfaced by the GUI in
+        v0.4.13.
+        """
+        id_set = list(job_ids)
+        results: dict[str, str] = {}
+        flags_to_set = []
+        with self._lock:
+            for job_id in id_set:
+                record = self._jobs.get(job_id)
+                if record is None:
+                    results[job_id] = "not-found"
+                elif record.state in TERMINAL_STATES:
+                    results[job_id] = "already-finished"
+                elif record.state == "queued":
+                    record.transition("cancelled")
+                    record.error = BATCH_CANCELLED_ERROR
+                    record.ok = False
+                    results[job_id] = "cancelled"
+                else:  # running (the only non-terminal state left)
+                    if include_running:
+                        flag = self._cancel_flags.get(job_id)
+                        if flag is not None and not flag.is_set():
+                            flags_to_set.append(flag)
+                            results[job_id] = "cancelling"
+                        else:
+                            # Double cancel while one is already in
+                            # flight — the same conflict semantics
+                            # per-job cancel reports.
+                            results[job_id] = "conflict"
+                    else:
+                        results[job_id] = "conflict"
+            for flag in flags_to_set:
+                flag.set()
+            if any(result != "not-found" for result in results.values()):
+                self._save_unlocked()
+        return results
 
     def set_cancel_flag(self, job_id: str, flag) -> None:
         if flag is None:
