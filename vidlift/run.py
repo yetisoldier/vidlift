@@ -2373,19 +2373,21 @@ def run_file(
                             f"{transcribe_device} (cuda=int8_float16, "
                             "cpu=int8)"
                         )
-                        if transcribe_engine_factory is not None:
-                            engine = transcribe_engine_factory(model_dir)
-                        else:
-                            engine = make_whisper_engine(
-                                model_dir, device=transcribe_device
-                            )
                         transcribed = transcribe_source_to_srt(
                             report.path,
                             output_path=plan.output_path,
                             workdir=transcribe_workdir,
                             ffmpeg=tools.ffmpeg,
                             runner=run_cmd,
-                            engine=engine,
+                            engine_factory=(
+                                lambda model_dir: (
+                                    transcribe_engine_factory(model_dir)
+                                    if transcribe_engine_factory is not None
+                                    else make_whisper_engine(
+                                        model_dir, device=transcribe_device
+                                    )
+                                )
+                            ),
                             language_pin=knobs.get("language") or "",
                             on_step=record_step,
                             on_progress=record_progress,

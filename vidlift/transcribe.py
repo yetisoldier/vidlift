@@ -64,6 +64,8 @@ __all__ = [
     "TranscriptionResult",
     "WhisperEngine",
     "align_verify_cues",
+    "CUE_LEAD_IN_MS",
+    "CUE_LEAD_OUT_MS",
     "detect_language",
     "make_whisper_engine",
     "model_cache_dir",
@@ -71,8 +73,10 @@ __all__ = [
     "resolve_transcription_device",
     "resolve_model_dir",
     "segments_to_cues",
+    "SEGMENT_NO_SPEECH_DROP",
     "transcribe_sidecar_srt_path",
     "transcribe_source_to_srt",
+    "WORD_PROB_FLOOR",
 ]
 
 
@@ -575,6 +579,34 @@ def detect_language(
 ALIGNED_MIDPOINT_REBUILD_MS = 250
 # Cues below this aligned confidence are dropped (music-region garbage).
 ALIGN_CONFIDENCE_DROP = 0.2
+# Per-cue word-confidence floor (validation fix 4): a cue whose average
+# WORD probability falls below this is dropped as music-region
+# hallucination garbage. Measured on Eric's library with the real small
+# model (Firefly/S01E01 en, Scarlet Heart/S01E01 ko; Karen's slices):
+# real dialogue clusters at 0.75-0.995 average word probability while
+# the music-edge garbled cues Karen flagged run 0.013-0.30 (the VAD
+# passes them; the fixed-marker + no_speech>0.9 rules did not). 0.5 sits
+# in the measured empty zone (0.30 garbage vs 0.75 real) — real
+# mumbly-but-true speech stays, hallucinated noise goes.
+WORD_PROB_FLOOR = 0.5
+# Per-cue word-confidence floor for WORDLESS cues (validation fix 4):
+# a segment whose words lack timestamps carries no word probability at
+# all, so the segment's own no_speech_prob is the only honest signal.
+# The silence/lo-fi signature Karen measured drops here too. Word-Stamped
+# clusters use WORD_PROB_FLOOR instead (average word probability).
+SEGMENT_NO_SPEECH_DROP = 0.9
+
+# Readability lead-in/lead-out around the word timestamps. The measured
+# lead-in is ZERO milliseconds ON PURPOSE: with the shipped VAD
+# (silero speech_pad_ms=400 default, faster_whisper/vad.py) cue starts
+# already lead the measured audio onsets (Karen's own onset metric:
+# −80 ms median on the Firefly slice) — an explicit lead-in pushed the
+# median to −96 ms on the same slices. The lead-out adds 120 ms of
+# hold after the last word's end (subtitle minimum-dwell convention:
+# cues that vanish at the last phoneme read as flicker), clamped
+# against the next cue start so it can never overlap.
+CUE_LEAD_IN_MS = 0
+CUE_LEAD_OUT_MS = 120
 
 _HALLUCINATION_TEXTS = {
     "thank you.", "thanks for watching!", "subtitles by",
@@ -584,14 +616,25 @@ _HALLUCINATION_TEXTS = {
 
 def segments_to_cues(
     segments: list[TranscriptSegment],
+    *,
+    word_prob_floor: float = WORD_PROB_FLOOR,
+    no_speech_drop: float = SEGMENT_NO_SPEECH_DROP,
 ) -> list[Cue]:
     """Cues from word timestamps (not segment midpoints).
 
     Each WORD-CLUSTER between big gaps (>=0.7 s within a segment)
-    becomes its own cue bounded by word times; a segment whose words
-    lack timestamps falls back to segment bounds. Whisper's own
-    segmentation (~7 s / 80 chars) is respected by construction; the
-    per-cue 500 ms minimum display floor rides with normalize_cues.
+    becomes its own cue bounded by word times: the start is the cluster's
+    FIRST WORD start (the honest anchor for a segment whose start can
+    precede its first word — the validation-fix fixture shape), the end
+    the LAST WORD end plus CUE_LEAD_OUT_MS hold (clamped against the
+    next cue, never overlapping); a segment whose words lack timestamps
+    falls back to segment bounds. Cues whose average word probability
+    is below ``word_prob_floor`` are dropped, and wordless segments with
+    no_speech_prob at/above ``no_speech_drop`` are dropped (music-region
+    hallucination garbage: measured real dialogue 0.75-0.995 vs garbled
+    music-edge 0.013-0.30 on Eric's library). Whisper's own segmentation
+    (~7 s / 80 chars) is respected by construction; the per-cue 500 ms
+    minimum display floor rides with normalize_cues.
     """
     cues: list[Cue] = []
     for segment in segments:
@@ -604,6 +647,11 @@ def segments_to_cues(
             and w.word.strip()
         ]
         if not words:
+            # the wordless fallback keeps segment bounds, but a segment
+            # the engine itself flagged as mostly-noise at/above the
+            # drop line is the hallucination signature — never a cue
+            if segment.no_speech_prob >= no_speech_drop:
+                continue
             cues.append(
                 Cue(
                     start_ms=int(round(segment.start * 1000)),
@@ -622,20 +670,54 @@ def segments_to_cues(
             else:
                 current.append(nxt)
         clusters.append(current)
+        # a high-no_speech segment with real-looking words is exactly
+        # Karen's music-edge signature (the VAD passes it, the words
+        # hallucinate over the music bed): require the cluster's OWN
+        # average word probability to clear the floor — which it does
+        # for true speech — AND the segment's no_speech_prob to stay
+        # below the drop line for any cluster whose text is short
+        # single-word debris (the measured 'Oh'/'I' shapes).
+        seg_no_speech = segment.no_speech_prob
         for cluster in clusters:
             cluster_text = " ".join(
                 w.word.strip() for w in cluster if w.word.strip()
             )
             if not cluster_text:
                 continue
+            avg_prob = sum(w.probability for w in cluster) / len(cluster)
+            if avg_prob < word_prob_floor:
+                continue
+            if seg_no_speech >= no_speech_drop and len(cluster) == 1:
+                # single-word debris over a flagged no-speech window:
+                # the measured music-edge shape ('Oh' p=.30 nsp=.82)
+                continue
+            end_word = cluster[-1].end
+            end_ms = int(round(
+                (end_word if end_word is not None else segment.end) * 1000
+            ))
+            if end_word is not None:
+                end_ms += CUE_LEAD_OUT_MS
             cues.append(
                 Cue(
-                    start_ms=int(round((cluster[0].start or 0.0) * 1000)),
-                    end_ms=int(round((cluster[-1].end or segment.end) * 1000)),
+                    start_ms=int(round((cluster[0].start or 0.0) * 1000))
+                    + CUE_LEAD_IN_MS,
+                    end_ms=end_ms,
                     text=cluster_text,
                 )
             )
-    return normalize_cues(cues)
+    out = normalize_cues(cues)
+    # the lead-out hold must never eat the next cue's start: clamp each
+    # cue's end against its successor (zero-gap adjacency is allowed;
+    # a >=500 ms display floor survives via normalize_cues for 0-length)
+    clamped: list[Cue] = []
+    for i, cue in enumerate(out):
+        end = cue.end_ms
+        if i + 1 < len(out):
+            nxt = out[i + 1]
+            if end > nxt.start_ms and cue.start_ms < nxt.start_ms:
+                end = max(nxt.start_ms, cue.start_ms + 500)
+        clamped.append(Cue(cue.start_ms, end, cue.text))
+    return clamped
 
 
 def align_verify_cues(
@@ -896,6 +978,16 @@ def transcribe_source_to_srt(
         on_step and on_step("transcribe-align")
         cues = segments_to_cues(segments)
         cues, notes = align_verify_cues(cues, segments)
+        # -- zero-cue rule (validation fix 3): an SRT with no cues is a
+        # 3-byte BOM file every player chokes on and the mux fails with
+        # an ffmpeg parse error instead of a reason. Name the condition
+        # HERE; the callers decide the disposition (Mode A fail-open
+        # note, Mode B failed job) — both honest, neither a parse error.
+        if not cues:
+            raise TranscriptionError(
+                "no speech detected in audio — transcription produced "
+                "no subtitle cues"
+            )
         # -- write the KEEP sidecar ----
         on_step and on_step("transcribe-write")
         from .srt import write_srt_file
