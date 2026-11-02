@@ -61,6 +61,15 @@ from .subtitles import (
     run_subtitle_ocr,
     sidecar_srt_path,
 )
+# v0.4.14 (Mode A): the transcription core. The GPU-phase lock factory
+# (engine_ncnn._gpu_phase_lock) resolves lazily inside the transcribe
+# branch — engine_ncnn imports run.py at module level, and the
+# resume-claim code already uses this exact lazy pattern.
+from .transcribe import (
+    TranscriptionError,
+    TranscriptionResult,
+    transcribe_source_to_srt,
+)
 # v0.4.9 (resume claim): the claim machinery needs the engine's own
 # honest helpers (duration gate, decode-count, audio extent) so a
 # claimed mezzanine proves itself EXACTLY as a freshly prepared one
@@ -1718,6 +1727,12 @@ def run_file(
     subtitle_ocr: bool = True,
     replace_source: bool = False,
     resume: bool = False,
+    # v0.4.14 (Mode A): None -> config TRANSCRIPTION_ENABLED_DEFAULT
+    # (locked ON); False is the load-bearing GUI checkbox.
+    transcription_enabled: bool | None = None,
+    # v0.4.14: the engine factory seam — tests inject a stub; production
+    # None builds the real faster-whisper engine in the branch below.
+    transcribe_engine_factory: Callable | None = None,
 ) -> RunResult:
     """Run one file through the full pipeline and return its state.
 
@@ -1850,6 +1865,27 @@ def run_file(
         plan = _apply_subtitle_ocr_preference(plan, enabled=subtitle_ocr)
         if plan is not original_plan:
             log("subtitle OCR disabled by user; bitmap subtitles will not be carried")
+        # v0.4.14 (Mode A): the caller-passed kill switch. The plan was
+        # built under the locked default; False here removes an
+        # already-selected transcribed plan and the log says so.
+        if (
+            transcription_enabled is not None
+            and not transcription_enabled
+            and plan.subtitle_plan is not None
+            and plan.subtitle_plan.source == "transcribed"
+        ):
+            log(
+                "transcription disabled by user; no subtitles will be "
+                "transcribed for this run"
+            )
+            plan = replace(
+                plan,
+                subtitle_plan=None,
+                transcription=None,
+                subtitle_note=(
+                    "transcription disabled by user; no subtitles carried"
+                ),
+            )
         state.plan = plan
         state.output_path = plan.output_path
         log(f"planned output: {plan.output_path}")
@@ -2276,7 +2312,127 @@ def run_file(
             warnings: list[str] = []
             sidecar_target = sidecar_srt_path(plan.output_path)
             try:
-                if sub_plan.kind == "text" and sub_plan.source == "embedded":
+                if sub_plan.kind == "text" and sub_plan.source == "transcribed":
+                    # ==== v0.4.14 Mode A: TRANSCRIBE (design §Mode A) ====
+                    # Model resolution + sha-pinned first-run download +
+                    # VAD + word timestamps + the alignment pass live in
+                    # transcribe.transcribe_source_to_srt; THIS branch
+                    # owns the disposition only. Sync by construction:
+                    # the core extracts the source's `0:a:0`, the exact
+                    # stream the encode maps untouched. Any failure
+                    # (missing model, failed sha pin, engine-off env, no
+                    # audio) FAILS OPEN through the shared except below.
+                    record_step("transcribe")
+                    transcribe_workdir = str(log_root / f"{run_id}.ocr-work")
+                    transcribe_engine_note = ""
+                    transcribe_device = ""
+                    # The machine-wide GPU-phase lock (the engine's own
+                    # depth-1 discipline; lazy import — engine_ncnn
+                    # imports this module at module level).
+                    from .engine_ncnn import _gpu_phase_lock
+
+                    gpu_lock = _gpu_phase_lock()
+
+                    def _transcribe_wait_label(holder_pid, held_seconds):
+                        record_step(
+                            "transcribing audio (waiting for GPU — held "
+                            f"by pid {holder_pid if holder_pid else '?'} "
+                            f"for {held_seconds:.0f}s)"
+                        )
+
+                    lock_acquired = gpu_lock.acquire(
+                        on_wait=_transcribe_wait_label
+                    )
+                    if not lock_acquired:
+                        # degrade-OPEN (the engine's own honesty rule):
+                        # never a hang; the note lands in the block.
+                        log(
+                            "WARNING: GPU phase lock unavailable on this "
+                            "filesystem; continuing WITHOUT cross-process "
+                            "GPU serialization for transcription"
+                        )
+                        transcribe_engine_note = (
+                            "gpu-phase-lock unavailable (degrade-open)"
+                        )
+                    else:
+                        log(f"GPU phase lock acquired: {gpu_lock.path}")
+                    try:
+                        from .transcribe import (
+                            make_whisper_engine,
+                            resolve_model_dir,
+                            resolve_transcription_device,
+                        )
+
+                        knobs = plan.transcription or {}
+                        transcribe_device = resolve_transcription_device(
+                            knobs.get("device") or "auto"
+                        )
+                        model_dir = resolve_model_dir(knobs.get("model"))
+                        log(
+                            f"transcription: model {model_dir} device "
+                            f"{transcribe_device} (cuda=int8_float16, "
+                            "cpu=int8)"
+                        )
+                        if transcribe_engine_factory is not None:
+                            engine = transcribe_engine_factory(model_dir)
+                        else:
+                            engine = make_whisper_engine(
+                                model_dir, device=transcribe_device
+                            )
+                        transcribed = transcribe_source_to_srt(
+                            report.path,
+                            output_path=plan.output_path,
+                            workdir=transcribe_workdir,
+                            ffmpeg=tools.ffmpeg,
+                            runner=run_cmd,
+                            engine=engine,
+                            language_pin=knobs.get("language") or "",
+                            on_step=record_step,
+                            on_progress=record_progress,
+                            should_cancel=cancel,
+                        )
+                    except TranscriptionError as exc:
+                        # Mode A is fail-open: a transcription failure
+                        # never fails the run. Convert to SubtitleOcrError
+                        # so the shared fail-open handler below records
+                        # it; the lock releases via the finally.
+                        raise SubtitleOcrError(
+                            "transcription unavailable; no subtitles "
+                            f"carried: {exc}"
+                        ) from exc
+                    finally:
+                        if lock_acquired:
+                            gpu_lock.release()
+                    record_step("subtitle-mux")
+                    mux_srt_into_mp4(
+                        plan.output_path,
+                        transcribed.srt_path,
+                        language=transcribed.language,
+                        ffmpeg=tools.ffmpeg,
+                        runner=run_cmd,
+                    )
+                    subtitles_block["status"] = "carried"
+                    subtitles_block["sidecar_path"] = transcribed.srt_path
+                    subtitles_block["embedded"] = {
+                        "codec": "mov_text",
+                        "language_tag": mux_language(transcribed.language),
+                    }
+                    subtitles_block["transcription"] = {
+                        "model": transcribed.model,
+                        "device": transcribe_device,
+                        "language": transcribed.language,
+                        "language_confidence": transcribed.language_confidence,
+                        "cue_count": transcribed.cue_count,
+                        "notes": list(transcribed.notes)
+                        + (
+                            [transcribe_engine_note]
+                            if transcribe_engine_note
+                            else []
+                        ),
+                    }
+                    for note in transcribed.notes:
+                        log(f"subtitles: {note}")
+                elif sub_plan.kind == "text" and sub_plan.source == "embedded":
                     # Embedded text was carried IN the encode (mov_text,
                     # selected-index map). Extract the same stream as an
                     # .srt sidecar post-encode (the KEEP disposition,

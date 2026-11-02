@@ -30,3 +30,18 @@ def _no_monitor_autostart(monkeypatch):
     # suite run (nor write the port fallback back to real user
     # QSettings). Monitor-specific tests re-enable per-test.
     monkeypatch.setenv("VIDLIFT_MONITOR_AUTOSTART", "0")
+
+# v0.4.14: transcription engine hard-off in the suite (the design's test
+# rule: the suite NEVER downloads the model or needs a GPU). Tests that
+# exercise engine resolution set their own seam/env explicitly and
+# override per-test.
+@pytest.fixture(autouse=True)
+def _no_transcription_engine(monkeypatch, tmp_path_factory):
+    monkeypatch.setenv("VIDLIFT_TRANSCRIPTION_ENGINE", "0")
+
+
+@pytest.fixture
+def transcription_engine_on(monkeypatch):
+    """The v0.4.14 tests build plans under the env guard; tests that
+    exercise Mode A's default-ON plan seam need it OFF."""
+    monkeypatch.delenv("VIDLIFT_TRANSCRIPTION_ENGINE", raising=False)
