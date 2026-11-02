@@ -297,15 +297,33 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
         options.get("log_dir") or (Path(path).parent / ".vidlift-runs")
     )
 
+    # v0.4.14 (Mode B progress): the tracked-runner seam — the
+    # executor hands run_subs_job's progress seams THIS live RunState,
+    # so the bridge's status payload reports the runner's own facts
+    # verbatim (Section 4.5) via the same state_box contract the
+    # run-job path uses; the mirror persists it for cross-process
+    # readers (tools.py's progress_snapshot fallback).
+    from ..run import RunState
+
+    state = RunState(file_path=path)
+    record.set_live("state_box", {"state": state})
+    # v0.4.5 (D2): re-pin the record so a reader's _maybe_reload
+    # cannot re-install a stale file row over the live seams (mirrors
+    # _execute_run_job's pin).
+    services.registry._jobs[record.job_id] = record
+
     def tracked(binary: str, args: list[str]):
         record.touch()
+        state.touch()
         live = record.get_live("commands")
         if live is not None:
             live.append([binary, *args])
         if "subs.srt" in " ".join(args) and "-c:s" in args:
             record.set_live("current_phase", "subs-mux")
+            state.current_phase = "subs-mux"
         elif "pcm_s16le" in args:
             record.set_live("current_phase", "transcribe")
+            state.current_phase = "transcribe"
         executor = getattr(services, "executor", None)
         if executor is not None and hasattr(executor, "maybe_mirror"):
             executor.maybe_mirror()
@@ -317,10 +335,39 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
 
     def probe_tracked(binary: str, args: list[str]):
         record.touch()
+        state.touch()
         record.set_live("current_phase", "probe")
+        state.current_phase = "probe"
         from ..run import _subprocess_runner
         base = services.probe_runner or services.command_runner or _subprocess_runner
         return base(binary, args)
+
+    def on_segments(segments_done: int, _total: int) -> None:
+        """v0.4.14 (Mode B): the core's on_progress carries segment
+        counts (segments_done; denominator unknown — 0 by contract).
+        Recorded into the state's progress dict so the GUI's honest
+        "N segment(s) done" label renders from REAL facts; no
+        fabricated total, ever."""
+        progress = dict(state.progress or {})
+        progress["segments_done"] = int(segments_done)
+        progress["step"] = f"transcribing segment {int(segments_done)}"
+        progress.pop("segments_total", None)
+        state.progress = progress
+        state.touch()
+        record.touch()
+
+    def on_step(step: str) -> None:
+        """The core's step names ride progress["step"] verbatim — the
+        same heartbeat-surface discipline the run path uses; rendering
+        lives GUI-side (run_stage_label)."""
+        progress = dict(state.progress or {})
+        note = str(step)
+        if note == "transcribe-run" and "segments_done" not in progress:
+            progress["step"] = "transcribing — building language model"
+        else:
+            progress["step"] = note
+        state.progress = progress
+        state.touch()
 
     try:
         from ..run import find_tools
@@ -344,6 +391,8 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
             burn=bool(options.get("burn", False)),
             workdir=options.get("workdir"),
             state_root=services.state_dir,
+            on_progress=on_segments,
+            on_step=on_step,
             should_cancel=cancel,
         )
     except EngineCancelled as exc:
