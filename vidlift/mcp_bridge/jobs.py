@@ -230,6 +230,11 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
             # options["resume"] reads as False, so v0.4.8 callers are
             # behavior-identical (no claim attempt, clean prepare).
             resume=bool(options.get("resume", False)),
+            # v0.4.14 (Mode A): absent-defaults rule — no options key
+            # reads as None (config default, locked ON); False kills.
+            transcription_enabled=options.get(
+                "transcription_enabled", None
+            ),
         )
     except EngineCancelled as exc:
         state = getattr(exc, "state", None)

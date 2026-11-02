@@ -505,6 +505,26 @@ class MainWindow(QMainWindow):
         )
         self.resume_claim.toggled.connect(self._resume_claim_changed)
 
+        # v0.4.14 (Mode A, Eric's locked default ON): transcribe the
+        # source's own audio when no subtitle track exists. The honest
+        # tooltip says the cost; QSettings-persisted like every other
+        # GUI preference.
+        self.transcribe_subs = QCheckBox(
+            "Add subtitles by transcription when none exist"
+        )
+        self.transcribe_subs.setChecked(
+            self._settings().value(
+                "transcribe_subs", True, type=bool
+            )
+        )
+        self.transcribe_subs.setToolTip(
+            "When a file has no subtitle track, transcribe its own audio "
+            "and embed the result (first use downloads a ~1.5 GB model "
+            "once; adds minutes per file). Sync comes from the source's "
+            "own audio stream, exactly the stream the encode keeps."
+        )
+        self.transcribe_subs.toggled.connect(self._transcribe_subs_changed)
+
         # v0.4.10 (R1): the GPU meter rides the top bar — a fixed-size
         # Task-Manager-style utilization chart (see vidlift/ui/
         # gpu_meter.py). Sampling is QThreadPool-off-thread, ~2 Hz,
@@ -721,6 +741,11 @@ class MainWindow(QMainWindow):
         """Persist the resume-claim preference (v0.4.9 §1.4, QSettings
         house rule); only the stored value changes."""
         self._settings().setValue("resume_claim", bool(checked))
+
+    def _transcribe_subs_changed(self, checked: bool) -> None:
+        """Persist the Mode A preference (v0.4.14, QSettings house
+        rule); only the stored value changes."""
+        self._settings().setValue("transcribe_subs", bool(checked))
 
     def _engine_changed(self, index: int) -> None:
         data = self.engine_combo.itemData(index)
@@ -1273,6 +1298,9 @@ class MainWindow(QMainWindow):
             # v0.4.9 (§1.4): rides into run_file(resume=...) through the
             # bridge's absent-defaults rule (absent would read False).
             "resume": self.resume_claim.isChecked(),
+            # v0.4.14 (Mode A): the checkbox is the load-bearing kill
+            # switch; False strips an already-selected transcribed plan.
+            "transcription_enabled": self.transcribe_subs.isChecked(),
         }
         try:
             self.job_ids = self.client.enqueue_run(

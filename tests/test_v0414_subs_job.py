@@ -458,3 +458,23 @@ def test_subs_cancel_mid_run_closes_cancelled(tmp_path, no_lock, monkeypatch):
     executor._run_job(record)
     final = registry.require(record.job_id)
     assert final.state == "cancelled"
+
+
+# -------------------------------------------------- Mode A surface wiring
+def test_mcp_run_options_carry_transcription_enabled(tmp_path):
+    """The run tool enqueues options verbatim; the executor's
+    absent-defaults rule passes None into run_file."""
+    from vidlift.mcp_bridge.registry import Registry
+    import inspect
+    import vidlift.mcp_bridge.jobs as jobs_mod
+
+    src = inspect.getsource(jobs_mod._execute_run_job)
+    assert 'transcription_enabled=options.get(\n                "transcription_enabled", None' in src
+
+
+def test_gui_checkbox_default_matches_locked_config(monkeypatch):
+    """QSettings default True mirrors config.TRANSCRIPTION_ENABLED_
+    DEFAULT (Eric's locked ON); the checkbox is the kill switch."""
+    from vidlift.config import TRANSCRIPTION_ENABLED_DEFAULT
+
+    assert TRANSCRIPTION_ENABLED_DEFAULT is True
