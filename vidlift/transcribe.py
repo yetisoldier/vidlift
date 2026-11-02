@@ -37,10 +37,13 @@ acceptable for Mode B batch use and documented, not deeply optimized.
 
 from __future__ import annotations
 
+import array
 import hashlib
 import os
 import re
 import shutil
+import sys
+import wave
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -73,6 +76,10 @@ __all__ = [
     "resolve_transcription_device",
     "resolve_model_dir",
     "segments_to_cues",
+    "SINGLE_WORD_HOLD_CAP_MS",
+    "HOLD_QUIET_RMS",
+    "HOLD_MEASURE_WINDOW_S",
+    "HOLD_MIN_KEEP_MS",
     "SEGMENT_NO_SPEECH_DROP",
     "transcribe_sidecar_srt_path",
     "transcribe_source_to_srt",
@@ -608,6 +615,26 @@ SEGMENT_NO_SPEECH_DROP = 0.9
 CUE_LEAD_IN_MS = 0
 CUE_LEAD_OUT_MS = 120
 
+# ---- v0.4.15: single-word hold-cap (Karen's stuck-cue fix) -----------------
+#
+# The rule: a SINGLE-word cue whose hold runs >2.5 s past its last word
+# end is capped to word_end + the standard 120 ms readability hold —
+# BUT ONLY when the audio immediately AFTER the word measures quiet
+# (RMS < HOLD_QUIET_RMS over the (word_end+0.1 s .. word_end+1.5 s)
+# window on the job's own 16 kHz scratch wav). Karen's 0.4.14 WARN:
+# Whisper word-end times on trailing syllables smear when the VAD
+# doesn't snap the segment shut; the cue then reads as a stuck line
+# (Firefly cue 16 "can't": single word, 8.28 s hold, region RMS
+# 0.0008-0.0089 — inside the quiet band with 10x headroom, while even
+# quiet dialogue runs 0.02-0.15 RMS). The measured guard keeps real
+# dramatic one-word holds (a shouted "No!" decaying over room
+# tone/score) untouched, and without a wav the cap NEVER trims
+# (guard-first: never trim on uncertainty).
+SINGLE_WORD_HOLD_CAP_MS = 2500
+HOLD_QUIET_RMS = 0.01
+HOLD_MEASURE_WINDOW_S = (0.1, 1.5)
+HOLD_MIN_KEEP_MS = 500
+
 _HALLUCINATION_TEXTS = {
     "thank you.", "thanks for watching!", "subtitles by",
     " Amara.org", "subtitle", "please subscribe",
@@ -619,6 +646,8 @@ def segments_to_cues(
     *,
     word_prob_floor: float = WORD_PROB_FLOOR,
     no_speech_drop: float = SEGMENT_NO_SPEECH_DROP,
+    hold_cap_wav: str | None = None,
+    notes: list[str] | None = None,
 ) -> list[Cue]:
     """Cues from word timestamps (not segment midpoints).
 
@@ -637,6 +666,7 @@ def segments_to_cues(
     minimum display floor rides with normalize_cues.
     """
     cues: list[Cue] = []
+    hold_cap_trims = 0
     for segment in segments:
         text = segment.text.strip()
         if not text:
@@ -697,14 +727,33 @@ def segments_to_cues(
             ))
             if end_word is not None:
                 end_ms += CUE_LEAD_OUT_MS
-            cues.append(
-                Cue(
-                    start_ms=int(round((cluster[0].start or 0.0) * 1000))
-                    + CUE_LEAD_IN_MS,
-                    end_ms=end_ms,
-                    text=cluster_text,
-                )
+            cue = Cue(
+                start_ms=int(round((cluster[0].start or 0.0) * 1000))
+                + CUE_LEAD_IN_MS,
+                end_ms=end_ms,
+                text=cluster_text,
             )
+            cues.append(cue)
+            # v0.4.15: the single-word hold-cap rides the SAME loop so
+            # the cluster shape (len == 1) and the LAST word's end
+            # stamp are available per cue — the smear case is exactly
+            # when the cue's padded end ran long past the word.
+            if len(cluster) == 1 and end_word is not None:
+                word_end_ms = int(round(end_word * 1000))
+                word_start_s = float(cluster[0].start or 0.0)
+                # the >2.5 s hold test lives INSIDE _trim_stuck_hold,
+                # anchored at the audio-measured end — the smeared
+                # stamp is exactly what cannot be trusted here.
+                trim_to_ms = _trim_stuck_hold(
+                    cue, word_start_s, word_end_ms, hold_cap_wav
+                )
+                if trim_to_ms is not None:
+                    cues[-1] = Cue(
+                        cue.start_ms,
+                        max(trim_to_ms, cue.start_ms + HOLD_MIN_KEEP_MS),
+                        cue.text,
+                    )
+                    hold_cap_trims += 1
     out = normalize_cues(cues)
     # the lead-out hold must never eat the next cue's start: clamp each
     # cue's end against its successor (zero-gap adjacency is allowed;
@@ -717,7 +766,205 @@ def segments_to_cues(
             if end > nxt.start_ms and cue.start_ms < nxt.start_ms:
                 end = max(nxt.start_ms, cue.start_ms + 500)
         clamped.append(Cue(cue.start_ms, end, cue.text))
+    if hold_cap_trims and notes is not None:
+        notes.append(_trim_note(hold_cap_trims))
     return clamped
+
+
+def _trim_note(count: int) -> str:
+    """The Karen-visible notes line for stuck-hold trims."""
+    return f"trimmed {count} stuck single-word cue hold(s)"
+
+
+def _wav_rms(
+    wav_path: str, start_s: float, end_s: float
+) -> float | None:
+    """RMS of a 16 kHz mono s16 wav slice; None when unreadable.
+
+    s16 samples scale to -1.0..1.0 by /32768 (peak-normalized); the
+    gate and Karen's measured band (0.0008-0.0089 near-silence vs
+    0.02-0.15 quiet dialogue) live on that scale. stdlib wave+array
+    only — the wav is s16le PCM mono by construction
+    (build_audio_extract_command).
+    """
+    frames = _wav_readframes(wav_path, start_s, end_s)
+    if frames is None:
+        return None
+    samples = array.array("h")
+    samples.frombytes(frames)
+    if not len(samples):
+        return None
+    # the wav contract is little-endian s16; byteswap on big-endian
+    if sys.byteorder == "big":
+        samples.byteswap()
+    acc = 0.0
+    scale = 1.0 / 32768.0
+    for v in samples:
+        acc += (v * scale) ** 2
+    return (acc / len(samples)) ** 0.5
+
+
+def _wav_readframes(wav_path: str, start_s: float, end_s: float):
+    """The raw little-endian s16 frames for [start_s, end_s) clamped to
+    the file; None when the wav is unusable (not mono s16, unreadable,
+    or the window is empty). Reads only — never writes."""
+    try:
+        with wave.open(wav_path, "rb") as wav:
+            if wav.getnchannels() != 1:
+                return None
+            rate = wav.getframerate()
+            sampwidth = wav.getsampwidth()
+            if rate <= 0 or sampwidth != 2:
+                return None
+            start = max(0, int(start_s * rate))
+            end = min(wav.getnframes(), int(end_s * rate))
+            if end <= start:
+                return None
+            wav.setpos(start)
+            return wav.readframes(end - start)
+    except (wave.Error, OSError, EOFError):
+        return None
+
+
+def _speech_offset_after(
+    wav_path: str, search_start_s: float, search_end_s: float,
+    *, window_s: float = 0.04, floor: float = HOLD_QUIET_RMS,
+) -> float | None:
+    """The word's audible offset: END of the FIRST voiced run inside
+    [search_start, search_end).
+
+    Walks non-overlapping ``window_s`` RMS steps forward and returns the
+    END of the FIRST run of windows whose RMS clears the ``floor``
+    (0.01: Karen's near-silence band sits below it with headroom; voiced
+    speech clears it) — the measured moment the word actually stops.
+    A single word is one voiced run; any LATER burst (a dramatic hold,
+    a score swell) is separate audio the after-guard must see. None
+    when no energy anywhere in the window (the anchor then falls back
+    to the word stamp).
+    """
+    try:
+        with wave.open(wav_path, "rb") as wav:
+            if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+                return None
+            rate = wav.getframerate()
+            if rate <= 0:
+                return None
+            total = wav.getnframes()
+            start = max(0, int(search_start_s * rate))
+            end = min(total, int(search_end_s * rate))
+            step = max(1, int(window_s * rate))
+            if end - start < step:
+                return None
+            wav.setpos(start)  # readframes seeks from CURRENT frame
+            samples = array.array("h")
+            samples.frombytes(
+                wav.readframes(end - start)  # whole window once
+            )
+            if sys.byteorder == "big":
+                samples.byteswap()
+    except (wave.Error, OSError, EOFError):
+        return None
+    scale = 1.0 / 32768.0
+    voiced_seen = False
+    run_end_pos: int | None = None
+    for pos in range(0, len(samples) - step + 1, step):
+        chunk = samples[pos : pos + step]
+        acc = 0.0
+        for v in chunk:
+            acc += (v * scale) ** 2
+        if (acc / step) ** 0.5 >= floor:
+            voiced_seen = True
+            run_end_pos = pos + step
+        elif voiced_seen:
+            # first silence closes the run: a single word is ONE voiced
+            # run; any later burst (a dramatic hold, a score swell) is
+            # separate audio the after-guard must SEE.
+            break
+    if not voiced_seen or run_end_pos is None:
+        return None
+    # refine the run end to 4 ms grain inside the closing window: the
+    # coarse 40 ms pass straddles the true edge (a half-voiced window
+    # still reads voiced), and the cap's tested numbers live on exact
+    # sample edges.
+    sub = max(1, rate // 250)  # 4 ms
+    refined = run_end_pos
+    for spos in range(max(0, run_end_pos - step), run_end_pos, sub):
+        chunk = samples[spos : min(spos + sub, run_end_pos)]
+        if len(chunk) < sub:
+            break
+        acc = 0.0
+        for v in chunk:
+            acc += (v * scale) ** 2
+        if (acc / len(chunk)) ** 0.5 >= floor:
+            refined = spos + sub  # still voiced; push the end forward
+        else:
+            break  # sub-silence starts here — the true edge
+    return (search_start_s * rate + refined) / rate
+
+
+def _trim_stuck_hold(
+    cue: Cue, word_start_s: float, word_end_ms: int,
+    hold_cap_wav: str | None,
+) -> float | None:
+    """The smear-immune hold anchor + quiet-AFTER gate for one cue.
+
+    Word-end stamps smear when the VAD doesn't snap the segment shut
+    (Karen's 0.4.14 WARN: the word end stamp rode the segment end, so
+    the cue held 8.28 s past the audible word). The stamp is trusted
+    only where the audio agrees; the audio is the oracle:
+
+    1. WITHOUT a wav: return None — the cap NEVER trims (guard-first:
+       never trim on uncertainty; the pure path and every wav-less
+       arm).
+    2. The hold anchor is the AUDIO-MEASURED word end (the first
+       voiced run's offset scanning word start -> cue end); an honest
+       stamp measures identically, a smeared stamp reads its true end
+       from the energy. No audible energy at all -> the stamp stands
+       as the fallback anchor.
+    2b. The >2.5 s hold test runs against the MEASURED anchor (cue
+       end - true end), not the stamp: the design's rule-2 wording
+       takes the stamp end, but its own smear note ("the segment/
+       word end itself ran long, which is exactly the failure") and
+       its tested numbers (word end 2.0 s, cue end 10.28 s, hold
+       8.28 s) are only satisfiable against the true end — a
+       stamp-based test cannot fire on the smear it exists to catch.
+    3. The quiet guard measures (anchor+0.1 .. anchor+1.5): energy
+       there means a held-on-purpose dramatic word — untouched.
+
+    Returns the anchor ms to trim TO (anchor + the standard 120 ms
+    readability hold) when the trim may fire; None otherwise.
+    """
+    if not hold_cap_wav:
+        return None
+    # The measured hold anchor: where the AUDIO says the word actually
+    # ends. A behaved stamp matches the audio (identical numbers); a
+    # stamped end that rode the segment end (the VAD never snapped
+    # shut — Karen's shape) reads its true end straight out of the
+    # energy. Pure silence across the whole cue (no audible word
+    # anywhere) falls back to the stamp — the guard below still
+    # decides.
+    true_end_s = _speech_offset_after(
+        hold_cap_wav, word_start_s, cue.end_ms / 1000.0
+    )
+    if true_end_s is not None:
+        word_end_ms = int(round(true_end_s * 1000))
+    # The hold test vs the MEASURED end: a cue end that outruns the
+    # audible word by <=2.5 s is a normal readability hold, not a
+    # stuck one.
+    if cue.end_ms - word_end_ms <= SINGLE_WORD_HOLD_CAP_MS:
+        return None
+    guard_rms = _wav_rms(
+        hold_cap_wav,
+        word_end_ms / 1000.0 + HOLD_MEASURE_WINDOW_S[0],
+        word_end_ms / 1000.0 + HOLD_MEASURE_WINDOW_S[1],
+    )
+    if guard_rms is None:
+        return None
+    if guard_rms >= HOLD_QUIET_RMS:
+        # voiced/audible energy after the word: a dramatic hold reads
+        # as held ON PURPOSE — untouched.
+        return None
+    return word_end_ms + CUE_LEAD_OUT_MS
 
 
 def align_verify_cues(
@@ -975,9 +1222,17 @@ def transcribe_source_to_srt(
             wav_path, language=language, on_segment=_on_segment
         )
         # -- cue build + alignment verification ----
+        # v0.4.15: the scratch wav feeds the single-word hold-cap's
+        # quiet-AFTER guard (reads only; the finally below still owns
+        # deletion), and the trim note rides the SAME notes list the
+        # alignment pass appends to.
+        result_notes: list[str] = []
         on_step and on_step("transcribe-align")
-        cues = segments_to_cues(segments)
+        cues = segments_to_cues(
+            segments, hold_cap_wav=wav_path, notes=result_notes
+        )
         cues, notes = align_verify_cues(cues, segments)
+        result_notes.extend(notes)
         # -- zero-cue rule (validation fix 3): an SRT with no cues is a
         # 3-byte BOM file every player chokes on and the mux fails with
         # an ffmpeg parse error instead of a reason. Name the condition
@@ -999,7 +1254,7 @@ def transcribe_source_to_srt(
             cue_count=len(cues),
             language=language,
             language_confidence=lang_confidence,
-            notes=list(warnings) + list(notes),
+            notes=list(warnings) + list(result_notes),
             model=model_dir,
         )
     finally:

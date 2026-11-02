@@ -227,6 +227,7 @@ def _cmd_run(
     replace_source: bool = False,
     upscale_profile: str = "live-action",
     resume: bool = False,
+    denoise: str = "off",
 ) -> int:
     """Drive one file through the runner and print its state.
 
@@ -354,7 +355,6 @@ def _cmd_subs(
     model: str | None,
     device: str,
     force: bool,
-    burn: bool,
     ffmpeg: str | None,
     ffprobe: str | None,
 ) -> int:
@@ -379,7 +379,6 @@ def _cmd_subs(
                 device_pin=device,
                 language_pin=lang,
                 force=force,
-                burn=burn,
             )
         except SubsJobError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -581,6 +580,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--denoise",
+        choices=["off", "light", "strong"],
+        default="off",
+        help=(
+            "denoise the source before upscaling: 'off' (default), 'light', or "
+            "'strong'. Use for noisy sources (VHS rips, old tape transfers, grainy "
+            "analog captures); leave off for clean DVD/Blu-ray rips — the upscale "
+            "already softens grain, and denoising a clean source costs fine detail "
+            "for no gain. Adds almost no time compared to the upscale itself."
+        ),
+    )
+    run_parser.add_argument(
         "--realesrgan",
         help="explicit realesrgan-ncnn-vulkan path (else VIDLIFT_REALESRGAN_NCNN, then bundled)",
     )
@@ -611,10 +622,6 @@ def build_parser() -> argparse.ArgumentParser:
     subs_parser.add_argument(
         "--force", action="store_true",
         help="transcribe even when a usable text subtitle track exists"
-    )
-    subs_parser.add_argument(
-        "--burn", action="store_true",
-        help="burn subtitles in at ORIGINAL resolution (B2; not implemented in v0.4.14)"
     )
     subs_parser.add_argument("--ffmpeg", help="explicit ffmpeg path")
     subs_parser.add_argument("--ffprobe", help="explicit ffprobe path")
@@ -723,6 +730,7 @@ def main(argv: list[str] | None = None) -> int:
             replace_source=args.replace_source,
             upscale_profile=args.upscale_profile,
             resume=args.resume,
+            denoise=args.denoise,
         )
     if args.command == "subs":
         return _cmd_subs(
@@ -731,7 +739,6 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             device=args.device,
             force=args.force,
-            burn=args.burn,
             ffmpeg=args.ffmpeg,
             ffprobe=args.ffprobe,
         )

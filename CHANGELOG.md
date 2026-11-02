@@ -2,7 +2,48 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
-## [0.4.14] - 2026-11-01
+## [0.4.15] - 2026-11-02
+
+### Added
+
+- **Denoise prep pass (opt-in, off by default)**: an hqdn3d light/strong
+  filter appended LAST in the prepare chain (after scale, setsar,
+  deinterlace, telecine — before FFv1). Choose `off`/`light`/`strong`
+  in the GUI (3-state combo, QSettings-persisted), `--denoise
+  {off,light,strong}` on `vidlift run` (refused on `subs`), or the
+  MCP `run` tool's `denoise` option. OFF stays byte-identical to the
+  v0.4.14 chain; the choice is recorded in the job state/manifest and
+  folded into resume-claim identity, so a run started OFF never
+  claims a denoised scratch (and vice versa) — v0.4.14 checkpoints
+  read as OFF. No auto-detection: the pass only runs when chosen.
+- **Single-word hold-cap**: a single-word cue held >2.5 s past its
+  word is capped to word end + the standard 120 ms readability hold —
+  but ONLY when the audio right after the word measures quiet (RMS
+  < 0.01 peak-normalized on the job's scratch wav). The measured
+  guard keeps real dramatic one-word holds untouched, and without
+  audio access the cap never trims. Fixes Karen's 0.4.14 WARN
+  (Firefly cue 16 "can't": 8.28 s stuck hold from a smeared word-end
+  stamp); trim counts surface in the job notes.
+
+### Fixed
+
+- **Flaky merge gate**: `test_subs_job_executes_through_executor`
+  failed ~1-of-4 runs — the executor's mirror-save throttle started
+  at 0.0 monotonic, leaving the first run's mirror save unthrottled;
+  the throttle now initializes at construction time.
+- **Release-gate network use**: the v0.4.14 gate could hit the real
+  Whisper model download in-test when the cache was cold (a ~37 s
+  network fetch that also cannot complete in the systemd unit
+  without a CA bundle). The test contract is now explicitly
+  no-network: model seeds are guaranteed and an autouse guard fails
+  any test that opens an external connection.
+
+### Removed
+
+- **`--burn` flag**: burn-in is permanently off the roadmap (Eric,
+  2026-11-01). The flag was surfaced-but-not-implemented; it is now
+  removed from the CLI, subcommands' help, MCP tool schemas, the GUI
+  checkbox, and its dedicated test surface.
 
 ### Added
 

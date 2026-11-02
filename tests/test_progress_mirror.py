@@ -185,7 +185,12 @@ def test_m5_activity_age_computed_not_persisted(tmp_path):
 
 def test_m6_mirror_throttle_respects_cadence(tmp_path):
     """The touch-path gate: a second maybe_mirror inside the 10 s
-    window is a no-op (no redundant registry save)."""
+    window is a no-op (no redundant registry save).
+
+    v0.4.15: the throttle starts AT construction, so the FIRST call is
+    inside the window too — the first explicit pass below rides the
+    monkeypatched clock past the cadence, then the second call (the
+    test's original shape) is the in-window no-op."""
     registry = Registry(tmp_path / "state")
     record = _running_record(tmp_path)
     registry._jobs[record.job_id] = record
@@ -194,6 +199,10 @@ def test_m6_mirror_throttle_respects_cadence(tmp_path):
     services = SimpleNamespace(registry=registry)
 
     executor = JobExecutor(services, executor_fn=lambda *_: None)
+    # ride the throttle past its construction time so the first call
+    # mirrors exactly as the pre-0.4.15 first call did; the cadence
+    # contract under test is unchanged.
+    executor._last_mirror_at -= PROGRESS_MIRROR_SECONDS + 1.0
     executor.maybe_mirror()
     snapshot_after_first = record.progress_snapshot
     assert snapshot_after_first is not None
@@ -202,3 +211,49 @@ def test_m6_mirror_throttle_respects_cadence(tmp_path):
     executor._last_mirror_at = time.monotonic()  # pretend it just ran
     executor.maybe_mirror()
     assert record.progress_snapshot is snapshot_after_first
+
+def test_first_command_does_not_trigger_mirror_save(tmp_path, monkeypatch):
+    """v0.4.15 flake hardening: the executor's mirror throttle starts
+    AT construction (the steady-state contract), not at 0.0 — the first
+    tracked command inside any job used to bypass the 10 s cadence and
+    save the registry mid-job, racing the synchronous callers that read
+    the record afterwards (the v0.4.14 merge-gate flake's cross-writer
+    seam). The pre-fix executor mirrors on the very first maybe_mirror
+    call; the fixed one performs NO save until PROGRESS_MIRROR_SECONDS
+    of executor life have actually elapsed (a start()ed executor's
+    timer mirrors on the cadence exactly as before)."""
+    registry = Registry(tmp_path / "state")
+    record = _running_record(tmp_path)
+    registry._jobs[record.job_id] = record
+    record.set_live("state_box", {"state": FakeRunState({"step": "x"})})
+
+    services = SimpleNamespace(registry=registry)
+
+    executor = JobExecutor(services, executor_fn=lambda *_: None)
+    saves: list[tuple] = []
+    real_save = registry.save
+
+    def spy_save():
+        saves.append(("save", time.monotonic()))
+        real_save()
+
+    monkeypatch.setattr(registry, "save", spy_save)
+
+    # RED-FIRST (pre-fix behavior: the first call always mirrors —
+    # monotonic() - 0.0 exceeds any process-uptime-bounded cadence).
+    executor.maybe_mirror()
+    assert saves == []
+
+    # the cadence arm still fires: once the throttle window elapses
+    # (clock monkeypatched in the jobs module namespace for
+    # determinism), the same call path mirrors and saves.
+    import vidlift.mcp_bridge.jobs as jobs_mod
+
+    real_monotonic = jobs_mod.time.monotonic
+    monkeypatch.setattr(
+        jobs_mod.time, "monotonic",
+        lambda: real_monotonic() + PROGRESS_MIRROR_SECONDS + 1.0,
+    )
+    executor.maybe_mirror()
+    assert len(saves) == 1
+    assert record.progress_snapshot is not None

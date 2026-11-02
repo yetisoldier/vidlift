@@ -970,6 +970,7 @@ def select_engine(
     binary: str | None = None,
     models_dir: str | None = None,
     tools: ToolBox | None = None,
+    denoise: str = "off",
 ) -> tuple[EngineAdapter, str | None]:
     """Resolve the ``--engine {auto,stub,ncnn}`` request (design Section 5).
 
@@ -1005,7 +1006,8 @@ def select_engine(
         verify_model_artifacts(models, spec.name)
         return (
             NcnnVulkanEngine(
-                binary=binary_path, models_dir=models, profile=profile
+                binary=binary_path, models_dir=models, profile=profile,
+                denoise=denoise,
             ),
             None,
         )
@@ -1020,7 +1022,8 @@ def select_engine(
                 return StubEngine(note=note), note
             return (
                 NcnnVulkanEngine(
-                    binary=binary_path, models_dir=models, profile=profile
+                    binary=binary_path, models_dir=models, profile=profile,
+                    denoise=denoise,
                 ),
                 None,
             )
@@ -1047,6 +1050,7 @@ class NcnnVulkanEngine(EngineAdapter):
         artifacts: dict | None = None,
         chunk_seconds: int | None = None,
         tile_floor: int | None = None,
+        denoise: str = "off",
         runner: Runner | None = None,
         engine_runner: Callable[[str, list[str]], int] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
@@ -1058,6 +1062,12 @@ class NcnnVulkanEngine(EngineAdapter):
         if spec is None:
             raise UpscaleError(f"unknown engine profile: {profile}")
         self.profile = profile
+        # v0.4.15 (opt-in denoise, design §Risks): rides the plan-identity
+        # block this engine writes into every checkpoint, so the claim
+        # layer refuses scratch prepared under a DIFFERENT denoise
+        # setting (a 0.4.14 checkpoint or an `off` run must never leak
+        # into a denoise run's resume claim).
+        self.denoise = denoise
         self.spec = spec
         # v0.4.9 (D5, dataclass-replace threading): when the runner
         # claims retained scratch, it hands the claim's decode-count of
@@ -1997,6 +2007,7 @@ class NcnnVulkanEngine(EngineAdapter):
                                 plan.output_height,
                             ],
                             "profile": self.profile,
+                            "denoise": self.denoise,
                             "subtitle_bitmap_ocr": (
                                 True
                                 if any(

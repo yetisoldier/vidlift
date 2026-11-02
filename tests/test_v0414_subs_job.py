@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -156,6 +157,41 @@ def engine_on(monkeypatch):
     monkeypatch.delenv("VIDLIFT_TRANSCRIPTION_ENGINE", raising=False)
 
 
+def _seed_model_state(state_root) -> None:
+    """v0.4.15 (release-gate root cause): this test's job resolves the
+    transcription model against a PER-TEST state_root with nothing in
+    it. Resolution then attempts a REAL ~1.5 GB network download of the
+    default model — which silently succeeded in interactive shells (CA
+    bundles available) and failed the job with
+    'transcription model download failed (config.json): SSL
+    CERTIFICATE_VERIFY_FAILED' inside the systemd transient units the
+    release gate runs in and whose 20-37 s tail inflated the suite.
+    The machine-wide cache (~/.vidlift/whisper/models) is complete but
+    the test never sees it: state_root redirects resolution. The honest
+    fix seeds the per-test state with the model the resolution CONTRACT
+    promises (.complete marker -> resolve returns the dir untouched) —
+    exercising the real resolution path with zero network. (The
+    conftest network guard would fail this test loudly either way;
+    seeding makes it pass for the right reason.)"""
+    import hashlib
+
+    tag = "medium"
+    model_dir = Path(state_root) / "whisper" / "models" / tag
+    model_dir.mkdir(parents=True, exist_ok=True)
+    # The contract checks ONLY the .complete marker (resolve_model_dir
+    # short-circuits before any file/digest read); the rest documents
+    # the shape the engine seam receives and keeps the fixture honest
+    # if the resolver ever grows content checks.
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.bin").write_bytes(b"stub-model-bin")
+    (model_dir / "vocabulary.txt").write_text("", encoding="utf-8")
+    (model_dir / ".complete").write_text(
+        f"{tag}\n{hashlib.sha256(b'stub-model-bin').hexdigest()}\n",
+        encoding="utf-8",
+    )
+
+
 @pytest.fixture
 def no_lock(monkeypatch):
     """A stand-in GPU-phase lock instance so no filesystem lock is used."""
@@ -285,11 +321,24 @@ def test_b1_success_remux_shape_and_source_blind(tmp_path, no_lock):
     assert no_lock.acquired and no_lock.released
 
 
-def test_burn_flag_is_named_not_implemented(tmp_path):
+def test_burn_flag_absent(tmp_path):
+    """v0.4.15 (Eric, 2026-11-01): burn-in is PERMANENTLY off the
+    roadmap; the vestigial flag is stripped, not merely unimplemented.
+    Both surfaces must hard-refuse: the kwarg is unknown (TypeError)
+    and the CLI flag is unrecognized (argparse exit 2)."""
     src = tmp_path / "movie.avi"
     src.write_bytes(b"x")
-    with pytest.raises(SubsJobError, match="not implemented"):
+    with pytest.raises(TypeError):
         run_subs_job(str(src), ffmpeg="ffmpeg", burn=True)
+
+    from vidlift.cli import main as cli_main
+
+    with patch.object(
+        sys, "argv", ["vidlift", "subs", str(src), "--burn"]
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main(["subs", str(src), "--burn"])
+    assert excinfo.value.code == 2
 
 
 # ------------------------------------------------ 3. executor + registry
@@ -320,7 +369,8 @@ def test_subs_job_executes_through_executor(tmp_path, no_lock, monkeypatch):
     src = tmp_path / "movie.avi"
     src.write_bytes(b"source-bytes")
     runner = FakeRunner(_probe_payload())
-    registry = _reg(tmp_path)
+    registry = _reg(tmp_path)  # rmtree('state') first; seeding follows
+    _seed_model_state(tmp_path / "state")
     services = _Services(registry, tmp_path)
     monkeypatch.setattr(
         jobs_mod, "_EXECUTORS",
@@ -350,7 +400,7 @@ def test_subs_job_executes_through_executor(tmp_path, no_lock, monkeypatch):
             workdir=str(tmp_path / "wd"),
             **{k: v for k, v in kw.items()
                if k in ("should_cancel", "state_root", "model_pin",
-                        "device_pin", "language_pin", "force", "burn")},
+                        "device_pin", "language_pin", "force")},
         ),
     )
     claimed = registry.claim_next()  # queued -> running (the real flow)

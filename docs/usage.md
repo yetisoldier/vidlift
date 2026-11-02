@@ -117,6 +117,29 @@ Use quotes around paths containing spaces.
   the fallback honestly.
 - **--engine stub** deliberately skips AI and is intended for pipeline testing.
 
+### Denoise (v0.4.15)
+
+`--denoise light|strong` (GUI: "Denoise source before upscaling") adds a
+denoise pass to the video preparation step, BEFORE the AI upscale.
+
+**When to use it:** noisy analog sources — VHS-grade rips, old tape
+transfers, heavy film grain or snow, noisy broadcast captures. A denoise
+pass on these gives the upscale model a cleaner signal, and the result
+is visibly better than upscaling the noise (upscaling amplifies tape
+noise as much as it amplifies detail).
+
+**When NOT to use it:** clean digital sources — DVD and Blu-ray rips,
+modern captures. The upscale model already softens light grain on its
+own, so denoising a clean source only costs fine detail for no gain.
+When in doubt, leave it Off.
+
+`light` suits most noisy tapes. Use `strong` only when noise is still
+clearly visible in the result of a `light` run — `strong` softens the
+picture noticeably. The pass adds almost no time compared to the
+upscale itself (seconds per minute of video, vs. minutes for the
+upscale). The setting is manual: VidLift does not try to detect noisy
+sources automatically.
+
 ## 4. Queue a bulk upscale
 
 VidLift's MCP interface accepts multiple input paths. It creates one job per

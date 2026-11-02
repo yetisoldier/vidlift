@@ -25,13 +25,14 @@ __all__ = [
     "MONITOR_TOKEN_DEFAULT",
     "MONITOR_ENABLED_DEFAULT",
     "QSETTINGS_MONITOR_KEYS",
-    "TRANSCRIPTION_BURN_DEFAULT",
     "TRANSCRIPTION_DEVICE_DEFAULT",
     "TRANSCRIPTION_ENABLED_DEFAULT",
     "TRANSCRIPTION_LANGUAGE_DEFAULT",
     "TRANSCRIPTION_MODEL_DEFAULT",
     "TRANSCRIPTION_VAD_DEFAULT",
     "QSETTINGS_TRANSCRIPTION_KEYS",
+    "DENOISE_DEFAULT",
+    "QSETTINGS_DENOISE_KEYS",
 ]
 
 MONITOR_HOST_DEFAULT = "0.0.0.0"  # LAN-visible, same as the sibling
@@ -62,10 +63,6 @@ TRANSCRIPTION_DEVICE_DEFAULT = "auto"
 TRANSCRIPTION_LANGUAGE_DEFAULT = ""
 # VAD prefilter stays ON (the design's hallucination discipline).
 TRANSCRIPTION_VAD_DEFAULT = True
-# Mode B burn-in: REMUX (B1) is the default; burn is an explicit opt-in
-# flag only (never the silent default).
-TRANSCRIPTION_BURN_DEFAULT = False
-
 # The QSettings keys the GUI persists for the Mode A checkbox (the
 # monitor/QSETTINGS pattern).
 QSETTINGS_TRANSCRIPTION_KEYS = {
@@ -73,6 +70,21 @@ QSETTINGS_TRANSCRIPTION_KEYS = {
     "model": "transcription/model",
     "device": "transcription/device",
     "language": "transcription/language",
+}
+
+# ---- v0.4.15 (opt-in denoise) ----------------------------------------------
+#
+# The prepare-chain denoise mode: "off" (default — byte-identical
+# v0.4.14 prepare commands), "light", or "strong" (the hqdn3d presets
+# in vidlift.run.DENOISE_PRESETS). OFF by default: the guidance (GUI
+# tooltip, CLI help, docs) describes exactly when to flip it; a clean
+# digital source must never pay denoise's detail cost by accident.
+DENOISE_DEFAULT = "off"
+
+# The QSettings keys the GUI persists for the denoise combo (the
+# monitor/QSETTINGS pattern, v0.4.15).
+QSETTINGS_DENOISE_KEYS = {
+    "mode": "denoise/mode",
 }
 
 # The QSettings keys the GUI persists (§2.1's settings keys, QSettings

@@ -235,6 +235,10 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
             transcription_enabled=options.get(
                 "transcription_enabled", None
             ),
+            # v0.4.15 (opt-in denoise): absent-defaults rule — no
+            # options["denoise"] reads as None (config default "off"),
+            # so pre-0.4.15 callers are behavior-identical.
+            denoise=options.get("denoise", None),
         )
     except EngineCancelled as exc:
         state = getattr(exc, "state", None)
@@ -388,7 +392,6 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
             device_pin=options.get("device", "auto"),
             language_pin=options.get("language", ""),
             force=bool(options.get("force", False)),
-            burn=bool(options.get("burn", False)),
             workdir=options.get("workdir"),
             state_root=services.state_dir,
             on_progress=on_segments,
@@ -521,8 +524,16 @@ class JobExecutor:
         # long stretches where no command boundary falls (the
         # decode-count pass, a realesrgan chunk run); the tracked
         # runner's touch path mirrors too (same throttle).
+        # v0.4.15 (flake hardening): the throttle clock initializes AT
+        # construction, not 0.0 — an executor built but never started()
+        # (the synchronous tracked-runner test path) used to mirror on
+        # its FIRST maybe_mirror() call (monotonic() - 0.0 exceeds any
+        # cadence), saving the registry mid-job and racing callers that
+        # read the record afterwards. The first tracked command now
+        # honors the 10 s cadence exactly like every later one; a
+        # start()ed executor's timer thread mirrors unchanged.
         self._mirror_stop = threading.Event()
-        self._last_mirror_at = 0.0
+        self._last_mirror_at = time.monotonic()
         self._mirror_thread: threading.Thread | None = None
 
     # -- lifecycle ---------------------------------------------------------

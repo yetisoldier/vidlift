@@ -42,6 +42,7 @@ from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
 
+from .config import DENOISE_DEFAULT
 from .plan import PlanError, PlannedFile, build_file_plan
 from .probe import (
     FileReport,
@@ -102,6 +103,8 @@ __all__ = [
     "BatchSummary",
     "build_encode_command",
     "build_decode_command",
+    "DENOISE_PRESETS",
+    "denoise_filter",
     "build_prepare_command",
     "build_verification_command",
     "ensure_output_dir",
@@ -536,12 +539,43 @@ class VerificationResult:
         }
 
 
+DENOISE_PRESETS: dict[str, str] = {
+    # hqdn3d=luma_spatial:luma_tmp:chroma_spatial:chroma_tmp (v0.4.15
+    # design §2): light doubles the temporal carry (the tape-snow
+    # killer) and doubles chroma against luma (analog noise lives in
+    # chroma); strong is ~2x light on every axis, reserved for sources
+    # where a light pass measurably leaves noise behind.
+    "light": "hqdn3d=1.5:3.0:3.0:6.0",
+    "strong": "hqdn3d=4.0:8.0:6.0:12.0",
+}
+
+
+def denoise_filter(denoise: str | None) -> str | None:
+    """The prepare-chain filter for a denoise setting; None = off.
+
+    ``None``/``""``/``"off"`` read as OFF (byte-identical v0.4.14
+    commands); ``"light"``/``"strong"`` map to the preset table. An
+    unknown value is a named error: the surfaces all constrain choices,
+    so reaching this with junk is a caller bug, never a user event.
+    """
+    if denoise in (None, "", "off"):
+        return None
+    preset = DENOISE_PRESETS.get(denoise)
+    if preset is None:
+        raise ValueError(
+            f"unknown denoise preset: {denoise!r} "
+            f"(expected off/light/strong)"
+        )
+    return preset
+
+
 def build_prepare_command(
     tools: ToolBox,
     plan: PlannedFile,
     prepared_path: str,
     *,
     sample_chain=None,
+    denoise: str | None = None,
 ) -> list[str]:
     """ffmpeg command writing the prepared source the engine contract needs.
 
@@ -576,6 +610,15 @@ def build_prepare_command(
         output_rate = sample_chain.output_rate
     elif report.interlaced_flagged:
         filters.append("bwdif=mode=send_field")
+    # v0.4.15 (opt-in denoise): the hqdn3d pass appends LAST — after
+    # deinterlace/telecine (denoising interlaced fields would smear
+    # comb artifacts into permanent mush) and after the fps/scale
+    # normalization (the filter runs at the exact frame the engine
+    # receives), before the ffv1 mezzanine encode. Off (None) ships
+    # the byte-identical v0.4.14 chain.
+    denoise_filter_str = denoise_filter(denoise)
+    if denoise_filter_str is not None:
+        filters.append(denoise_filter_str)
     cmd = [
         tools.ffmpeg,
         "-hide_banner", "-loglevel", "error", "-nostdin",
@@ -876,6 +919,10 @@ class RunState:
     # that proved. None = no claim (default OFF; old consumers
     # unaffected). Rides to_dict()/manifest under run.resume_claim.
     resume_claim: dict | None = None
+    # v0.4.15 additive: the resolved prepare-chain denoise mode
+    # ("off" | "light" | "strong"). None until the run records it; the
+    # manifest echo states the selection (Karen's acceptance reads it).
+    denoise_mode: str | None = None
 
     def touch(self) -> None:
         self.last_activity_at = time.time()
@@ -926,6 +973,8 @@ class RunState:
             "subtitles": self.subtitles,
             "upscale_profile": self.upscale_profile,
             "resume_claim": self.resume_claim,
+            # v0.4.15 additive: the resolved denoise selection.
+            "denoise_mode": self.denoise_mode,
         }
 
 
@@ -1168,6 +1217,7 @@ def find_claimable_scratch(
     *,
     plan,
     profile: str,
+    denoise: str = "off",
     tools: ToolBox,
     run_cmd: Runner,
     new_run_id: str,
@@ -1181,7 +1231,9 @@ def find_claimable_scratch(
     next candidate; zero candidates -> None -> clean run):
       1. source identity: absolute path, st_size, st_mtime_ns equal;
       2. plan identity: target, gb_per_hour, output geometry, prepare
-         filter chain (the idet arm included), upscale profile;
+         filter chain (the idet arm included), upscale profile, and —
+         v0.4.15 — the resolved denoise mode (a mezzanine prepared
+         under a different denoise setting never claims);
       3. sentinel race: `.claimed-by-*` O_EXCL-create must succeed;
       4. prepared mezzanine proof: exists, duration passes the engine's
          Gate P, decode-count == the checkpoint's prepared_total_frames.
@@ -1268,6 +1320,13 @@ def find_claimable_scratch(
             "gb_per_hour": plan.target_gb_per_hour,
             "geometry": [plan.output_width, plan.output_height],
             "profile": profile,
+            # v0.4.15 (opt-in denoise, design §Risks): the resolved
+            # denoise mode is part of plan identity. A checkpoint whose
+            # plan block lacks the key reads as "off" — a pre-0.4.15
+            # (or denoise-off) mezzanine matches only a denoise-off
+            # run, so a denoise run can NEVER silently claim scratch
+            # prepared without its filter.
+            "denoise": denoise,
             "subtitle_bitmap_ocr": (
                 True
                 if any(s2.kind == "image" for s2 in (reported.subtitles or []))
@@ -1275,7 +1334,19 @@ def find_claimable_scratch(
             ),
             "source_flagged_interlaced": bool(reported.interlaced_flagged),
         }
-        if recorded_plan != expected_plan:
+        # backward-compat read: v0.4.14 checkpoints carry no denoise
+        # key; the recorded copy reads as "off" rather than failing
+        # key-missing (a denoise run still refuses it above).
+        recorded_plan_for_compare = (
+            dict(recorded_plan) if isinstance(recorded_plan, dict)
+            else recorded_plan
+        )
+        if (
+            isinstance(recorded_plan_for_compare, dict)
+            and "denoise" not in recorded_plan_for_compare
+        ):
+            recorded_plan_for_compare["denoise"] = "off"
+        if recorded_plan_for_compare != expected_plan:
             continue
         # (4) prepared mezzanine proof: duration gate + decode count.
         # Proofs run BEFORE the sentinel is created (design ordering:
@@ -1733,6 +1804,9 @@ def run_file(
     # v0.4.14: the engine factory seam — tests inject a stub; production
     # None builds the real faster-whisper engine in the branch below.
     transcribe_engine_factory: Callable | None = None,
+    # v0.4.15 (opt-in denoise): None -> config DENOISE_DEFAULT ("off").
+    # "light"/"strong" append the hqdn3d preset to the prepare chain.
+    denoise: str | None = None,
 ) -> RunResult:
     """Run one file through the full pipeline and return its state.
 
@@ -1902,6 +1976,11 @@ def run_file(
         log(f"output dir ready: {Path(plan.output_path).parent}")
         end_phase(phase, note=f"verdict={plan.process_verdict}")
 
+        # v0.4.15 (opt-in denoise): absent reads the config default
+        # ("off") at run time — the GUI/CLI/MCP all pass explicit
+        # values; the planner seam stays source-blind.
+        denoise_mode = denoise if denoise is not None else DENOISE_DEFAULT
+
         # ---- prepare ----
         phase = begin_phase(PHASE_PREPARE)
         sample_chain = None
@@ -1967,6 +2046,7 @@ def run_file(
                 log_root,
                 plan=plan,
                 profile=profile,
+                denoise=denoise_mode,
                 tools=tools,
                 run_cmd=run_cmd,
                 new_run_id=run_id,
@@ -2000,7 +2080,8 @@ def run_file(
             run_command(
                 PHASE_PREPARE,
                 build_prepare_command(
-                    tools, plan, prepared_path, sample_chain=sample_chain
+                    tools, plan, prepared_path, sample_chain=sample_chain,
+                    denoise=denoise_mode,
                 ),
             )
             if not os.path.isfile(prepared_path):
@@ -2020,6 +2101,9 @@ def run_file(
         # "anime") once the upscale phase opens — status/manifest echo
         # the selection under every engine (stub, real, fail-open).
         state.upscale_profile = profile
+        # v0.4.15: record the resolved denoise selection beside the
+        # profile — status/manifest echo it under every engine.
+        state.denoise_mode = denoise_mode
 
         def record_progress(frames_done: int, frames_total: int) -> None:
             # B.6: merge, never replace — the "step" label set by
@@ -2089,7 +2173,16 @@ def run_file(
                     profile=profile,
                     binary=realesrgan,
                     models_dir=realesrgan_models,
+                    denoise=denoise_mode,
                 )
+            # v0.4.15 (opt-in denoise): an EXPLICITLY passed engine
+            # (tests, the bridge) cannot carry the select_engine kwarg —
+            # inject the resolved mode onto the instance so the engine's
+            # checkpoint plan block records THIS run's setting (the stub
+            # never writes checkpoints; the real engine reads its own
+            # attribute; a foreign engine object just gains an unused
+            # attribute).
+            active_engine.denoise = denoise_mode
             state.engine_name = type(active_engine).__name__
             if selection_note:
                 state.engine_note = selection_note
@@ -2697,6 +2790,8 @@ def _build_manifest(
             # source identity, and the checks that proved. None = no
             # claim; absent on pre-0.4.9 manifests (additive v2).
             "resume_claim": state.resume_claim,
+            # v0.4.15 additive: the resolved denoise selection.
+            "denoise_mode": state.denoise_mode,
         },
         "tools": tools.to_dict(),
         "probe": {
@@ -2714,6 +2809,10 @@ def _build_manifest(
             "audio_bitrate_kbps": plan.audio.bitrate_kbps,
             "estimated_output_bytes": plan.estimated_output_bytes,
             "subtitle_note": plan.subtitle_note,
+            # v0.4.15 additive: the prepare-chain denoise mode
+            # ("off" | "light" | "strong") — Karen's acceptance reads
+            # this block.
+            "denoise": state.denoise_mode,
             # v0.4.1 additive (design §B.7): the structured subtitle plan
             # echo and the ASS style-loss fact. Every key optional;
             # v1/v2-unextended consumers unaffected.
@@ -2791,6 +2890,8 @@ def _write_failure_manifest(state: RunState, tools: ToolBox) -> None:
                 # failure/cancel manifest — a retry's debugging sees the
                 # claim at a glance (claimed run-id + chunks).
                 "resume_claim": state.resume_claim,
+                # v0.4.15 additive: the resolved denoise selection.
+                "denoise_mode": state.denoise_mode,
             },
             "tools": tools.to_dict() if tools else None,
             "artifacts": {
