@@ -63,6 +63,13 @@ _OPTIONS_RUN = {
     # prepared content must all prove equal; otherwise runs clean.
     # Absent -> False (v0.4.8 behavior, the absent-defaults rule).
     "resume": {"type": "boolean"},
+    # v0.4.15 (opt-in denoise): the prepare-chain denoise mode
+    # ("off" | "light" | "strong"), string not enum matching
+    # "upscale_profile"'s permissive shape — an unknown value fails
+    # named in run_file's denoise_filter ("off" reads the default).
+    # Absent -> config DENOISE_DEFAULT ("off"); pre-0.4.15 callers are
+    # behavior-identical (the absent-defaults rule).
+    "denoise": {"type": "string"},
 }
 
 # The binding tool surface (mcp-bridge.md Section 4, verbatim shapes).

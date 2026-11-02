@@ -227,6 +227,7 @@ def _cmd_run(
     replace_source: bool = False,
     upscale_profile: str = "live-action",
     resume: bool = False,
+    denoise: str = "off",
 ) -> int:
     """Drive one file through the runner and print its state.
 
@@ -579,6 +580,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--denoise",
+        choices=["off", "light", "strong"],
+        default="off",
+        help=(
+            "denoise the source before upscaling: 'off' (default), 'light', or "
+            "'strong'. Use for noisy sources (VHS rips, old tape transfers, grainy "
+            "analog captures); leave off for clean DVD/Blu-ray rips — the upscale "
+            "already softens grain, and denoising a clean source costs fine detail "
+            "for no gain. Adds almost no time compared to the upscale itself."
+        ),
+    )
+    run_parser.add_argument(
         "--realesrgan",
         help="explicit realesrgan-ncnn-vulkan path (else VIDLIFT_REALESRGAN_NCNN, then bundled)",
     )
@@ -717,6 +730,7 @@ def main(argv: list[str] | None = None) -> int:
             replace_source=args.replace_source,
             upscale_profile=args.upscale_profile,
             resume=args.resume,
+            denoise=args.denoise,
         )
     if args.command == "subs":
         return _cmd_subs(

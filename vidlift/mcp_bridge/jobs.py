@@ -235,6 +235,10 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
             transcription_enabled=options.get(
                 "transcription_enabled", None
             ),
+            # v0.4.15 (opt-in denoise): absent-defaults rule — no
+            # options["denoise"] reads as None (config default "off"),
+            # so pre-0.4.15 callers are behavior-identical.
+            denoise=options.get("denoise", None),
         )
     except EngineCancelled as exc:
         state = getattr(exc, "state", None)

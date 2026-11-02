@@ -31,6 +31,8 @@ __all__ = [
     "TRANSCRIPTION_MODEL_DEFAULT",
     "TRANSCRIPTION_VAD_DEFAULT",
     "QSETTINGS_TRANSCRIPTION_KEYS",
+    "DENOISE_DEFAULT",
+    "QSETTINGS_DENOISE_KEYS",
 ]
 
 MONITOR_HOST_DEFAULT = "0.0.0.0"  # LAN-visible, same as the sibling
@@ -68,6 +70,21 @@ QSETTINGS_TRANSCRIPTION_KEYS = {
     "model": "transcription/model",
     "device": "transcription/device",
     "language": "transcription/language",
+}
+
+# ---- v0.4.15 (opt-in denoise) ----------------------------------------------
+#
+# The prepare-chain denoise mode: "off" (default — byte-identical
+# v0.4.14 prepare commands), "light", or "strong" (the hqdn3d presets
+# in vidlift.run.DENOISE_PRESETS). OFF by default: the guidance (GUI
+# tooltip, CLI help, docs) describes exactly when to flip it; a clean
+# digital source must never pay denoise's detail cost by accident.
+DENOISE_DEFAULT = "off"
+
+# The QSettings keys the GUI persists for the denoise combo (the
+# monitor/QSETTINGS pattern, v0.4.15).
+QSETTINGS_DENOISE_KEYS = {
+    "mode": "denoise/mode",
 }
 
 # The QSettings keys the GUI persists (§2.1's settings keys, QSettings

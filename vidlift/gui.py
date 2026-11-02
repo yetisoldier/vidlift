@@ -55,6 +55,8 @@ from .config import (
     MONITOR_PORT_DEFAULT,
     MONITOR_TOKEN_DEFAULT,
     QSETTINGS_MONITOR_KEYS,
+    DENOISE_DEFAULT,
+    QSETTINGS_DENOISE_KEYS,
 )
 from .mcp_bridge.client_local import (
     BatchTooLarge,
@@ -130,6 +132,23 @@ PROFILE_TOOLTIP = (
     "and line art. Manual switch; VidLift does not auto-detect content "
     "type. Persists across sessions."
 )
+
+# v0.4.15 (opt-in denoise): the three-state combo (a checkbox cannot
+# name two strengths) beside the transcription checkbox row, default
+# Off. The tooltip is the ERIC-LOCKED guidance copy — character-for-
+# character per the design (Karen diffs it against §5's block); the
+# CLI help and docs/usage.md carry the same contract.
+DENOISE_COMBO_LABEL = "Denoise source before upscaling"
+DENOISE_TOOLTIP = (
+    "Removes tape noise and grain before the upscale pass.\n\n"
+    "Use it for noisy sources: VHS rips, old tape transfers, grainy or "
+    "snowy analog captures. Leave it Off for clean DVD or Blu-ray rips — "
+    "upscaling already softens grain, and denoising a clean source only "
+    "costs fine detail. Light is the right strength for most noisy "
+    "tapes; try Strong only if noise is still visible. Adds almost no "
+    "time compared to the upscale itself."
+)
+DENOISE_CHOICES = (("Off", "off"), ("Light", "light"), ("Strong", "strong"))
 
 PLAN_HELPER_TEXT = "1. Add files → 2. Plan → 3. Start. Planning never writes to disk."
 
@@ -541,6 +560,21 @@ class MainWindow(QMainWindow):
         )
         self.transcribe_subs.toggled.connect(self._transcribe_subs_changed)
 
+        # v0.4.15 (opt-in denoise): three states in a combo (Off default,
+        # Light, Strong) — a checkbox cannot name two strengths. The
+        # Mode A upscale flow is the ONLY surface: Mode B (subs) has no
+        # prepare chain, so the control says "before upscaling".
+        self.denoise_combo = QComboBox()
+        for label, data in DENOISE_CHOICES:
+            self.denoise_combo.addItem(label, data)
+        self.denoise_combo.setToolTip(DENOISE_TOOLTIP)
+        self.denoise_mode = self._load_denoise_mode()
+        index = self.denoise_combo.findData(self.denoise_mode)
+        self.denoise_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.denoise_combo.currentIndexChanged.connect(
+            self._denoise_changed
+        )
+
         # v0.4.10 (R1): the GPU meter rides the top bar — a fixed-size
         # Task-Manager-style utilization chart (see vidlift/ui/
         # gpu_meter.py). Sampling is QThreadPool-off-thread, ~2 Hz,
@@ -655,6 +689,16 @@ class MainWindow(QMainWindow):
         value = self._settings().value("upscale_profile", "live-action")
         if value not in ("live-action", "anime"):
             return "live-action"
+        return str(value)
+
+    def _load_denoise_mode(self) -> str:
+        """The persisted denoise mode (v0.4.15); a stale/unknown value
+        reads as ``off`` — never silently applied."""
+        value = self._settings().value(
+            QSETTINGS_DENOISE_KEYS["mode"], DENOISE_DEFAULT
+        )
+        if value not in ("off", "light", "strong"):
+            return "off"
         return str(value)
 
     # -- LAN monitor (v0.4.6 design §4) -------------------------------------
@@ -780,6 +824,14 @@ class MainWindow(QMainWindow):
         rule); only the stored value changes."""
         self._settings().setValue("transcribe_subs", bool(checked))
 
+    def _denoise_changed(self, index: int) -> None:
+        """Persist the denoise-mode choice (v0.4.15, QSettings house
+        rule); only the stored value and the live choice change."""
+        data = self.denoise_combo.itemData(index)
+        if data in ("off", "light", "strong"):
+            self.denoise_mode = data
+            self._settings().setValue(QSETTINGS_DENOISE_KEYS["mode"], data)
+
     def _engine_changed(self, index: int) -> None:
         data = self.engine_combo.itemData(index)
         if data in ("auto", "stub", "ncnn"):
@@ -892,6 +944,13 @@ class MainWindow(QMainWindow):
         # cells). Row 2 reads as the options/actions row tail, directly
         # below the Cancel cluster's column.
         grid.addWidget(self.add_subs_button, 2, 7)
+        # v0.4.15 (opt-in denoise): the three-state combo rides a new
+        # options row (rows 0-2 are full) directly under the profile
+        # combo, keeping the options/actions rows reading top-down as
+        # one settings block. The label names the WHEN (before the
+        # upscale); the tooltip carries the full guidance verbatim.
+        grid.addWidget(QLabel(DENOISE_COMBO_LABEL), 3, 1)
+        grid.addWidget(self.denoise_combo, 3, 2)
         grid.setColumnStretch(6, 1)
         layout.addWidget(controls)
         layout.addWidget(self.progress)
@@ -1572,6 +1631,10 @@ class MainWindow(QMainWindow):
             # v0.4.14 (Mode A): the checkbox is the load-bearing kill
             # switch; False strips an already-selected transcribed plan.
             "transcription_enabled": self.transcribe_subs.isChecked(),
+            # v0.4.15 (opt-in denoise): rides into run_file(denoise=...)
+            # through the bridge's absent-defaults rule the same way the
+            # profile rides (off would read the config default anyway).
+            "denoise": self.denoise_mode,
         }
         try:
             self.job_ids = self.client.enqueue_run(
@@ -1588,6 +1651,8 @@ class MainWindow(QMainWindow):
         # v0.4.8 (D5): the profile is fixed for the batch the same way.
         self.profile_combo.setEnabled(False)
         self.profile_combo.setToolTip(PROFILE_TOOLTIP)
+        # v0.4.15: denoise is fixed for the batch the same way.
+        self.denoise_combo.setEnabled(False)
         # v0.4.14 (Mode B): the slate bootstrap lives in ONE place for
         # both flows; the upscale tail keeps its engine/profile locks
         # between enqueue and the shared slate build. Plan rows start at
@@ -2534,6 +2599,9 @@ class MainWindow(QMainWindow):
         # v0.4.8 (D5): re-enable the profile combo with its honest tooltip.
         self.profile_combo.setEnabled(True)
         self.profile_combo.setToolTip(PROFILE_TOOLTIP)
+        # v0.4.15: re-enable the denoise combo with its honest tooltip.
+        self.denoise_combo.setEnabled(True)
+        self.denoise_combo.setToolTip(DENOISE_TOOLTIP)
         self._render_recent_jobs()
         self._sync_run_controls()
         if any("cancelled" in note for note in notes):
