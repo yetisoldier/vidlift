@@ -157,9 +157,17 @@ class _ScriptedClient:
         chosen = fresh[: len(paths)]
         if len(chosen) != len(paths):
             raise AssertionError("scripted subs ids exhausted")
-        self.submitted.extend(chosen)
+        # v0.4.15.1: a re-pick of an already-scripted file during a live
+        # batch re-hands THAT file's id (the registry would hold a live
+        # record for it; a scripted double-hand stays identity-stable so
+        # the window's union dedupes instead of minting a fake twin).
+        already = [
+            jid for jid in self.submitted
+            if self.jobs.get(jid, {}).get("file_path") in paths
+        ]
+        self.submitted.extend(jid for jid in chosen if jid not in self.submitted)
         self.last_enqueued_kinds = [self.subs_kinds.get(jid) for jid in chosen]
-        return list(chosen)
+        return list(dict.fromkeys(already + chosen))
 
     def status_snapshot(self, job_id):
         seq = self.sequences.get(job_id) or []

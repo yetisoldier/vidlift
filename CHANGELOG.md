@@ -2,6 +2,28 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.15.1] - 2026-11-02
+
+### Fixed
+
+- **'Add Subtitles…' false "batch running" block**: the guard blocked the
+  picker whenever the window held batch ids even with nothing running
+  (planned-but-not-started files read as an active batch). The planned-files
+  state is not a batch — standalone subtitles are independent of the upscale
+  batch slate, so the picker now opens any time; a dialog appears only when a
+  live subtitles job over the SAME file would collide, and picked files append
+  cleanly while an upscale batch is still running (the serial executor orders
+  everything).
+- **Startup sweep for stale job records**: a fresh app start could block every
+  guarded click (Clear/Start/cancel) with "Wait for the current upscale to
+  finish or cancel it first." while the GPU sat idle — the persistent registry
+  carried 'queued'/'running' leftovers from a crashed session and the active-
+  job count read them as live. The GUI's startup now sweeps stale queued AND
+  running records to `failed` ("stale job from previous session (startup
+  sweep)") before the first active-count read; the swept jobs stay visible as
+  failed history rows, never deleted. The stdio MCP server keeps its restart
+  semantics (queued jobs enqueued by an agent resume when it restarts).
+
 ## [0.4.15] - 2026-11-02
 
 ### Added
