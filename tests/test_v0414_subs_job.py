@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -285,11 +286,24 @@ def test_b1_success_remux_shape_and_source_blind(tmp_path, no_lock):
     assert no_lock.acquired and no_lock.released
 
 
-def test_burn_flag_is_named_not_implemented(tmp_path):
+def test_burn_flag_absent(tmp_path):
+    """v0.4.15 (Eric, 2026-11-01): burn-in is PERMANENTLY off the
+    roadmap; the vestigial flag is stripped, not merely unimplemented.
+    Both surfaces must hard-refuse: the kwarg is unknown (TypeError)
+    and the CLI flag is unrecognized (argparse exit 2)."""
     src = tmp_path / "movie.avi"
     src.write_bytes(b"x")
-    with pytest.raises(SubsJobError, match="not implemented"):
+    with pytest.raises(TypeError):
         run_subs_job(str(src), ffmpeg="ffmpeg", burn=True)
+
+    from vidlift.cli import main as cli_main
+
+    with patch.object(
+        sys, "argv", ["vidlift", "subs", str(src), "--burn"]
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main(["subs", str(src), "--burn"])
+    assert excinfo.value.code == 2
 
 
 # ------------------------------------------------ 3. executor + registry
@@ -350,7 +364,7 @@ def test_subs_job_executes_through_executor(tmp_path, no_lock, monkeypatch):
             workdir=str(tmp_path / "wd"),
             **{k: v for k, v in kw.items()
                if k in ("should_cancel", "state_root", "model_pin",
-                        "device_pin", "language_pin", "force", "burn")},
+                        "device_pin", "language_pin", "force")},
         ),
     )
     claimed = registry.claim_next()  # queued -> running (the real flow)

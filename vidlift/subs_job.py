@@ -94,7 +94,6 @@ def run_subs_job(
     device_pin: str = "auto",
     language_pin: str = "",
     force: bool = False,
-    burn: bool = False,
     workdir: str | None = None,
     state_root: str | os.PathLike | None = None,
     on_step=None,
@@ -104,9 +103,9 @@ def run_subs_job(
     download_log=None,
     gpu_lock_factory=None,
 ) -> SubsJobResult:
-    """One standalone subs job (B1 soft-mux; ``burn=True`` is B2 and
-    fails with a named not-implemented error this cycle — the flag
-    rides the surface now so the GUI/CLI contract is stable).
+    """One standalone subs job (B1 soft-mux; burn-in is permanently
+    off the roadmap — the v0.4.15 strip removed the vestigial
+    ``burn`` flag and its named not-implemented stub).
 
     Never overwrites the source: the output is ``{stem}.subs.mp4`` and
     a pre-existing output FAILS the job (not-ready, the caller
@@ -115,12 +114,6 @@ def run_subs_job(
     from .run import find_tools  # lazy: run.py is heavy
 
     del find_tools  # (resolved ffmpeg/ffprobe come from the caller)
-
-    if burn:
-        raise SubsJobError(
-            "burn-in (--burn) is not implemented in v0.4.14 B1; "
-            "use the default soft-mux (zero quality loss)"
-        )
 
     def _step(name: str) -> None:
         if on_step is not None:

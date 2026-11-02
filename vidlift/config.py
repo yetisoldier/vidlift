@@ -25,7 +25,6 @@ __all__ = [
     "MONITOR_TOKEN_DEFAULT",
     "MONITOR_ENABLED_DEFAULT",
     "QSETTINGS_MONITOR_KEYS",
-    "TRANSCRIPTION_BURN_DEFAULT",
     "TRANSCRIPTION_DEVICE_DEFAULT",
     "TRANSCRIPTION_ENABLED_DEFAULT",
     "TRANSCRIPTION_LANGUAGE_DEFAULT",
@@ -62,10 +61,6 @@ TRANSCRIPTION_DEVICE_DEFAULT = "auto"
 TRANSCRIPTION_LANGUAGE_DEFAULT = ""
 # VAD prefilter stays ON (the design's hallucination discipline).
 TRANSCRIPTION_VAD_DEFAULT = True
-# Mode B burn-in: REMUX (B1) is the default; burn is an explicit opt-in
-# flag only (never the silent default).
-TRANSCRIPTION_BURN_DEFAULT = False
-
 # The QSettings keys the GUI persists for the Mode A checkbox (the
 # monitor/QSETTINGS pattern).
 QSETTINGS_TRANSCRIPTION_KEYS = {

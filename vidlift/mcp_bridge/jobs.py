@@ -388,7 +388,6 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
             device_pin=options.get("device", "auto"),
             language_pin=options.get("language", ""),
             force=bool(options.get("force", False)),
-            burn=bool(options.get("burn", False)),
             workdir=options.get("workdir"),
             state_root=services.state_dir,
             on_progress=on_segments,

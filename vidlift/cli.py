@@ -354,7 +354,6 @@ def _cmd_subs(
     model: str | None,
     device: str,
     force: bool,
-    burn: bool,
     ffmpeg: str | None,
     ffprobe: str | None,
 ) -> int:
@@ -379,7 +378,6 @@ def _cmd_subs(
                 device_pin=device,
                 language_pin=lang,
                 force=force,
-                burn=burn,
             )
         except SubsJobError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -612,10 +610,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="transcribe even when a usable text subtitle track exists"
     )
-    subs_parser.add_argument(
-        "--burn", action="store_true",
-        help="burn subtitles in at ORIGINAL resolution (B2; not implemented in v0.4.14)"
-    )
     subs_parser.add_argument("--ffmpeg", help="explicit ffmpeg path")
     subs_parser.add_argument("--ffprobe", help="explicit ffprobe path")
     benchmark_parser = sub.add_parser(
@@ -731,7 +725,6 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             device=args.device,
             force=args.force,
-            burn=args.burn,
             ffmpeg=args.ffmpeg,
             ffprobe=args.ffprobe,
         )

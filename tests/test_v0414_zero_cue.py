@@ -273,7 +273,7 @@ def test_mode_b_zero_cue_job_fails_named(tmp_path, monkeypatch):
             workdir=str(tmp_path / "wd"),
             **{k: v for k, v in kw.items()
                if k in ("should_cancel", "state_root", "model_pin",
-                        "device_pin", "language_pin", "force", "burn")},
+                        "device_pin", "language_pin", "force")},
         )
 
     monkeypatch.setattr(
