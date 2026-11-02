@@ -122,7 +122,7 @@ jobs:
           if (-not (Test-Path dist\vidlift-cli.exe)) { throw "CLI executable missing" }
           $ver = (& dist\vidlift-cli.exe --version | Out-String).Trim()
           Write-Output "cli-version: $ver"
-          if ($ver -ne 'vidlift 0.4.15') { throw "CLI smoke failed: got '$ver', expected 'vidlift 0.4.15'" }
+          if ($ver -ne 'vidlift 0.4.15.1') { throw "CLI smoke failed: got '$ver', expected 'vidlift 0.4.15.1'" }
 
       - name: PE stamp check
         shell: pwsh
@@ -130,7 +130,7 @@ jobs:
           foreach ($f in @('dist\VidLift\VidLift.exe','dist\vidlift-cli.exe')) {
             $vi = (Get-Item $f).VersionInfo
             Write-Output ("PE {0}: FileVersion={1} ProductVersion={2}" -f $f, $vi.FileVersion, $vi.ProductVersion)
-            if ($vi.FileVersion -ne '0.4.15' -or $vi.ProductVersion -ne '0.4.15') { throw "PE stamp wrong on $f" }
+            if ($vi.FileVersion -ne '0.4.15.1' -or $vi.ProductVersion -ne '0.4.15.1') { throw "PE stamp wrong on $f" }
           }
 
       - name: Build installer
@@ -185,9 +185,9 @@ jobs:
       - name: Upload build artifact (no publish; staging handled off-runner)
         uses: actions/upload-artifact@v4
         with:
-          name: vidlift-0.4.15-windows-installer
+          name: vidlift-0.4.15.1-windows-installer
           path: |
-            output/VidLift-0.4.15-Windows-x64-Setup.exe
-            output/VidLift-0.4.15-Windows-x64-Setup.exe.sha256
+            output/VidLift-0.4.15.1-Windows-x64-Setup.exe
+            output/VidLift-0.4.15.1-Windows-x64-Setup.exe.sha256
           if-no-files-found: error
           retention-days: 7
