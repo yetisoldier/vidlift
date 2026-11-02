@@ -611,11 +611,46 @@ def tool_manifest(services: BridgeServices, args: dict) -> dict:
     }
 
 
+def tool_transcribe(services: BridgeServices, args: dict) -> dict:
+    """transcribe (v0.4.14 Mode B): enqueue subs jobs, return at once.
+
+    args: paths[] required; lang, model, device, force (booleans/
+    strings, all optional). Cancel covers subs jobs via the existing
+    tool_cancel (registry transitions are job-kind-blind)."""
+    lang = args.get("lang") or ""
+    model = args.get("model") or None
+    device = args.get("device") or "auto"
+    force = bool(args.get("force", False))
+    jobs: list[dict] = []
+    for path in args["paths"]:
+        if not os.path.isfile(path):
+            jobs.append(
+                {"path": path, "job_id": None, "ok": False,
+                 "error": f"no such file: {path}"}
+            )
+            continue
+        record = services.registry.enqueue(
+            kind="subs",
+            paths=[path],
+            options={
+                "language": str(lang),
+                "model": model,
+                "device": str(device),
+                "force": force,
+            },
+        )
+        services.executor.notify_new_work()
+        jobs.append({"path": path, "job_id": record.job_id, "ok": True,
+                     "kind": "subs"})
+    return {"jobs": jobs}
+
+
 TOOL_HANDLERS = {
     "probe": tool_probe,
     "plan": tool_plan,
     "benchmark": tool_benchmark,
     "run": tool_run,
+    "transcribe": tool_transcribe,
     "status": tool_status,
     "cancel": tool_cancel,
     "list": tool_list,

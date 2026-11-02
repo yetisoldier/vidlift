@@ -273,6 +273,97 @@ def _state_log_path(state):
     return log.path if log is not None else None
 
 
+def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutcome:
+    """One Mode B standalone subs job (v0.4.14 §Mode B, B1 soft-mux).
+
+    A thin call through run_subs_job — the same probe/guard/transcribe/
+    remux discipline the CLI uses. Transcription IS the job's point, so
+    its failures fail the job (SubsJobError -> failed), but cancel
+    still closes cancelled via the shared CancelFlag contract.
+    """
+    from ..probe import ProbeError
+    from ..run import EngineCancelled, RunError
+    from ..subs_job import SubsJobError, run_subs_job
+    from ..transcribe import TranscriptionError
+
+    options = record.options
+    path = record.paths[0]
+    log_root = Path(
+        options.get("log_dir") or (Path(path).parent / ".vidlift-runs")
+    )
+
+    def tracked(binary: str, args: list[str]):
+        record.touch()
+        live = record.get_live("commands")
+        if live is not None:
+            live.append([binary, *args])
+        if "subs.srt" in " ".join(args) and "-c:s" in args:
+            record.set_live("current_phase", "subs-mux")
+        elif "pcm_s16le" in args:
+            record.set_live("current_phase", "transcribe")
+        executor = getattr(services, "executor", None)
+        if executor is not None and hasattr(executor, "maybe_mirror"):
+            executor.maybe_mirror()
+        from ..run import _subprocess_runner
+        base = services.command_runner or _subprocess_runner
+        return base(binary, args)
+
+    record.set_live("commands", [])
+
+    def probe_tracked(binary: str, args: list[str]):
+        record.touch()
+        record.set_live("current_phase", "probe")
+        from ..run import _subprocess_runner
+        base = services.probe_runner or services.command_runner or _subprocess_runner
+        return base(binary, args)
+
+    try:
+        from ..run import find_tools
+        tools = find_tools(
+            ffmpeg=options.get("ffmpeg"), ffprobe=options.get("ffprobe")
+        )
+    except RunError as exc:
+        return JobOutcome(ok=False, error=f"missing_tool: {exc}")
+    try:
+        result = run_subs_job(
+            path,
+            ffmpeg=tools.ffmpeg,
+            ffprobe=tools.ffprobe,
+            probe_runner=probe_tracked,
+            runner=tracked,
+            engine_factory=getattr(services, "transcribe_engine_factory", None),
+            model_pin=options.get("model"),
+            device_pin=options.get("device", "auto"),
+            language_pin=options.get("language", ""),
+            force=bool(options.get("force", False)),
+            burn=bool(options.get("burn", False)),
+            workdir=options.get("workdir"),
+            state_root=services.state_dir,
+            should_cancel=cancel,
+        )
+    except EngineCancelled as exc:
+        return JobOutcome(ok=False, cancelled=True, error=str(exc))
+    except SubsJobError as exc:
+        return JobOutcome(ok=False, error=str(exc))
+    except TranscriptionError as exc:
+        return JobOutcome(ok=False, error=f"transcription unavailable: {exc}")
+    except ProbeError as exc:
+        return JobOutcome(ok=False, error=str(exc))
+    return JobOutcome(
+        ok=True,
+        output_path=result.output_path,
+        log_path=None,
+        result={
+            "output_path": result.output_path,
+            "srt_path": result.srt_path,
+            "language": result.language,
+            "cue_count": result.cue_count,
+            "model": result.model,
+            "notes": list(result.notes),
+        },
+    )
+
+
 def _execute_benchmark_job(
     record: JobRecord, services, cancel: CancelFlag
 ) -> JobOutcome:
@@ -342,6 +433,7 @@ def _execute_benchmark_job(
 
 _EXECUTORS = {
     "run": _execute_run_job,
+    "subs": _execute_subs_job,
     "benchmark": _execute_benchmark_job,
 }
 

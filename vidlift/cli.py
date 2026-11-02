@@ -347,6 +347,59 @@ def _cmd_run(
     return 0 if result.ok else 1
 
 
+def _cmd_subs(
+    files: list[str],
+    *,
+    lang: str,
+    model: str | None,
+    device: str,
+    force: bool,
+    burn: bool,
+    ffmpeg: str | None,
+    ffprobe: str | None,
+) -> int:
+    """Mode B: transcribe + soft-mux; exit 0 ok, 1 job failure, 2 tool."""
+    from .subs_job import SubsJobError, run_subs_job
+    from .transcribe import TranscriptionError
+
+    try:
+        tools = find_tools(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    except MissingToolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    failures = 0
+    for path in files:
+        print(f"== {path}")
+        try:
+            result = run_subs_job(
+                path,
+                ffmpeg=tools.ffmpeg,
+                ffprobe=tools.ffprobe,
+                model_pin=model,
+                device_pin=device,
+                language_pin=lang,
+                force=force,
+                burn=burn,
+            )
+        except SubsJobError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        except TranscriptionError as exc:
+            print(f"error: transcription unavailable: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        print(
+            f"  output: {result.output_path}\n"
+            f"  language: {result.language} "
+            f"(confidence {result.language_confidence})\n"
+            f"  cues: {result.cue_count}  model: {result.model}"
+        )
+        for note in result.notes:
+            print(f"  note: {note}")
+    return 1 if failures else 0
+
+
 def _cmd_benchmark(
     file_path: str,
     *,
@@ -535,6 +588,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--realesrgan-models",
         help="explicit model dir (else VIDLIFT_REALESRGAN_MODELS, then models/ beside the binary)",
     )
+    subs_parser = sub.add_parser(
+        "subs",
+        help=(
+            "transcribe a file's own audio and soft-mux subtitles into a NEW "
+            "{stem}.subs.mp4 beside it (Mode B; no upscale, source untouched)"
+        ),
+    )
+    subs_parser.add_argument(
+        "files", metavar="FILE", nargs="+", help="video file(s) to subtitle"
+    )
+    subs_parser.add_argument(
+        "--lang", default="", help="pin the transcription language (ISO 639-1, e.g. ko); default auto-detect"
+    )
+    subs_parser.add_argument(
+        "--model", default=None, help="whisper model tag or path (default: medium; first use downloads it)"
+    )
+    subs_parser.add_argument(
+        "--device", choices=["auto", "cuda", "cpu"], default="auto",
+        help="transcription device (default auto)"
+    )
+    subs_parser.add_argument(
+        "--force", action="store_true",
+        help="transcribe even when a usable text subtitle track exists"
+    )
+    subs_parser.add_argument(
+        "--burn", action="store_true",
+        help="burn subtitles in at ORIGINAL resolution (B2; not implemented in v0.4.14)"
+    )
+    subs_parser.add_argument("--ffmpeg", help="explicit ffmpeg path")
+    subs_parser.add_argument("--ffprobe", help="explicit ffprobe path")
     benchmark_parser = sub.add_parser(
         "benchmark",
         help="measure one sample slice to pin an ETA constant for this machine",
@@ -640,6 +723,17 @@ def main(argv: list[str] | None = None) -> int:
             replace_source=args.replace_source,
             upscale_profile=args.upscale_profile,
             resume=args.resume,
+        )
+    if args.command == "subs":
+        return _cmd_subs(
+            args.files,
+            lang=args.lang,
+            model=args.model,
+            device=args.device,
+            force=args.force,
+            burn=args.burn,
+            ffmpeg=args.ffmpeg,
+            ffprobe=args.ffprobe,
         )
     if args.command == "runs":
         # v0.4.9 (design §1.6): the prune surface over the scratch GC.
