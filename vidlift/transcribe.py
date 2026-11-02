@@ -840,9 +840,10 @@ def transcribe_source_to_srt(
     """
     os.makedirs(workdir, exist_ok=True)
     wav_path = os.path.join(workdir, "source-audio-16k.wav")
-    code, _out, err = runner(
-        ffmpeg, build_audio_extract_command(ffmpeg, source_path, wav_path)
+    extract_cmd = build_audio_extract_command(
+        ffmpeg, source_path, wav_path
     )
+    code, _out, err = runner(extract_cmd[0], extract_cmd[1:])
     if code != 0 or not os.path.exists(wav_path):
         raise TranscriptionError(
             f"audio extraction for transcription failed: "
