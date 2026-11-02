@@ -133,6 +133,45 @@ class LocalBridgeClient:
             job_ids.append(record.job_id)
         return job_ids
 
+    # v0.4.14 (Mode B): the GUI's enqueue surface for standalone subs
+    # jobs — the EXACT registry/executor path the MCP transcribe tool
+    # (tool_transcribe) uses (same kind, same per-file shape). One
+    # enqueue surface, never a fork; the GUI's file-picker validation
+    # mirrors enqueue_run's (a missing file raises, the picker never
+    # shows fabricated rows).
+    def enqueue_subs(self, paths: list[str]) -> list[str]:
+        """Validate paths, enqueue one ``subs`` job per path in
+        submission order, wake the executor, and return the job_ids in
+        that order so GUI rows map 1:1. Options follow tool_transcribe's
+        absent-defaults rule (the GUI picker exposes no overrides —
+        auto everything; --force stays a CLI/MCP concern)."""
+        clean: list[str] = []
+        for path in paths:
+            path_str = str(path)
+            if not Path(path_str).is_file():
+                raise FileNotFoundError(
+                    f"no such file on this machine: {path_str}"
+                )
+            clean.append(path_str)
+        if not clean:
+            return []
+        if len(clean) > MAX_GUI_BATCH:
+            raise BatchTooLarge(
+                f"{len(clean)} files exceeds the {MAX_GUI_BATCH}-file "
+                "per-batch limit; add fewer files and run them in rounds"
+            )
+        job_ids: list[str] = []
+        for path in clean:
+            record = self.registry.enqueue(
+                kind="subs",
+                paths=[path],
+                options={"language": "", "model": None, "device": "auto",
+                         "force": False},
+            )
+            self.services.executor.notify_new_work()
+            job_ids.append(record.job_id)
+        return job_ids
+
     # -- status -------------------------------------------------------------
 
     def status_snapshot(self, job_id: str) -> dict | None:

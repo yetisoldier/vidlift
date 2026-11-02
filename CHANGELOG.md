@@ -2,6 +2,45 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.14] - 2026-11-01
+
+### Added
+
+- **Transcription Subtitles (v0.4.14)**: VidLift now makes subtitles
+  when a file has none, using faster-whisper (medium model default,
+  sha256-pinned first-run download into `~/.vidlift/whisper/models/`,
+  user pin override for large-v3 or a local model path).
+- **Mode A — integrated fallback**: a file with no embedded text,
+  bitmap, or sidecar subtitles has its own audio transcribed during
+  the run's subtitles phase and the result is soft-muxed (mov_text,
+  language-tagged) into the finished MP4. Sync is structural: the
+  transcription extracts the source's `0:a:0`, the exact stream the
+  encode maps untouched. On by default (Eric's locked decision); the
+  GUI checkbox "Add subtitles by transcription when none exist" is
+  the load-bearing kill switch and QSettings-persisted. Any
+  transcription failure (missing model, failed download, no audio)
+  fails OPEN: the upscale ships video+audio, a warning records it —
+  an upscale never fails because subtitles could not be made.
+- **Mode B — standalone `vidlift subs FILE...`**: transcribe +
+  soft-mux into a NEW `{stem}.subs.mp4` beside the source at ANY
+  resolution, never touching the source. B1 stream-copy remux is
+  default (zero quality loss; `--burn` B2 is surfaced but returns a
+  named not-implemented error this cycle). `--lang`, `--model`,
+  `--device`, `--force` flags; non-zero exit on job failure.
+- **MCP tool `transcribe`**: enqueue subs jobs (`paths[]`, optional
+  `lang`/`model`/`device`/`force`); cancel/status/manifest/list cover
+  subs jobs untouched (registry transitions are job-kind-blind);
+  cancel-batch included.
+- VAD prefilter + word-level timestamps + an alignment verification
+  pass repair cues whose aligned midpoint drifts >250 ms; below-
+  floor confidence cues are dropped (hallucination discipline);
+  language auto-detect with config pin override; detected language +
+  confidence + model + cue count land in the run manifest's
+  `subtitles.transcription` block.
+- The machine-wide GPU phase lock serializes transcription against
+  any concurrent upscale (one VRAM user at a time); on filesystems
+  that cannot host the lock it degrades OPEN with a warning.
+
 ## [0.4.13] - 2026-11-01
 
 ### Added

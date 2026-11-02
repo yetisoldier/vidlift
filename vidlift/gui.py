@@ -311,6 +311,22 @@ def run_stage_label(snapshot: dict | None) -> str:
         base = "verify — full decode"
     elif phase == "subtitles":
         base = "subtitles — OCR/carry"
+    elif phase == "transcribe":
+        # v0.4.14 (Mode B, the count-pass honest-label pattern §3b
+        # D-eta): the denominator is unknown until whisper's stream
+        # ENDS (segments_done counts up with no total), so the base
+        # label names the work and shows the count so far; no
+        # percentage can exist yet. Elapsed seconds ride the existing
+        # liveness clock; the ETA machinery contributes no digits.
+        base = "transcribing audio"
+        segments_done = progress_state.get("segments_done")
+        if isinstance(segments_done, (int, float)) and segments_done > 0:
+            unit = "segment" if int(segments_done) == 1 else "segments"
+            base = f"transcribing audio — {int(segments_done)} {unit} done"
+    elif phase == "subs-mux":
+        # v0.4.14 (Mode B): the soft-mux is a stream copy — seconds.
+        # Honest by construction; no ETA digits (elapsed only).
+        base = "remuxing subtitles (stream copy — no re-encode)"
     elif phase == "done":
         base = "done"
     else:
@@ -505,6 +521,26 @@ class MainWindow(QMainWindow):
         )
         self.resume_claim.toggled.connect(self._resume_claim_changed)
 
+        # v0.4.14 (Mode A, Eric's locked default ON): transcribe the
+        # source's own audio when no subtitle track exists. The honest
+        # tooltip says the cost; QSettings-persisted like every other
+        # GUI preference.
+        self.transcribe_subs = QCheckBox(
+            "Add subtitles by transcription when none exist"
+        )
+        self.transcribe_subs.setChecked(
+            self._settings().value(
+                "transcribe_subs", True, type=bool
+            )
+        )
+        self.transcribe_subs.setToolTip(
+            "When a file has no subtitle track, transcribe its own audio "
+            "and embed the result (first use downloads a ~1.5 GB model "
+            "once; adds minutes per file). Sync comes from the source's "
+            "own audio stream, exactly the stream the encode keeps."
+        )
+        self.transcribe_subs.toggled.connect(self._transcribe_subs_changed)
+
         # v0.4.10 (R1): the GPU meter rides the top bar — a fixed-size
         # Task-Manager-style utilization chart (see vidlift/ui/
         # gpu_meter.py). Sampling is QThreadPool-off-thread, ~2 Hz,
@@ -562,6 +598,23 @@ class MainWindow(QMainWindow):
             "Stop the running job and cancel every queued job in this batch."
         )
         self.cancel_batch_button.clicked.connect(self.cancel_batch_upscale)
+        # v0.4.14 (Mode B): standalone subtitles — transcribe a file's own
+        # audio and soft-mux the result WITHOUT re-encoding or upscaling
+        # the video. The queue table and the batch-accounting bootstrap
+        # (_begin_job_slate) are shared with the upscale flow; the slate
+        # machinery is job-kind-blind so row rendering/Cancel Batch ride
+        # the exact v0.4.13 paths.
+        self.add_subs_button = QPushButton("Add Subtitles…")
+        self.add_subs_button.setEnabled(True)
+        self.add_subs_button.setToolTip(
+            "Add subtitles by transcribing each file's own audio — without "
+            "re-encoding the video.\n\n"
+            "The output lands beside each source as <name>.subs.mp4 plus a "
+            ".srt sidecar; the source is never modified. Existing videos at "
+            "any resolution are welcome. First use downloads a ~1.5 GB model "
+            "once."
+        )
+        self.add_subs_button.clicked.connect(self.choose_subs_files)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
@@ -722,6 +775,11 @@ class MainWindow(QMainWindow):
         house rule); only the stored value changes."""
         self._settings().setValue("resume_claim", bool(checked))
 
+    def _transcribe_subs_changed(self, checked: bool) -> None:
+        """Persist the Mode A preference (v0.4.14, QSettings house
+        rule); only the stored value changes."""
+        self._settings().setValue("transcribe_subs", bool(checked))
+
     def _engine_changed(self, index: int) -> None:
         data = self.engine_combo.itemData(index)
         if data in ("auto", "stub", "ncnn"):
@@ -827,6 +885,13 @@ class MainWindow(QMainWindow):
         # v0.4.13 (design §4.1): Cancel Batch lands immediately right of
         # Cancel Current — column 8, row 1, was free (Start owns (0, 8)).
         grid.addWidget(self.cancel_batch_button, 1, 8)
+        # v0.4.14 (Mode B): "Add Subtitles…" lands on row 2, column 7 —
+        # the only free option-row cell (row 2 holds the monitor span
+        # (0,5) over the resume checkbox (1,2) overlap, profile label
+        # (2,5)/combo (2,6); (2,7) and (2,8) are the only untouched
+        # cells). Row 2 reads as the options/actions row tail, directly
+        # below the Cancel cluster's column.
+        grid.addWidget(self.add_subs_button, 2, 7)
         grid.setColumnStretch(6, 1)
         layout.addWidget(controls)
         layout.addWidget(self.progress)
@@ -988,9 +1053,98 @@ class MainWindow(QMainWindow):
         self._add_paths(paths)
 
     def choose_output_dir(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Choose output folder", str(Path.home()))
+        folder = QFileDialog.getExistingDirectory(self, "Choose an output folder", str(Path.home()))
         if folder:
             self.output_dir.setText(folder)
+
+    # -- Add Subtitles (v0.4.14 Mode B, no upscale) ---------------------
+
+    def _subs_file_rows(self, paths: list[str]) -> list[list[str]]:
+        """The subs table rows (same 8-column schema as the plan view;
+        the Status cell carries the subs verdict instead of the upscale
+        one) — the shared-table render contract for subs batches."""
+        rows: list[list[str]] = []
+        for path in paths:
+            existing = Path(path[:-4] + ".subs.mp4")
+            status = (
+                "blocked — subtitles output already exists (will not be overwritten)"
+                if existing.exists()
+                else "subs ready"
+            )
+            rows.append(
+                [
+                    status,
+                    path,
+                    "transcribe",
+                    "keep original",
+                    path[:-4] + ".subs.mp4",
+                    "",
+                    "transcribed from the file's own audio",
+                    (
+                        "output exists: " + Path(path[:-4] + ".subs.mp4").name
+                        + " (will not be overwritten)"
+                        if existing.exists()
+                        else ""
+                    ),
+                ]
+            )
+        return rows
+
+    def choose_subs_files(self) -> None:
+        """v0.4.14 (Mode B, Eric's reach): the GUI entry for standalone
+        subtitles — pick EXISTING videos at ANY resolution, enqueue one
+        ``subs`` job per file through the SAME registry/executor the MCP
+        transcribe tool uses (one enqueue surface, never a fork), and
+        render through the shared slate + table machinery (rows keyed
+        by _batch_row_for_job; Cancel Current/Cancel Batch ride the
+        v0.4.13 cancel paths unchanged). No plan, no upscale pass, no
+        engine/profile lock: the video streams are copied verbatim."""
+        if self.client.active_job_count() > 0 or self.job_ids:
+            QMessageBox.information(
+                self, "VidLift",
+                "Wait for the current batch to finish or cancel it first.",
+            )
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Choose videos to add subtitles to",
+            str(Path.home()),
+            "Video files (*.avi *.divx *.flv *.m4v *.mkv *.mov *.mp4 *.mpeg *.mpg *.ts *.vob *.wmv);;All files (*)",
+        )
+        paths = [str(path) for path in paths if str(path)]
+        if not paths:
+            return
+        try:
+            self.job_ids = self.client.enqueue_subs(paths)
+        except (BatchTooLarge, FileNotFoundError, BridgeError) as exc:
+            QMessageBox.warning(self, "VidLift", str(exc))
+            self.job_ids = []
+            return
+        if not self.job_ids:
+            return
+        # v0.4.14 (Mode B): a subs batch reuses the SHARED table — its
+        # rows append after any prior batch's rows (the table is the
+        # window's batch view; an old batch's terminal rows stay
+        # readable above — clear_files empties the whole table).
+        seed = self.file_table.rowCount()
+        self.file_table.setRowCount(seed + len(paths))
+        for offset, cells in enumerate(self._subs_file_rows(paths)):
+            for column, text in enumerate(cells):
+                self.file_table.setItem(
+                    seed + offset, column, QTableWidgetItem(text)
+                )
+        # v0.4.14 (Mode B): a fresh submission reseeds the slate — the
+        # shared bootstrap gives these rows the same _batch_row_for_job
+        # identity map, run_counts slots, bar, and follow engagement
+        # the upscale flow gets; a prior batch's structures can never
+        # alias into this one (_begin_job_slate rewrites ALL of them).
+        # Subs rows APPEND: the row map shifts by the existing row count.
+        self._reset_batch_progress()
+        self._begin_job_slate(self.job_ids, row_offset=seed)
+        self._set_summary(
+            f"{len(self.job_ids)} queued for subtitles",
+            "Transcribing audio and soft-muxing subtitles (no upscale).",
+        )
 
     def clear_files(self) -> None:
         if self.client.active_job_count() > 0:
@@ -1049,6 +1203,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "VidLift", "Some files failed to probe.\n\n" + "\n".join(failures[:8]))
 
     def render_batch(self, batch: BatchPlan) -> None:
+        # v0.4.14 (Mode B): a plan render REPLACES the table (a plan is
+        # its own batch view; subs history rows may only survive a
+        # plan render on the NEXT subs append, never across a new plan —
+        # the upscale batch's row map seeds from 0 and any leftover
+        # foreign row above it would alias poll writes).
         self.file_table.setRowCount(len(batch.files))
         for row, item in enumerate(batch.files):
             report = item.report
@@ -1086,14 +1245,21 @@ class MainWindow(QMainWindow):
 
     def _update_start_enabled(self) -> None:
         """Start stays available only with a plan, ready rows, and no
-        in-flight jobs (design §5: re-enable at the LAST terminal)."""
+        in-flight jobs (design §5: re-enable at the LAST terminal).
+
+        v0.4.14 (Mode B): a subs slate carries NO plan — the Start
+        button is untouched (still disabled from construction) so a
+        stray click across a running/subs-only queue can never ship the
+        current batch as an upscale re-plan."""
         if self.client.active_job_count() > 0:
             # a run is live; Start is the cancel affordance via disable–
             # enable symmetry handled in _sync_run_controls
             return
+        if not self.batch:
+            self.start_button.setEnabled(False)
+            return
         allowed = (
-            self.batch is not None
-            and self.batch.runnable_count > 0
+            self.batch.runnable_count > 0
             and not self.job_ids
         )
         self.start_button.setEnabled(allowed)
@@ -1142,33 +1308,40 @@ class MainWindow(QMainWindow):
     # honest "(no data)" line instead of raising. Safe for queued (no snapshot data),
     # running mid-transition, cancelled, succeeded, failed, and lookup-failed rows.
     def _render_detail_for_row(self, row: int | None = None) -> None:
-        if self.batch is None:
-            return
         if row is None:
             rows = self.file_table.selectionModel().selectedRows()
             if not rows:
                 return
             row = rows[0].row()
-        # Keep the v0.4.12 bounds guard: a row outside the plan renders
-        # nothing rather than inventing data (§2.1 step 1).
-        if not (0 <= row < len(self.batch.files)):
-            return
-        item = self.batch.files[row]
-        text = detail_text(
-            item,
-            subtitle_ocr_enabled=self.subtitle_ocr.isChecked(),
-            upscale_profile=self.profile_choice,
-        )
-        # v0.4.9 (§1.4 D1), unchanged call — but now inside the _sync_details
-        # slot boundary (belt-and-braces over scratch_note_for_source's own
-        # OSError/JSONDecodeError guards: a Windows locked-file transient
-        # must never escape a slot in the frozen build, §2.1 step 3).
-        if not self.resume_claim.isChecked():
-            from .run import scratch_note_for_source
+        if self.batch is None:
+            # v0.4.14 (Mode B): a subs slate has NO BatchPlan — the
+            # detail body renders from the shared table row and then
+            # FALLS THROUGH to the SAME LIVE overlay tail the plan
+            # path uses (one overlay contract, kind-blind).
+            if not (0 <= row < self.file_table.rowCount()):
+                return
+            text = self._subs_detail_text(row)
+        else:
+            # Keep the v0.4.12 bounds guard: a row outside the plan renders
+            # nothing rather than inventing data (§2.1 step 1).
+            if not (0 <= row < len(self.batch.files)):
+                return
+            item = self.batch.files[row]
+            text = detail_text(
+                item,
+                subtitle_ocr_enabled=self.subtitle_ocr.isChecked(),
+                upscale_profile=self.profile_choice,
+            )
+            # v0.4.9 (§1.4 D1), unchanged call — but now inside the _sync_details
+            # slot boundary (belt-and-braces over scratch_note_for_source's own
+            # OSError/JSONDecodeError guards: a Windows locked-file transient
+            # must never escape a slot in the frozen build, §2.1 step 3).
+            if not self.resume_claim.isChecked():
+                from .run import scratch_note_for_source
 
-            note = scratch_note_for_source(Path(item.report.path))
-            if note:
-                text = f"{text}\n\n{note}"
+                note = scratch_note_for_source(Path(item.report.path))
+                if note:
+                    text = f"{text}\n\n{note}"
         # LIVE overlay (§2.1 step 4): additive, tolerant, identity-keyed.
         job_id = next(
             (
@@ -1220,6 +1393,34 @@ class MainWindow(QMainWindow):
             lines.append(f"Log: {last}")
         self._set_details_text("\n".join([text, "", *lines]))
 
+    def _subs_detail_text(self, row: int) -> str:
+        """v0.4.14 (Mode B): the subs row's detail body — the file, the
+        output contract, and the row's own verdict — rendered from the
+        shared table's cells (no BatchPlan exists for a subs slate).
+        The LIVE overlay (_render_detail_for_row's tail) appends below
+        exactly as it does for plan batches."""
+        cells = (
+            self.file_table.item(row, column)
+            for column in range(self.file_table.columnCount())
+        )
+        values = [cell.text() if cell is not None else "" for cell in cells]
+        status, path, source, target, output, _size, subtitle_note, warning = (
+            (values + [""] * 8)[:8]
+        )
+        lines = [
+            path,
+            "",
+            "Mode: subtitles only (no upscale; the video streams are copied)",
+            f"Verdict: {status}",
+            f"Subtitles: {subtitle_note or 'transcribed from the file' + chr(39) + 's own audio'}",
+            f"Output: {output} (+ .srt sidecar)",
+        ]
+        if target and target != "keep original":
+            lines.append(f"Resolution handling: {target}")
+        if warning:
+            lines.extend(["", "Warnings:", f"- {warning}"])
+        return "\n".join(lines)
+
     def _set_details_text(self, text: str) -> None:
         """§3.3-f: the details QTextEdit has no change-guard — setPlainText
         resets the user's scroll. Compare-before-write so a paused/idle
@@ -1245,6 +1446,101 @@ class MainWindow(QMainWindow):
         self.render_batch(self.batch)
 
     # ---- Start: enqueue through the unified bridge path (design §5) ----
+
+    # v0.4.14 (Mode B): the batch slate bootstrap every enqueue flow
+    # shares (upscale Start and Add Subtitles alike). One batch = one
+    # submission = one slate; back-to-back hygiene rides the same
+    # structures — _reset_batch_progress() reseeds slot/row maps at
+    # submission time, so a second submission never aliases the first
+    # batch's rows or slots.
+    def _begin_job_slate(
+        self, job_ids: list[str], *, row_offset: int = 0
+    ) -> None:
+        if not job_ids:
+            return
+        # v0.4.14 (Mode B): the fresh slate begins with a CLEAN poll
+        # context — the stage/ETA facts of a PREVIOUS batch must never
+        # leak into a fresh submission's rows (the render path consults
+        # _batch_row_for_job before writing cells).
+        self._batch_row_for_job = {}
+        self.run_panel.show()
+        self.stage_bar.reset()
+        self.overall_bar.reset()
+        self.overall_bar.set_busy(True, "queue active ...")
+        self.stage_bar.set_busy(True, "starting ...")
+        self.run_total = len(job_ids)
+        # v0.4.10 (R2): stable per-batch slot registry (see start_upscale
+        # for the full contract); a subs batch uses the IDENTICAL slate.
+        self._batch_slots: list[str] = list(job_ids)
+        self._batch_slot_index: dict[str, int] = {
+            job_id: index for index, job_id in enumerate(self._batch_slots)
+        }
+        # v0.4.12 (item 1): the stable ROW map, seeded ONCE in submission
+        # order, immutable for the batch's lifetime (the full truth
+        # contract lives at its original seeding site in start_upscale).
+        # v0.4.14 (Mode B): subs rows APPEND below any previous batch's
+        # rows (the shared table is the window's batch view), so the
+        # identity map carries the row_offset — slots/run_counts stay
+        # 0-based slate-parallel arrays (submission order), while cells
+        # write at physical rows offset+index.
+        self._batch_row_for_job: dict[str, int] = {
+            job_id: row_offset + index
+            for index, job_id in enumerate(self._batch_slots)
+        }
+        if len(self._batch_row_for_job) != len(self._batch_slots):
+            raise RuntimeError(
+                "batch row map seeding mismatch: "
+                f"{len(self._batch_row_for_job)} rows for "
+                f"{len(self._batch_slots)} job ids"
+            )
+        self.run_counts: list[str | None] = [None] * self.run_total
+        self.run_summary = summarize_batch(self.run_counts)
+        # v0.4.13 addendum (§3.2 BATCH_START): follow engages with
+        # _follow_job_id=None so the FIRST claim is an identity edge.
+        self._follow_mode = True
+        self._follow_job_id = None
+        # v0.4.10 (R2): the batch bar restarts from a KNOWN color.
+        self._progress_chunk_color = None
+        self.progress.setRange(0, self.run_total)
+        self.progress.setValue(0)
+        self.progress.setFormat(_batch_format(self.run_summary))
+        self.progress.show()
+        self._sync_run_controls()
+        # Liveness: dots animate, clock ticks until the last job lands.
+        self._run_started_at = time.time()
+        self._elapsed_timer.start()
+        self.activity_dots.start()
+        self._stage_now = "queued"
+        self._stage_eta = None
+        self._stage_fraction = None
+        # v0.4.12 (item 2): ETA state starts fresh with every batch.
+        self._eta_state = {}
+        self._eta_phase_now = None
+        self._eta_rendered = None
+        self._batch_eta_rendered = None
+        self.time_elapsed.setText("Elapsed 0:00")
+        # Seed the forecast immediately instead of waiting one tick.
+        self._forecast_total()
+        self._render_recent_jobs()
+
+    def _reset_batch_progress(self) -> None:
+        """v0.4.14 (Mode B): a subs batch reuses the SAME run panel,
+        bars, and slate structures as an upscale batch; the fresh-sub
+        path clears them to a new submission's baseline (no QSettings —
+        an ephemeral in-window reset, distinct from the batch-boundary
+        reset that _batch_finished gives every ENDED batch)."""
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.progress.hide()
+        self.stage_bar.reset()
+        self.overall_bar.reset()
+        self._set_text(self.stage_label, "")
+        self._batch_slots = []
+        self._batch_slot_index = {}
+        self._batch_row_for_job = {}
+        self.run_counts = []
+        self.run_total = 0
+        self.run_summary = None
 
     def start_upscale(self) -> None:
         if self.client.active_job_count() > 0 or self.job_ids:
@@ -1273,6 +1569,9 @@ class MainWindow(QMainWindow):
             # v0.4.9 (§1.4): rides into run_file(resume=...) through the
             # bridge's absent-defaults rule (absent would read False).
             "resume": self.resume_claim.isChecked(),
+            # v0.4.14 (Mode A): the checkbox is the load-bearing kill
+            # switch; False strips an already-selected transcribed plan.
+            "transcription_enabled": self.transcribe_subs.isChecked(),
         }
         try:
             self.job_ids = self.client.enqueue_run(
@@ -1289,86 +1588,11 @@ class MainWindow(QMainWindow):
         # v0.4.8 (D5): the profile is fixed for the batch the same way.
         self.profile_combo.setEnabled(False)
         self.profile_combo.setToolTip(PROFILE_TOOLTIP)
-        self.run_panel.show()
-        self.stage_bar.reset()
-        self.overall_bar.reset()
-        self.overall_bar.set_busy(True, "queue active ...")
-        self.stage_bar.set_busy(True, "starting ...")
-        self.run_total = len(self.job_ids)
-        # v0.4.10 (R2): batch truth accounting lives in the pure
-        # summarize_batch(state list) → BatchSummary; run_counts is the
-        # GUI-side mirror of which batch slot reached which terminal
-        # state (index i ↔ batch slot i in SUBMISSION order),
-        # run_summary is the last rendered BatchSummary. "Terminal"
-        # counts a job as RESOLVED (bar advances); only succeeded
-        # raises the succeeded count (bar green).
-        # v0.4.10-fix (D2): stable per-batch slot registry —
-        # _batch_slots holds the job ids in SUBMISSION order and is
-        # never drained/reordered while the batch lives;
-        # _batch_slot_index maps job_id -> slot for the terminal
-        # writer. run_counts stays parallel to the slots (None until
-        # terminal), so summarize_batch stays correct even after a
-        # terminal job leaves self.job_ids and the rows shift down.
-        self._batch_slots: list[str] = list(self.job_ids)
-        self._batch_slot_index: dict[str, int] = {
-            job_id: index for index, job_id in enumerate(self._batch_slots)
-        }
-        # v0.4.12 (item 1): the stable ROW map — job_id -> table row, seeded
-        # ONCE in submission order and immutable for the batch's lifetime.
-        # The table is built by render_batch in plan order and never
-        # reordered while the batch runs; submission order == plan row order
-        # by construction (enqueue_run returns ids in path order,
-        # client_local.py). The cosmetic cell writes key on THIS map, never
-        # on the draining job_ids index (the v0.4.11 escape: surviving jobs
-        # shift down as terminal jobs drain, so a row-indexed write lands on
-        # the wrong physical row and the last job's home row is left frozen
-        # at "running").
-        self._batch_row_for_job: dict[str, int] = {
-            job_id: index for index, job_id in enumerate(self._batch_slots)
-        }
-        if len(self._batch_row_for_job) != len(self._batch_slots):
-            # A duplicate job_id would silently alias rows — a contract bug,
-            # loudly raised at seed time, never silently zipped.
-            raise RuntimeError(
-                "batch row map seeding mismatch: "
-                f"{len(self._batch_row_for_job)} rows for "
-                f"{len(self._batch_slots)} job ids"
-            )
-        self.run_counts: list[str | None] = [None] * self.run_total
-        self.run_summary = summarize_batch(self.run_counts)
-        # v0.4.13 addendum (§3.2 BATCH_START): follow engages with
-        # _follow_job_id=None so the FIRST claim is an identity edge.
-        self._follow_mode = True
-        self._follow_job_id = None
-        # v0.4.10 (R2): the batch bar restarts from a KNOWN color — the
-        # stale QSS chunk from a previous run must not survive into
-        # this run's truth.
-        self._progress_chunk_color = None
-        self.progress.setRange(0, self.run_total)
-        self.progress.setValue(0)
-        # Fresh accounting: nothing succeeded yet, so even the single-
-        # job bar carries truth ("0/1 succeeded") instead of the old
-        # "0/1 completed" phrasing that counted ANY terminal state.
-        self.progress.setFormat(_batch_format(self.run_summary))
-        self.progress.show()
-        self._sync_run_controls()
-        # Liveness: dots animate, clock ticks until the last job lands
-        # (all done/failed/cancelled paths pass through _stop_liveness).
-        self._run_started_at = time.time()
-        self._elapsed_timer.start()
-        self.activity_dots.start()
-        self._stage_now = "queued"
-        self._stage_eta = None
-        self._stage_fraction = None
-        # v0.4.12 (item 2): ETA state starts fresh with every batch.
-        self._eta_state = {}
-        self._eta_phase_now = None
-        self._eta_rendered = None
-        self._batch_eta_rendered = None
-        self.time_elapsed.setText("Elapsed 0:00")
-        # Seed the forecast immediately instead of waiting one tick.
-        self._forecast_total()
-        self._render_recent_jobs()
+        # v0.4.14 (Mode B): the slate bootstrap lives in ONE place for
+        # both flows; the upscale tail keeps its engine/profile locks
+        # between enqueue and the shared slate build. Plan rows start at
+        # physical row 0 (render_batch rebuilt the table).
+        self._begin_job_slate(self.job_ids, row_offset=0)
 
     def cancel_upscale(self) -> None:
         """The single cancel path (design §5): the registry's own
@@ -1921,7 +2145,15 @@ class MainWindow(QMainWindow):
         if snapshot.get("engine_simulated"):
             return None
         phase = snapshot.get("current_phase") or ""
-        if phase in ("verify", "finalize", "probe", "subtitles", "done", ""):
+        if phase in (
+            "verify", "finalize", "probe", "subtitles", "done", "",
+            # v0.4.14 (Mode B): transcription is segment-counted with an
+            # unknown denominator and the subs-mux is a fast stream copy
+            # — no honest rate exists, so NO ETA digits are invented
+            # (elapsed-only labels cover both; the segments count rides
+            # the stage label).
+            "transcribe", "subs-mux",
+        ):
             return None
         progress = snapshot.get("progress") or {}
         now = time.time()

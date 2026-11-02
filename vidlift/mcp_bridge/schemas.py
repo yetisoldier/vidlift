@@ -110,6 +110,21 @@ TOOL_SCHEMAS: dict[str, dict] = {
         },
         "required": ["paths"],
     },
+    "transcribe": {
+        "type": "object",
+        "properties": {
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+            },
+            "lang": {"type": "string"},
+            "model": {"type": "string"},
+            "device": {"type": "string", "enum": ["auto", "cuda", "cpu"]},
+            "force": {"type": "boolean"},
+        },
+        "required": ["paths"],
+    },
     "status": {
         "type": "object",
         "properties": {"job_id": {"type": "string"}},
@@ -154,6 +169,13 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "prepare, upscale, encode, verify). Returns immediately with job "
         "ids; poll status/manifest. Nothing requires this session to stay "
         "open."
+    ),
+    "transcribe": (
+        "Standalone subtitles (v0.4.14 Mode B): transcribe the file's own "
+        "audio (faster-whisper, medium by default; first use downloads the "
+        "model) and soft-mux mov_text subtitles into a NEW {stem}.subs.mp4 "
+        "beside the source — never overwriting it. Enqueues subs jobs; "
+        "cancel works on them; status/manifest read them like any job."
     ),
     "status": (
         "The full runner observability contract for one job: state, phase, "

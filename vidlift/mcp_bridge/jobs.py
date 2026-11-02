@@ -230,6 +230,11 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
             # options["resume"] reads as False, so v0.4.8 callers are
             # behavior-identical (no claim attempt, clean prepare).
             resume=bool(options.get("resume", False)),
+            # v0.4.14 (Mode A): absent-defaults rule — no options key
+            # reads as None (config default, locked ON); False kills.
+            transcription_enabled=options.get(
+                "transcription_enabled", None
+            ),
         )
     except EngineCancelled as exc:
         state = getattr(exc, "state", None)
@@ -271,6 +276,146 @@ def _state_field(state, name):
 def _state_log_path(state):
     log = getattr(state, "log", None) if state is not None else None
     return log.path if log is not None else None
+
+
+def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutcome:
+    """One Mode B standalone subs job (v0.4.14 §Mode B, B1 soft-mux).
+
+    A thin call through run_subs_job — the same probe/guard/transcribe/
+    remux discipline the CLI uses. Transcription IS the job's point, so
+    its failures fail the job (SubsJobError -> failed), but cancel
+    still closes cancelled via the shared CancelFlag contract.
+    """
+    from ..probe import ProbeError
+    from ..run import EngineCancelled, RunError
+    from ..subs_job import SubsJobError, run_subs_job
+    from ..transcribe import TranscriptionError
+
+    options = record.options
+    path = record.paths[0]
+    log_root = Path(
+        options.get("log_dir") or (Path(path).parent / ".vidlift-runs")
+    )
+
+    # v0.4.14 (Mode B progress): the tracked-runner seam — the
+    # executor hands run_subs_job's progress seams THIS live RunState,
+    # so the bridge's status payload reports the runner's own facts
+    # verbatim (Section 4.5) via the same state_box contract the
+    # run-job path uses; the mirror persists it for cross-process
+    # readers (tools.py's progress_snapshot fallback).
+    from ..run import RunState
+
+    state = RunState(file_path=path)
+    record.set_live("state_box", {"state": state})
+    # v0.4.5 (D2): re-pin the record so a reader's _maybe_reload
+    # cannot re-install a stale file row over the live seams (mirrors
+    # _execute_run_job's pin).
+    services.registry._jobs[record.job_id] = record
+
+    def tracked(binary: str, args: list[str]):
+        record.touch()
+        state.touch()
+        live = record.get_live("commands")
+        if live is not None:
+            live.append([binary, *args])
+        if "subs.srt" in " ".join(args) and "-c:s" in args:
+            record.set_live("current_phase", "subs-mux")
+            state.current_phase = "subs-mux"
+        elif "pcm_s16le" in args:
+            record.set_live("current_phase", "transcribe")
+            state.current_phase = "transcribe"
+        executor = getattr(services, "executor", None)
+        if executor is not None and hasattr(executor, "maybe_mirror"):
+            executor.maybe_mirror()
+        from ..run import _subprocess_runner
+        base = services.command_runner or _subprocess_runner
+        return base(binary, args)
+
+    record.set_live("commands", [])
+
+    def probe_tracked(binary: str, args: list[str]):
+        record.touch()
+        state.touch()
+        record.set_live("current_phase", "probe")
+        state.current_phase = "probe"
+        from ..run import _subprocess_runner
+        base = services.probe_runner or services.command_runner or _subprocess_runner
+        return base(binary, args)
+
+    def on_segments(segments_done: int, _total: int) -> None:
+        """v0.4.14 (Mode B): the core's on_progress carries segment
+        counts (segments_done; denominator unknown — 0 by contract).
+        Recorded into the state's progress dict so the GUI's honest
+        "N segment(s) done" label renders from REAL facts; no
+        fabricated total, ever."""
+        progress = dict(state.progress or {})
+        progress["segments_done"] = int(segments_done)
+        progress["step"] = f"transcribing segment {int(segments_done)}"
+        progress.pop("segments_total", None)
+        state.progress = progress
+        state.touch()
+        record.touch()
+
+    def on_step(step: str) -> None:
+        """The core's step names ride progress["step"] verbatim — the
+        same heartbeat-surface discipline the run path uses; rendering
+        lives GUI-side (run_stage_label)."""
+        progress = dict(state.progress or {})
+        note = str(step)
+        if note == "transcribe-run" and "segments_done" not in progress:
+            progress["step"] = "transcribing — building language model"
+        else:
+            progress["step"] = note
+        state.progress = progress
+        state.touch()
+
+    try:
+        from ..run import find_tools
+        tools = find_tools(
+            ffmpeg=options.get("ffmpeg"), ffprobe=options.get("ffprobe")
+        )
+    except RunError as exc:
+        return JobOutcome(ok=False, error=f"missing_tool: {exc}")
+    try:
+        result = run_subs_job(
+            path,
+            ffmpeg=tools.ffmpeg,
+            ffprobe=tools.ffprobe,
+            probe_runner=probe_tracked,
+            runner=tracked,
+            engine_factory=getattr(services, "transcribe_engine_factory", None),
+            model_pin=options.get("model"),
+            device_pin=options.get("device", "auto"),
+            language_pin=options.get("language", ""),
+            force=bool(options.get("force", False)),
+            burn=bool(options.get("burn", False)),
+            workdir=options.get("workdir"),
+            state_root=services.state_dir,
+            on_progress=on_segments,
+            on_step=on_step,
+            should_cancel=cancel,
+        )
+    except EngineCancelled as exc:
+        return JobOutcome(ok=False, cancelled=True, error=str(exc))
+    except SubsJobError as exc:
+        return JobOutcome(ok=False, error=str(exc))
+    except TranscriptionError as exc:
+        return JobOutcome(ok=False, error=f"transcription unavailable: {exc}")
+    except ProbeError as exc:
+        return JobOutcome(ok=False, error=str(exc))
+    return JobOutcome(
+        ok=True,
+        output_path=result.output_path,
+        log_path=None,
+        result={
+            "output_path": result.output_path,
+            "srt_path": result.srt_path,
+            "language": result.language,
+            "cue_count": result.cue_count,
+            "model": result.model,
+            "notes": list(result.notes),
+        },
+    )
 
 
 def _execute_benchmark_job(
@@ -342,6 +487,7 @@ def _execute_benchmark_job(
 
 _EXECUTORS = {
     "run": _execute_run_job,
+    "subs": _execute_subs_job,
     "benchmark": _execute_benchmark_job,
 }
 

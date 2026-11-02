@@ -1060,13 +1060,84 @@ class OcrResult:
 
 
 def mux_language(lang: str) -> str:
-    """ffprobe subtitle language -> MP4 track tag (the honesty rule).
+    """Subtitle language -> MP4 track tag.
 
-    'eng'/'en' -> 'eng'; anything else (including '', the unconfirmed
-    case) -> 'und'. Never stamp 'eng' on an unconfirmed stream
-    (b2m subtitles.py:458-466; the v0.2.16-embedded-subs §3 rule).
+    The v0.2.16-embedded-subs honesty rule is about UNCONFIRMED streams:
+    never stamp 'eng' on a stream we could not identify — unknown/empty/
+    unrecognized codes stay 'und'. But a DETECTED (or confirmed) language
+    must carry its real ISO 639-2 tag: v0.4.14 transcription reports
+    faster-whisper's ISO 639-1 codes (ko/zh/ja/de/fr/...), and collapsing
+    every non-English code to 'und' broke the language-tag promise for
+    exactly the foreign-language slice the feature exists for (Karen's
+    M1: a ko-detected file got 'und', not 'kor').
+
+    Table = ISO 639-2/B for the languages the transcription core can
+    emit plus the common embedded-sub codes; anything unrecognized is
+    still honestly 'und'. ffmpeg/mp4a round-trip verified for kor/zho/
+    jpn/chi (ffprobe echoes the tag verbatim).
     """
-    return "eng" if lang in ("eng", "en") else "und"
+    code = (lang or "").strip().lower()
+    if not code:
+        return "und"
+    if code in ISO_639_2_TAGS:
+        return ISO_639_2_TAGS[code]
+    # already a 639-2 code (eng, ger, cmn...) or a 3-letter unknown:
+    # pass through verbatim only when it matches a real 639-2 shape we
+    # know; unknown anything -> und (never invent a tag)
+    if code in _PASS_THROUGH_639_2 or code == "und":
+        return code
+    return "und"
+
+
+# ISO 639-2/B tags for the two-letter codes faster-whisper detects
+# (its full label set; the common languages first, the tail is the rest
+# of Whisper's published language list minus the ones with no distinct
+# 639-2 code — those pass through und). Keyed by 639-1/P code.
+ISO_639_2_TAGS: dict[str, str] = {
+    "en": "eng", "ko": "kor", "zh": "zho", "ja": "jpn",
+    "de": "deu", "fr": "fra", "es": "spa", "it": "ita",
+    "pt": "por", "ru": "rus", "hi": "hin", "ar": "ara",
+    "nl": "nld", "sv": "swe", "no": "nor", "da": "dan",
+    "fi": "fin", "pl": "pol", "cs": "ces", "sk": "slo",
+    "hu": "hun", "ro": "ron", "bg": "bul", "el": "ell",
+    "tr": "tur", "uk": "ukr", "he": "heb", "fa": "per",
+    "ur": "urd", "th": "tha", "vi": "vie", "id": "ind",
+    "ms": "msa", "tl": "tgl", "bn": "ben", "ta": "tam",
+    "te": "tel", "ml": "mal", "kn": "kan", "mr": "mar",
+    "gu": "guj", "pa": "pan", "ne": "nep", "si": "sin",
+    "km": "khm", "my": "mya", "sw": "swa", "am": "amh",
+    "yo": "yor", "af": "afr", "sq": "sqi", "hy": "hye",
+    "az": "aze", "ka": "kat", "kk": "kaz", "ky": "kir",
+    "uz": "uzb", "mn": "mon", "bo": "tib", "is": "isl",
+    "et": "est", "lv": "lav", "lt": "lit", "be": "bel",
+    "mk": "mkd", "sr": "srp", "hr": "hrv", "sl": "slv",
+    "ga": "gle", "cy": "cym", "eu": "eus", "ca": "cat",
+    "gl": "glg", "la": "lat", "mi": "mri", "ha": "hau",
+    "so": "som", "sn": "sna", "nn": "nno", "oc": "oci",
+    "br": "bre", "sa": "san", "as": "asm", "lo": "lao",
+    "tg": "tgk",
+}
+
+# ISO 639-2 codes streams may already carry (embedded subs, user pins):
+# passed through verbatim in their canonical form (639-2/B plus the /T
+# bibliographic twins ffmpeg accepts, and the macrolanguage twins).
+_PASS_THROUGH_639_2 = {
+    "eng", "kor", "zho", "jpn", "deu", "ger", "fra", "fre",
+    "spa", "ita", "por", "rus", "hin", "ara", "nld", "dut",
+    "swe", "nor", "dan", "fin", "pol", "ces", "cze", "slo",
+    "hun", "ron", "rum", "bul", "ell", "gre", "tur", "ukr",
+    "heb", "per", "fas", "urd", "tha", "vie", "ind", "msa",
+    "may", "tgl", "ben", "tam", "tel", "mal", "kan", "mar",
+    "guj", "pan", "nep", "sin", "khm", "mya", "swa", "amh",
+    "yor", "afr", "sqi", "alb", "hye", "arm", "aze", "kat",
+    "geo", "kaz", "kir", "uzb", "mon", "tib", "bod", "isl",
+    "ice", "est", "lav", "lit", "bel", "mkd", "mac", "srp",
+    "hrv", "slv", "gle", "cym", "wel", "eus", "baq", "cat",
+    "glg", "lat", "mri", "hau", "som", "sna", "nno", "nob",
+    "oci", "bre", "san", "asm", "lao", "tgk", "cmn", "chi",
+    "nob", "fao", "haw", "mt", "lb", "fo", "ku", "sd", "ug",
+    "tt", "yi", "jv", "su", "ceb", "ny", "st", "xh", "zu",
+}
 
 
 def mux_srt_into_mp4(

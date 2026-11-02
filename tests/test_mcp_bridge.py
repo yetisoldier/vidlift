@@ -227,8 +227,9 @@ def wait_for_state(server: McpServer, job_id: str, states: set[str], timeout: fl
 def test_t1_tool_surface_matches_the_binding_shapes():
     marker("t1")
     # the eight tools, exactly, and nothing else
+    # v0.4.14: the transcribe tool joins the surface (Mode B)
     assert set(TOOL_SCHEMAS) == {
-        "probe", "plan", "benchmark", "run",
+        "probe", "plan", "benchmark", "run", "transcribe",
         "status", "cancel", "list", "manifest",
     }
     # field names, types, required-ness per Section 4
@@ -1007,7 +1008,7 @@ def test_t9_server_serves_over_real_stdio_pipes(tmp_path):
     lines = [json.loads(line) for line in text.splitlines() if line]
     assert lines[0]["id"] == 1
     assert [t["name"] for t in lines[0]["result"]["tools"]] == [
-        "probe", "plan", "benchmark", "run",
+        "probe", "plan", "benchmark", "run", "transcribe",
         "status", "cancel", "list", "manifest",
     ]
     assert lines[1]["id"] == 2 and lines[1]["result"] == {}

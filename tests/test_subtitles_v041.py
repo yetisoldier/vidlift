@@ -361,8 +361,14 @@ class TestS5StyleLossAndLanguage:
     def test_mux_language_und_honesty(self):
         # never stamp eng on an unconfirmed stream (§B.3)
         assert S.mux_language("") == "und"
-        assert S.mux_language("ger") == "und"
         assert S.mux_language("undeclared-anything") == "und"
+        # v0.4.14 validation fix (M1): KNOWN languages get their real
+        # ISO 639-2 tag — 'ger' is a real ISO 639-2 code (German), not
+        # an "unconfirmed" stream; the fix passes known 639-2 codes
+        # through verbatim instead of collapsing them to 'und'. The
+        # honesty rule now means: unknown/empty -> und, never invent
+        # tags. 'qtx-private' style garbage still lands und:
+        assert S.mux_language("qtx") == "und"
 
     def test_untagged_text_plans_to_und(self):
         report = _report(subs=[{"codec_name": "srt"}])
@@ -856,7 +862,12 @@ class TestS12Mux:
             ffmpeg="ffmpeg", runner=runner,
         )
         assert "-metadata:s:s:0" in argv_seen
-        assert "language=und" in argv_seen  # the honesty rule
+        # v0.4.14 validation fix (M1): 'ger' is a REAL ISO 639-2 code
+        # (German) — a known language passes through verbatim. The
+        # v0.4.1 honesty rule survives for UNCONFIRMED languages:
+        # unknown/empty still tag 'und' (pinned in
+        # test_mux_language_und_honesty + the validation-fix tests).
+        assert "language=ger" in argv_seen
 
 
 # ---- S13: tesseract lane parity ----------------------------------------

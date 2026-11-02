@@ -84,6 +84,13 @@ class PlannedFile:
     # text track is ASS/SSA — styling does not survive mov_text
     # conversion; stated, never hidden.
     subtitle_style_loss: bool = False
+    # v0.4.14 additive (design §Mode A): the Mode A transcription
+    # settings this run will use, present ONLY when the plan selected
+    # the transcribed fallback (source="transcribed"). None = no
+    # transcription this run (feature off, or a carried/embedded/OCR
+    # plan exists). Detected language rides in at phase time, never
+    # here — plan-time records intent + pin, run-time executes.
+    transcription: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -170,7 +177,12 @@ def _expectation(report: FileReport) -> str:
     return "inspect the sample before a full run"
 
 
-def select_subtitle_track(report: FileReport) -> SubtitlePlan | None:
+def select_subtitle_track(
+    report: FileReport,
+    *,
+    transcription_enabled: bool = False,
+    transcription_language: str = "",
+) -> SubtitlePlan | None:
     """The deterministic probe-side selection rule (design §B.2).
 
     The file-first replacement for b2m's scan-side recommend.py, porting
@@ -188,6 +200,15 @@ def select_subtitle_track(report: FileReport) -> SubtitlePlan | None:
 
     Plan-time decision, run-time execution (the repo's established
     split): the run phase consumes the plan with zero decision logic.
+
+    v0.4.14 (design §Mode A, Eric's locked default ON): rule 4's None
+    seam gains the transcription fallback when ``transcription_enabled``
+    — the plan becomes ``source="transcribed"``, ``kind="text"`` and
+    the run phase transcribes the source's own audio. The sync anchor
+    is structural: the encode maps ``1:a:0`` untouched, so an SRT built
+    from that same stream IS the output timeline. The fallback fires
+    ONLY here — any embedded text, bitmap (even unhandled), or adopted
+    sidecar keeps the v0.4.1 selection verbatim (regression-guarded).
     """
     text_subs = [s for s in report.subtitles if s.kind == "text"]
     if text_subs:
@@ -244,10 +265,26 @@ def select_subtitle_track(report: FileReport) -> SubtitlePlan | None:
                 lang="",
                 ocr_required=True,
             )
+    # v0.4.14 (design §Mode A): the honest 'none' PLUS the transcription
+    # fallback when Mode A is enabled and the file has audio. A no-audio
+    # file has nothing to transcribe — the honest None stands (the run
+    # phase would fail-open on extraction anyway; the plan says so).
+    if transcription_enabled and report.audio:
+        return SubtitlePlan(
+            source="transcribed",
+            stream_index=-1,
+            sidecar_path="",
+            kind="text",
+            codec_name="mov_text",
+            lang=transcription_language or "",
+            ocr_required=False,
+        )
     return None
 
 
-def _subtitle_note(report: FileReport) -> str:
+def _subtitle_note(
+    report: FileReport, *, transcription_language: str = ""
+) -> str:
     """Describe the PLAN, not just the inventory (design §B.7).
 
     v0.4.1 rewrite: today's 'listed only; no OCR in VidLift' verdict is
@@ -255,8 +292,18 @@ def _subtitle_note(report: FileReport) -> str:
     is skipped. A mixed text+bitmap file now reports carrying the
     text track (the old all-or-nothing silence is the gap v0.4.1
     closes).
+
+    v0.4.14: the note renders the transcribed disposition too, under
+    the SAME shipped default the planner uses (a note can never
+    contradict the plan's own selection).
     """
-    selected = select_subtitle_track(report)
+    from .transcribe import TRANSCRIPTION_ENABLED_DEFAULT
+
+    selected = select_subtitle_track(
+        report,
+        transcription_enabled=TRANSCRIPTION_ENABLED_DEFAULT,
+        transcription_language=transcription_language,
+    )
     if selected is None:
         if report.sidecars:
             # Discovery found a sidecar but selection did not adopt it
@@ -275,6 +322,12 @@ def _subtitle_note(report: FileReport) -> str:
         parts.append(
             f"sidecar {os.path.basename(selected.sidecar_path)} adopted "
             "as the text track (muxed mov_text + copied sidecar)"
+        )
+    elif selected.kind == "text" and selected.source == "transcribed":
+        pin = f" [{selected.lang}]" if selected.lang else ""
+        parts.append(
+            "no subtitle track; transcribing source audio -> "
+            f"mov_text + sidecar{pin}"
         )
     elif selected.kind == "image" and selected.source == "embedded":
         engine = "seconv" if os.name == "nt" else "tesseract"
@@ -335,6 +388,10 @@ def build_file_plan(
     gb_per_hour: float = DEFAULT_GB_PER_HOUR,
     output_dir: str | None = None,
     check_collision: bool = True,
+    transcription_enabled: bool | None = None,
+    transcription_model: str | None = None,
+    transcription_device: str | None = None,
+    transcription_language: str | None = None,
 ) -> PlannedFile:
     """Build a pre-flight plan for one classified file.
 
@@ -343,11 +400,37 @@ def build_file_plan(
     warning (block-until-forced; no silent overwrite of a pre-existing
     file). ``check_collision`` exists so a caller that has already dealt
     with the disk state can skip the probe; the default keeps the gate on.
+
+    v0.4.14 (design §Mode A): ``transcription_enabled`` opts the plan
+    into the transcribed fallback at the None seam — None (the absent
+    default) reads as ENABLED (Eric's locked shipped default, config.py
+    TRANSCRIPTION_ENABLED_DEFAULT), False is the load-bearing checkbox.
+    Model/device/language pins ride the plan's ``transcription`` block
+    (additive, None-defaulted); detected language is filled at phase
+    time, never planned here.
     """
     if gb_per_hour <= 0:
         raise PlanError("gb_per_hour must be greater than zero")
     if report.video is None:
         raise PlanError("cannot plan a file with no video stream")
+    from .transcribe import (
+        TRANSCRIPTION_ENABLED_DEFAULT,
+    )
+
+    if transcription_enabled is None:
+        transcription_enabled = TRANSCRIPTION_ENABLED_DEFAULT
+    # The suite-wide engine-off guard (tests conftest): Mode A's plan
+    # seam resolves to the plain 'none' selection — a fact, not a
+    # warning — with zero model/cache/network touch. Tests that verify
+    # Mode A's plan seam set their own env explicitly.
+    if (
+        transcription_enabled
+        and os.environ.get("VIDLIFT_TRANSCRIPTION_ENGINE", "") == "0"
+    ):
+        transcription_enabled = False
+    transcription_model = transcription_model or "medium"
+    transcription_device = transcription_device or "auto"
+    transcription_language = transcription_language or ""
     width, height = output_geometry(report, target)
     audio = _audio_plan(report)
     video_kbps = estimate_video_bitrate_kbps(
@@ -358,7 +441,21 @@ def build_file_plan(
     estimated_bytes = None
     if report.duration_seconds is not None:
         estimated_bytes = int(gb_per_hour * GB * report.duration_seconds / 3600)
-    subtitle_plan = select_subtitle_track(report)
+    subtitle_plan = select_subtitle_track(
+        report,
+        transcription_enabled=transcription_enabled,
+        transcription_language=transcription_language,
+    )
+    transcription_block: dict | None = None
+    if (
+        subtitle_plan is not None
+        and subtitle_plan.source == "transcribed"
+    ):
+        transcription_block = {
+            "model": transcription_model,
+            "device": transcription_device,
+            "language": transcription_language,
+        }
     style_loss = bool(
         subtitle_plan is not None
         and subtitle_plan.source == "embedded"
@@ -376,10 +473,13 @@ def build_file_plan(
         video_bitrate_kbps=video_kbps,
         estimated_output_bytes=estimated_bytes,
         expectation=_expectation(report),
-        subtitle_note=_subtitle_note(report),
+        subtitle_note=_subtitle_note(
+            report, transcription_language=transcription_language
+        ),
         process_verdict=_process_verdict(report),
         subtitle_plan=subtitle_plan,
         subtitle_style_loss=style_loss,
+        transcription=transcription_block,
     )
     if check_collision and os.path.exists(planned.output_path):
         # v0.4.12 (item 3): the new plain name can legitimately collide
@@ -400,6 +500,10 @@ def build_batch_plan(
     target: str = "720p",
     gb_per_hour: float = DEFAULT_GB_PER_HOUR,
     output_dir: str | None = None,
+    transcription_enabled: bool | None = None,
+    transcription_model: str | None = None,
+    transcription_device: str | None = None,
+    transcription_language: str | None = None,
 ) -> BatchPlan:
     """Build a batch pre-flight plan from classified probe reports.
 
@@ -408,6 +512,9 @@ def build_batch_plan(
     name already exists on disk is returned NOT-ready with the warning —
     the GUI treats it exactly like every other non-ready verdict (yellow
     row, excluded from Start).
+
+    v0.4.14: the transcription knobs pass through to build_file_plan
+    (the same absent-defaults rule: None reads as the config default).
     """
     files: list[PlannedFile] = []
     for report in reports:
@@ -417,6 +524,10 @@ def build_batch_plan(
             gb_per_hour=gb_per_hour,
             output_dir=output_dir,
             check_collision=False,
+            transcription_enabled=transcription_enabled,
+            transcription_model=transcription_model,
+            transcription_device=transcription_device,
+            transcription_language=transcription_language,
         )
         if item.process_verdict == "ready" and os.path.exists(item.output_path):
             item = replace(

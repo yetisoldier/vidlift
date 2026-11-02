@@ -25,11 +25,55 @@ __all__ = [
     "MONITOR_TOKEN_DEFAULT",
     "MONITOR_ENABLED_DEFAULT",
     "QSETTINGS_MONITOR_KEYS",
+    "TRANSCRIPTION_BURN_DEFAULT",
+    "TRANSCRIPTION_DEVICE_DEFAULT",
+    "TRANSCRIPTION_ENABLED_DEFAULT",
+    "TRANSCRIPTION_LANGUAGE_DEFAULT",
+    "TRANSCRIPTION_MODEL_DEFAULT",
+    "TRANSCRIPTION_VAD_DEFAULT",
+    "QSETTINGS_TRANSCRIPTION_KEYS",
 ]
 
 MONITOR_HOST_DEFAULT = "0.0.0.0"  # LAN-visible, same as the sibling
 MONITOR_PORT_DEFAULT = 8765
 MONITOR_ENABLED_DEFAULT = True  # ON by default (design §4.1)
+
+# ---- v0.4.14 (transcription subtitles) ------------------------------------
+#
+# Eric's LOCKED decisions (2026-11-01; do not relitigate):
+# 1. Mode A (upscale fallback transcription): ENABLED by default. The
+#    GUI checkbox / config override stays (a user may disable), but the
+#    SHIPPED default is ON.
+# 2. Model delivery: first-run download of the `medium` model into the
+#    machine-shared cache under the state dir (sha256-pinned per model);
+#    config pin override for a large-v3 tag or a user model path.
+
+# Mode A switch — ON by default (ERIC'S LOCKED DEFAULT). The planner's
+# absent-default reads this constant (plan.build_file_plan), so the CLI
+# run path and the GUI checkbox default all land on it from HERE.
+TRANSCRIPTION_ENABLED_DEFAULT = True
+# The default model tag (first-run download; sha-pinned in
+# vidlift.transcribe.MODEL_SHA256).
+TRANSCRIPTION_MODEL_DEFAULT = "medium"
+# device auto -> cuda when CTranslate2 sees one, else the documented
+# int8 CPU fallback (~1x realtime).
+TRANSCRIPTION_DEVICE_DEFAULT = "auto"
+# Empty = per-file auto-detect (the design's language rule).
+TRANSCRIPTION_LANGUAGE_DEFAULT = ""
+# VAD prefilter stays ON (the design's hallucination discipline).
+TRANSCRIPTION_VAD_DEFAULT = True
+# Mode B burn-in: REMUX (B1) is the default; burn is an explicit opt-in
+# flag only (never the silent default).
+TRANSCRIPTION_BURN_DEFAULT = False
+
+# The QSettings keys the GUI persists for the Mode A checkbox (the
+# monitor/QSETTINGS pattern).
+QSETTINGS_TRANSCRIPTION_KEYS = {
+    "enabled": "transcription/enabled",
+    "model": "transcription/model",
+    "device": "transcription/device",
+    "language": "transcription/language",
+}
 
 # The QSettings keys the GUI persists (§2.1's settings keys, QSettings
 # spelling). monitor/token overrides MONITOR_TOKEN_DEFAULT when set.
