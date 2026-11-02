@@ -157,6 +157,41 @@ def engine_on(monkeypatch):
     monkeypatch.delenv("VIDLIFT_TRANSCRIPTION_ENGINE", raising=False)
 
 
+def _seed_model_state(state_root) -> None:
+    """v0.4.15 (release-gate root cause): this test's job resolves the
+    transcription model against a PER-TEST state_root with nothing in
+    it. Resolution then attempts a REAL ~1.5 GB network download of the
+    default model — which silently succeeded in interactive shells (CA
+    bundles available) and failed the job with
+    'transcription model download failed (config.json): SSL
+    CERTIFICATE_VERIFY_FAILED' inside the systemd transient units the
+    release gate runs in and whose 20-37 s tail inflated the suite.
+    The machine-wide cache (~/.vidlift/whisper/models) is complete but
+    the test never sees it: state_root redirects resolution. The honest
+    fix seeds the per-test state with the model the resolution CONTRACT
+    promises (.complete marker -> resolve returns the dir untouched) —
+    exercising the real resolution path with zero network. (The
+    conftest network guard would fail this test loudly either way;
+    seeding makes it pass for the right reason.)"""
+    import hashlib
+
+    tag = "medium"
+    model_dir = Path(state_root) / "whisper" / "models" / tag
+    model_dir.mkdir(parents=True, exist_ok=True)
+    # The contract checks ONLY the .complete marker (resolve_model_dir
+    # short-circuits before any file/digest read); the rest documents
+    # the shape the engine seam receives and keeps the fixture honest
+    # if the resolver ever grows content checks.
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.bin").write_bytes(b"stub-model-bin")
+    (model_dir / "vocabulary.txt").write_text("", encoding="utf-8")
+    (model_dir / ".complete").write_text(
+        f"{tag}\n{hashlib.sha256(b'stub-model-bin').hexdigest()}\n",
+        encoding="utf-8",
+    )
+
+
 @pytest.fixture
 def no_lock(monkeypatch):
     """A stand-in GPU-phase lock instance so no filesystem lock is used."""
@@ -334,7 +369,8 @@ def test_subs_job_executes_through_executor(tmp_path, no_lock, monkeypatch):
     src = tmp_path / "movie.avi"
     src.write_bytes(b"source-bytes")
     runner = FakeRunner(_probe_payload())
-    registry = _reg(tmp_path)
+    registry = _reg(tmp_path)  # rmtree('state') first; seeding follows
+    _seed_model_state(tmp_path / "state")
     services = _Services(registry, tmp_path)
     monkeypatch.setattr(
         jobs_mod, "_EXECUTORS",
