@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 
 from .jobs import JobExecutor
-from .registry import Registry
+from .registry import RESTART_ERROR, STARTUP_SWEEP_ERROR, Registry
 from .schemas import InvalidInput, TOOL_DESCRIPTIONS, TOOL_SCHEMAS, validate_tool_args
 from .tools import BridgeError, BridgeServices, TOOL_HANDLERS
 from ..run import MissingToolError
@@ -140,26 +140,50 @@ def _scratch_roots_for_gc(registry) -> list[Path]:
     return roots
 
 
-def build_services(state_dir: str | Path | None = None) -> "BridgeServices":
+def build_services(
+    state_dir: str | Path | None = None,
+    *,
+    gui_startup: bool = False,
+) -> "BridgeServices":
     """The v0.4.4 unification factory (design §5): one construction
     path for the bridge's services object, used by BOTH the stdio MCP
     server's entry and the GUI's in-process client.
 
     Builds the registry at ``state_dir`` (or ``$VIDLIFT_STATE_DIR`` or
-    the platform default), runs the restart sweep exactly as the MCP
-    server always has, and wires a :class:`JobExecutor` around it. The
-    executor is constructed but NOT started: the server starts it in
-    ``McpServer.__init__`` (worker threads owned there); the GUI client
-    starts it after the Qt app is up and stops it on quit. Test seams
-    on the returned services object (probe/command runners) stay None
-    — production wiring, the real subprocesses."""
+    the platform default) and runs the restart sweep BEFORE anything
+    else can read the registry. The sweep mode differs by consumer:
+    the stdio server keeps §6 semantics (running corpses failed,
+    queued jobs resume — its executor starts seconds later and
+    honestly runs them), while ``gui_startup=True`` ALSO closes stale
+    'queued' records as failed (``STARTUP_SWEEP_ERROR``): the GUI's
+    executor has not started, so queued records are orphaned too, and
+    leaving them made ``active_job_count()`` block the fresh window
+    (Eric's 12:43 CZ repro: fresh start, empty table, GPU idle and
+    Clear popped "Wait for the current upscale…"). One sweep, exactly
+    where the registry is loaded: the persisted truth is clean before
+    the first active-job read. Wires a :class:`JobExecutor` around the
+    registry. The executor is constructed but NOT started: the server
+    starts it in ``McpServer.__init__`` (worker threads owned there);
+    the GUI client starts it after the sweep and stops it on quit.
+    Test seams on the returned services object (probe/command runners)
+    stay None — production wiring, the real subprocesses."""
     from .tools import BridgeServices
 
     resolved = _default_state_dir(state_dir)
     registry = Registry(resolved)
     # Restart sweep FIRST (Section 6): the previous process's running
     # jobs are corpses; they become failed with the binding restart
-    # error, never silently succeeded. Identical for both consumers.
+    # error, never silently succeeded. Identical for both consumers —
+    # GUI startup mode (gui_startup=True) passes the startup error
+    # string and ALSO closes stale queued records (v0.4.15.1): at GUI
+    # startup the executor has not started, so queued records are
+    # exactly as orphaned as running ones, and active_job_count()
+    # would otherwise block the fresh window on a crashed session's
+    # leftovers. ONE sweep runs here, before any consumer read.
+    registry.sweep_orphans(
+        error=STARTUP_SWEEP_ERROR if gui_startup else RESTART_ERROR,
+        include_queued=gui_startup,
+    )
     registry.sweep_orphans()
     # v0.4.9 (design §1.6): the scratch GC runs beside the restart
     # sweep — retained scratch becomes durable state with resume

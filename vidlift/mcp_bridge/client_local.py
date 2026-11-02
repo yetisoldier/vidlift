@@ -11,9 +11,22 @@ contract is THE bridge's ``_status_payload`` — imported directly from
 ``tools.py`` (design Appendix: fork it and Slice 3 is wrong).
 
 Lifecycle: the GUI owns one :class:`LocalBridgeClient` at app start
-(the executor starts when the client is constructed), calls
+(the sweep runs first, then the executor starts), calls
 ``enqueue_run``/``status_snapshot``/``cancel``/``history`` from the Qt
 thread, and stops the executor on application quit.
+
+v0.4.15.1 (startup sweep): the client's construction is THE GUI's
+startup sweep — the registry was just loaded (fresh or after a crash)
+and the executor has not started, so every 'queued'/'running' record
+in the file is a previous session's orphan. They close as ``failed``
+with ``STARTUP_SWEEP_ERROR`` and remain as visible failed history
+rows; ``active_job_count()`` is therefore 0 at window construction,
+and the guards (Clear/Start/cancel) cannot block a fresh start off
+the previous session's leftovers (Eric's 2026-11-02 12:43 CST repro:
+fresh start, empty table, GPU idle, Clear popped "Wait for the
+current upscale…"). The stdio server keeps §6 queue-resume semantics
+(its executor starts with the server; a queued job enqueued across a
+restart honestly runs).
 """
 
 from __future__ import annotations
@@ -85,7 +98,14 @@ class LocalBridgeClient:
         # sweep as the stdio server (design §5's restart discipline:
         # a crashed GUI's mid-run job surfaces as failed with the
         # binding restart error on next launch).
-        self.services = build_services(state_dir)
+        # v0.4.15.1 (startup sweep): the GUI mode also closes stale
+        # 'queued' records as failed BEFORE the executor can start and
+        # BEFORE any active_job_count() read in the window — the guard
+        # (gui.py active_job_count() > 0) then sees a clean registry on
+        # a fresh start, never the previous session's leftovers (Eric's
+        # 12:43 CST repro; see sweep_orphans' docstring for why the
+        # stdio server must NOT do this — its queued jobs resume).
+        self.services = build_services(state_dir, gui_startup=True)
         self._owns_executor = start_executor
         if start_executor:
             self.services.executor.start()

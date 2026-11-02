@@ -19,6 +19,20 @@ server died mid-run — and marks them ``failed`` with the binding
 restart error. Honest, never silently "succeeded", never silently
 dropped. Queued jobs across a restart resume automatically (the
 executor picks them up).
+
+v0.4.15.1 (GUI startup sweep): the GUI's entry (``LocalBridgeClient``
+-> ``build_services(gui_startup=True)``) runs the sweep in startup
+mode, which ALSO fails stale 'queued' records. Rationale: the design's
+"queued jobs resume across a restart" is true when another PROCESS
+re-attaches (the stdio server's executor is about to run); at GUI
+startup the executor thread has not started, so queued records are
+every bit as orphaned as running ones — yet ``active_job_count()``
+(counts queued+running) then blocks every guarded click (Eric's
+2026-11-02 12:43 CST repro: fresh start, empty table, GPU idle, and
+Clear popped "Wait for the current upscale…" because stale records
+from a crashed session still read as active). Swept records become
+visible failed history rows (honest, never dropped); the stdio MCP
+server keeps the §6 semantics (queued resumes) unchanged.
 """
 
 from __future__ import annotations
@@ -36,6 +50,7 @@ __all__ = [
     "JobRecord",
     "Registry",
     "RESTART_ERROR",
+    "STARTUP_SWEEP_ERROR",
     "VALID_TRANSITIONS",
     "BATCH_CANCELLED_ERROR",
 ]
@@ -44,6 +59,13 @@ JOBS_FILENAME = "jobs.json"
 
 RESTART_ERROR = (
     "server restarted during run; outcome unknown, see log"
+)
+
+# v0.4.15.1: the error string stamped on records the GUI's STARTUP
+# sweep closes (registry's own vocabulary, self-explanatory history
+# rows: "stale job from previous session").
+STARTUP_SWEEP_ERROR = (
+    "stale job from previous session (startup sweep)"
 )
 
 # Allowed state machine (mcp-bridge.md Section 5.4), enforced in the
@@ -537,17 +559,55 @@ class Registry:
 
     # -- restart semantics ---------------------------------------------------
 
-    def sweep_orphans(self) -> list[JobRecord]:
+    def sweep_orphans(
+        self,
+        *,
+        error: str = RESTART_ERROR,
+        include_queued: bool = False,
+    ) -> list[JobRecord]:
         """The Section-6 restart rule: jobs in ``running`` state with no
         live thread owner are the previous server's corpses. They are
-        marked ``failed`` with the binding restart error — never
-        silently "succeeded", never silently dropped."""
+        marked ``failed`` with ``error`` (default: the binding restart
+        error) — never silently "succeeded", never silently dropped.
+
+        v0.4.15.1 (startup mode, ``include_queued=True``): 'queued'
+        records are swept too, with ``error=STARTUP_SWEEP_ERROR`` as
+        the GUI passes. Justification: at GUI startup the executor
+        thread has not started, so a queued record is exactly as
+        orphaned as a running one — and unlike the stdio server (whose
+        executor starts seconds later and honestly RESUMES §6's queued
+        jobs), the GUI counts queued+running as active and blocks
+        every guarded interaction. Swept records stay in the registry
+        as failed history rows (honest, never dropped).
+
+        The queued close is a documented state-machine write (a
+        privileged bookkeeping close, not a normal transition):
+        'queued -> failed' is refused by ``VALID_TRANSITIONS`` (only a
+        live owner may move a queued job to running, and the queued
+        close paths go through cancel), so the sweep stamps
+        ``state/ok/error/finished_at/last_activity_at`` directly and
+        deliberately does NOT fabricate ``started_at`` — the job never
+        started (same honesty shape as a §3.4 batch-cancelled record,
+        with "failed" naming the restart's outcome-unknown instead of
+        the user's cancel). Idempotent: terminal records are never
+        re-swept, so a second run over a swept registry finds nothing.
+        """
         swept: list[JobRecord] = []
+        now = time.time()
         for record in list(self._jobs.values()):
             if record.state == "running":
-                record.error = RESTART_ERROR
+                record.error = error
                 record.ok = False
                 self.transition(record, "failed")  # running -> failed is legal
+                swept.append(record)
+            elif include_queued and record.state == "queued":
+                # Privileged startup close (see docstring): stamp and
+                # persist; no fabricated started_at.
+                record.state = "failed"
+                record.ok = False
+                record.error = error
+                record.finished_at = now
+                record.last_activity_at = now
                 swept.append(record)
         if swept:
             self.save()
