@@ -2,6 +2,19 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.15.1] - 2026-11-02
+
+### Fixed
+
+- **'Add Subtitles…' false "batch running" block**: the guard blocked the
+  picker whenever the window held batch ids even with nothing running
+  (planned-but-not-started files read as an active batch). The planned-files
+  state is not a batch — standalone subtitles are independent of the upscale
+  batch slate, so the picker now opens any time; a dialog appears only when a
+  live subtitles job over the SAME file would collide, and picked files append
+  cleanly while an upscale batch is still running (the serial executor orders
+  everything).
+
 ## [0.4.15] - 2026-11-02
 
 ### Added

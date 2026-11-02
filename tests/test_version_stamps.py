@@ -57,6 +57,20 @@ def _version_info_tuple(name: str) -> tuple[int, int, int, int]:
     return tuple(int(p) for p in parts)
 
 
+def _expected_version_tuple() -> tuple[int, int, int, int]:
+    """The 4-part byte tuple __version__ must stamp into version_info.txt.
+
+    3-part versions (x.y.z) pad with a trailing 0 (the v0.4.12 rule).
+    4-part hotfix versions (x.y.z.w — first: 0.4.15.1) map as-is."""
+    parts = [int(part) for part in vidlift.__version__.split(".")]
+    if len(parts) == 3:
+        parts.append(0)
+    assert len(parts) == 4, (
+        f"__version__ {vidlift.__version__!r} does not carry 3 or 4 parts"
+    )
+    return tuple(parts)
+
+
 def test_pyproject_version_matches_package_version():
     assert _pyproject_version() == vidlift.__version__, (
         "pyproject.toml version drifted from vidlift/__init__.py __version__"
@@ -80,7 +94,7 @@ def test_version_info_filevers_tuple_matches_package_version():
     must carry the package version — the tuple is what Explorer and the
     CLI smoke gate actually read off the built binary."""
     filevers = _version_info_tuple("filevers")
-    expected = tuple(int(part) for part in vidlift.__version__.split(".")) + (0,)
+    expected = _expected_version_tuple()
     assert len(expected) == 4
     assert filevers == expected, (
         f"filevers {filevers} drifted from __version__ {vidlift.__version__}"
@@ -89,7 +103,7 @@ def test_version_info_filevers_tuple_matches_package_version():
 
 def test_version_info_prodvers_tuple_matches_package_version():
     prodvers = _version_info_tuple("prodvers")
-    expected = tuple(int(part) for part in vidlift.__version__.split(".")) + (0,)
+    expected = _expected_version_tuple()
     assert len(expected) == 4
     assert prodvers == expected, (
         f"prodvers {prodvers} drifted from __version__ {vidlift.__version__}"

@@ -1149,6 +1149,43 @@ class MainWindow(QMainWindow):
             )
         return rows
 
+    @staticmethod
+    def _active_subs_paths(running: list, queued: list) -> frozenset[str]:
+        """v0.4.15.1: the LIVE standalone-subs conflict set — the source
+        paths of every queued/running ``subs`` job in the registry's
+        snapshot views (client.queue_views()). ONLY live subs jobs
+        conflict: an upscale job's paths are irrelevant to the subs
+        picker (Bob's v0.4.15.1 decision — Mode B is independent of the
+        upscale batch slate; the serial executor serializes everything
+        anyway), and a window-owned stale id list is not live work (the
+        Eric false-positive class this release fixes)."""
+        records = [r for r in [*running, *queued] if getattr(r, "kind", None) == "subs"]
+        return frozenset(
+            str(path)
+            for record in records
+            for path in (getattr(record, "paths", None) or [])
+        )
+
+    @staticmethod
+    def _live_window_ids(job_ids: list[str], client) -> list[str]:
+        """v0.4.15.1: window-owned ids still worth tracking — snapshot-
+        provable LIVE work or an unknown-state id (conservative keep:
+        the pre-0.4.15.1 poll drain treats unknown ids as active). An
+        id the registry reports TERMINAL leaves the window list (the
+        stale-Eric false-positive class; the poll drain also drops
+        these every tick)."""
+        live: list[str] = []
+        for job_id in job_ids:
+            try:
+                snapshot = client.status_snapshot(job_id)
+            except Exception:
+                snapshot = None
+            if snapshot is None or snapshot.get("state") not in (
+                "succeeded", "failed", "cancelled",
+            ):
+                live.append(str(job_id))
+        return live
+
     def choose_subs_files(self) -> None:
         """v0.4.14 (Mode B, Eric's reach): the GUI entry for standalone
         subtitles — pick EXISTING videos at ANY resolution, enqueue one
@@ -1157,13 +1194,18 @@ class MainWindow(QMainWindow):
         render through the shared slate + table machinery (rows keyed
         by _batch_row_for_job; Cancel Current/Cancel Batch ride the
         v0.4.13 cancel paths unchanged). No plan, no upscale pass, no
-        engine/profile lock: the video streams are copied verbatim."""
-        if self.client.active_job_count() > 0 or self.job_ids:
-            QMessageBox.information(
-                self, "VidLift",
-                "Wait for the current batch to finish or cancel it first.",
-            )
-            return
+        engine/profile lock: the video streams are copied verbatim.
+
+        v0.4.15.1 (the Eric guard fix): standalone subs mode is
+        INDEPENDENT of the upscale batch slate (Bob's decision) — no
+        blanket guard, and the window's own id list is NOT live work.
+        The picker always opens; a block dialog fires ONLY for a real
+        conflict, a live (queued/running) subs job over the SAME source
+        file (the run-side never-overwritten gate, subs_job.py, made
+        visible pre-flight). Picked files append into the live batch
+        slate when one is running; the executor serializes all job
+        kinds, so a subs enqueue can never contend with the running
+        encode's worker."""
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Choose videos to add subtitles to",
@@ -1173,14 +1215,53 @@ class MainWindow(QMainWindow):
         paths = [str(path) for path in paths if str(path)]
         if not paths:
             return
+        # v0.4.15.1: the ONLY blocking condition — a live subs job over
+        # the same source. Pure read over queue_views(); a client
+        # without that surface (older scripted harnesses) yields no
+        # conflict info and never blocks — independence-first, the
+        # fail-open direction (the registry-side never-overwrite gate
+        # at subs_job.py still holds the ground truth).
+        live_subs_paths: frozenset[str] = frozenset()
         try:
-            self.job_ids = self.client.enqueue_subs(paths)
+            running, queued = self.client.queue_views()
+        except AttributeError:
+            running, queued = [], []
+        live_subs_paths = self._active_subs_paths(running or [], queued or [])
+        conflicts = [path for path in paths if path in live_subs_paths]
+        if conflicts:
+            shown = ", ".join(Path(path).name for path in conflicts[:5])
+            more = f" (+{len(conflicts) - 5} more)" if len(conflicts) > 5 else ""
+            QMessageBox.information(
+                self, "VidLift",
+                "Wait for the current batch to finish or cancel it first.\n"
+                f"Already queued for subtitles: {shown}{more}",
+            )
+            return
+        pending_ids: list[str] | None = None
+        if self.job_ids:
+            pending_ids = list(self.job_ids)
+        try:
+            fresh_ids = self.client.enqueue_subs(paths)
         except (BatchTooLarge, FileNotFoundError, BridgeError) as exc:
             QMessageBox.warning(self, "VidLift", str(exc))
-            self.job_ids = []
+            if pending_ids is not None:
+                # the live batch's ids survive untouched — only stale
+                # (unknown/terminal) window ids are dropped
+                self.job_ids = MainWindow._live_window_ids(pending_ids, self.client)
+            else:
+                self.job_ids = []
             return
-        if not self.job_ids:
+        if not fresh_ids:
+            if pending_ids is not None:
+                self.job_ids = pending_ids
             return
+        # v0.4.15.1: the window tracks ENQUEUED-BY-THIS-WINDOW ids with
+        # a LIVE (non-terminal, snapshot-provable) state — stale ids
+        # (the Eric false-positive class) are dropped from tracking, a
+        # concurrent submission EXTENDS the live list, and the poll
+        # loop keeps draining terminal ids per tick.
+        live_pending = MainWindow._live_window_ids(pending_ids or [], self.client)
+        self.job_ids = live_pending + [str(job_id) for job_id in fresh_ids]
         # v0.4.14 (Mode B): a subs batch reuses the SHARED table — its
         # rows append after any prior batch's rows (the table is the
         # window's batch view; an old batch's terminal rows stay
@@ -1198,10 +1279,29 @@ class MainWindow(QMainWindow):
         # the upscale flow gets; a prior batch's structures can never
         # alias into this one (_begin_job_slate rewrites ALL of them).
         # Subs rows APPEND: the row map shifts by the existing row count.
-        self._reset_batch_progress()
-        self._begin_job_slate(self.job_ids, row_offset=seed)
+        # v0.4.15.1: when an upscale slate is LIVE the bootstrap extends
+        # it (below) — a reset here would orphan the running batch.
+        if pending_ids is not None and self._batch_slots:
+            live = self._batch_slots
+            fresh = [job_id for job_id in self.job_ids if job_id not in live]
+            self._batch_slots = live + fresh
+            self._batch_slot_index = {
+                job_id: index for index, job_id in enumerate(self._batch_slots)
+            }
+            self.run_total = len(self._batch_slots)
+            self.run_counts = (self.run_counts or [None] * len(live)) + [
+                None
+            ] * len(fresh)
+            for index, job_id in enumerate(fresh):
+                self._batch_row_for_job[job_id] = len(live) + index
+            self.run_summary = summarize_batch(self.run_counts)
+        else:
+            self._reset_batch_progress()
+            self._begin_job_slate(self.job_ids, row_offset=seed)
         self._set_summary(
-            f"{len(self.job_ids)} queued for subtitles",
+            f"{len(self._batch_slots)} queued for subtitles"
+            if pending_ids is not None
+            else f"{len(self.job_ids)} queued for subtitles",
             "Transcribing audio and soft-muxing subtitles (no upscale).",
         )
 
