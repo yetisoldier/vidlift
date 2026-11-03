@@ -130,3 +130,43 @@ def test_server_info_version_matches_package_version():
         "the MCP serverInfo version drifted from vidlift.__version__"
     )
     assert SERVER_INFO["name"] == "vidlift"
+
+
+# ---------------------------------------------------------------------------
+# v0.4.15.4 (CI derivation): the build workflow derives, never stamps
+# ---------------------------------------------------------------------------
+
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-windows-installer.yml"
+
+
+def test_workflow_has_no_version_literals():
+    """The Windows build workflow's version derives from
+    ``$env:VIDLIFT_VERSION`` (written from pyproject at the stamp step,
+    strictly before every use) — a version LITERAL in the workflow is
+    the drift class that cost two releases (0.4.15.2's stale-0.4.15.1
+    literals; 0.4.15.3's retarget). Bob's findall-equals-[] regex was
+    pre-adjusted per his sanctioned escape hatch: this file
+    legitimately hosts dotted THREE-part TOOL pins (Real-ESRGAN 0.2.0
+    download URLs, SubtitleEdit 5.2.0, tessdata 4.1.0, av==14.2.0) —
+    the release shape 4-part tuple (x.y.z.w) and any vidlift-named
+    version composite is what the gate forbids. A future legit 4-part
+    tool pin would fail here and require a documented, reviewed
+    regex adjustment — that's the gate doing its job."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    all_dotted = re.findall(r"\d+\.\d+\.\d+(?:\.\d+)?", text)
+    release_shaped = [stamp for stamp in all_dotted if stamp.count(".") == 3]
+    assert release_shaped == [], (
+        f"4-part version literal(s) in the build workflow: "
+        f"{release_shaped} — derive from $env:VIDLIFT_VERSION instead "
+        "(bump the version files, never the workflow)"
+    )
+    # the smoke-string/name/path shapes (e.g. "vidlift 0.4.15.x",
+    # "vidlift-0.4.15.x-windows-installer", "VidLift-0.4.15.x-Windows")
+    # even as 3-part stamps — the two past drift instances' shapes.
+    named = re.findall(
+        r"[Vv]id[Ll]ift[ -]\d+\.\d+\.\d+(?:\.\d+)?", text
+    )
+    assert named == [], (
+        f"vidlift-named version literal(s) in the build workflow: "
+        f"{named} — derive from $env:VIDLIFT_VERSION instead"
+    )

@@ -13,6 +13,17 @@ Private repo, so LAN monitoring ships ON by default (the sibling's
 v0.1.3+ call): the read-only API binds 0.0.0.0:8765 with the baked
 token. Rotate MONITOR_TOKEN_DEFAULT if this repo's visibility ever
 changes.
+
+v0.4.15.4 (F-15, the deferred halves — explicit revisit criteria): the
+constant-time token compare shipped; the bind default (0.0.0.0 →
+localhost) and per-install token generation stay DEFERRED — flipping
+the bind silently breaks the LAN-watch workflow on upgrade; per-install
+tokens need a pairing/UX design (the watching client must learn the
+token). REVISIT when: this repo's visibility changes; a wide-audience
+packaged ship happens; any write-capable monitor endpoint is ever
+proposed (structurally impossible today — adding one would reopen the
+file); or Eric makes the product call. Rotation-by-release remains the
+documented interim.
 """
 
 from __future__ import annotations

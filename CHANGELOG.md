@@ -2,6 +2,109 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.15.4] - 2026-11-03
+
+### Fixed
+
+- **Overall queue bar inflated then receded at job boundaries** (N-1,
+  Medium): v0.4.15.3's measured-floor honesty regressed at the NEXT
+  scale — when job N resolved, its final measured fraction (usually
+  1.0) rode into job N+1's probe window, rendering the whole batch
+  100% before visibly receding at the first measured tick. A resolving
+  job now RETIRES its measured floor (guarded on the empty slot, so a
+  delivered-twice terminal snapshot never resets a live job's truth).
+- **Busy label missed the plan phase** (N-2, Low): the phase-keyed
+  busy map lacked `plan` (run.py's real PHASE_PLAN — it fell back to
+  the generic "estimating ...") and carried the dead `finalize` key no
+  writer emits. The map is now structurally pinned to the emitted
+  phase set, so a future phase addition fails the suite instead of
+  silently falling back.
+- **Test-file hygiene** (N-3, info): both byte-verified newline-less
+  files end with a newline; the real-ffmpeg integration file carries
+  the `slow` mark its name advertises; the marker is registered in
+  pyproject (the 3 standing PytestUnknownMarkWarnings are dead; test
+  selection is unchanged — the canonical invocation has no `-m`
+  filter).
+- **Registry cancel lied "not-found" across processes** (F-7): a
+  second process's queued/running job is file-visible but invisible to
+  a stale in-memory view. `cancel()` converges on the file's truth
+  before reading (v0.4.15.3's converge machinery, one extra stat);
+  `cancel_batch()` gets the identical converge inside its lock hold.
+- **Missing ffprobe tracebacked the probe/plan CLI** (F-8):
+  `probe_file` converts the subprocess layer's raw `FileNotFoundError`
+  into its documented contract error — `ProbeError` naming the binary
+  — so every consumer gets the honest named failure.
+- **MCP serverInfo version stamp drifted, ungated** (F-9): the
+  hand-stamped `"0.2.0"` literal is gone — `SERVER_INFO` derives from
+  the package `__version__`, and the version-stamp suite pins the
+  derivation.
+- **Language detection decoded the whole file** (F-10): the detect
+  pass consumes ~30 s of features but decoded entire 4 h sources
+  (~1 GB of RAM). The new bounded-prefix decode (`DETECT_AUDIO_SECONDS`
+  = 120 s, sample-exact against faster-whisper's resample chain) makes
+  detection's memory a constant, asserted structurally.
+- **Model-cache edges stranded debris / returned broken dirs** (F-11):
+  a failed or interrupted fetch (including KeyboardInterrupt) always
+  removes its `.part.tmp` staging file, and a `.complete` marker
+  WITHOUT `model.bin` no longer short-circuits — resolution re-enters
+  the size/sha-verified fetch path instead of returning a dir that
+  fails engine construction with a confusing error.
+- **Dead code swept** (F-12): seven grep-verified dead sites removed
+  (`align_verify_cues`'s never-read `covering` list,
+  `MAX_EXTRACT_SECONDS`, `STALE_AFTER_HEARTBEATS`, plan.py's
+  `if False else`, run.py's no-op reason reassignment and dead
+  `claimed_by` reassignment, subs_job.py's import-then-del pair) —
+  zero functional change; pre-delete greps confirmed no test
+  references any removed symbol.
+- **Drop path skipped the file cap** (F-13a): the folder picker capped
+  at 500 files; drag-and-drop accepted unbounded. The drop enforces
+  the same cap with the same visible modal naming the limit.
+- **Enqueue write failures could crash the GUI** (F-13b): a full or
+  read-only state dir raises `OSError` from the `jobs.json` write —
+  both enqueue paths (Start Upscale and Add Subtitles) now catch it
+  and show the honest dialog ("could not record the batch: ...")
+  instead of the exception escaping the Qt slot (the documented
+  crash-abort class on frozen builds).
+- **"Cancel Current" killed queued work** (F-13c): the old enable rule
+  (active count > 0) counted QUEUED jobs, so a queued-only batch made
+  the button clickable — and the click permanently converted the next
+  queued job to cancelled, every word of the tooltip false. The
+  window now tracks the actually-running job id; the button is enabled
+  iff THIS window owns a running job and cancels only that job; the
+  tooltip says exactly that (queued clearing remains Cancel Batch's
+  documented surface, with its confirm dialog).
+- **CLI had no headless transcription off switch** (F-14a): `run` and
+  `plan` both accept `--no-transcribe`, threading through the
+  absent-defaults rule (absent → config default; flag → explicit
+  False) — plan renders the same truth a `run --no-transcribe`
+  performs.
+- **Plan hardcoded the transcription model** (F-14b): the literal
+  `"medium"` silently defeated the config constant; plans now derive
+  the model from `TRANSCRIPTION_MODEL_DEFAULT` (pinned by a
+  derivation test, not a literal test).
+
+### Security
+
+- **Monitor token compare is constant-time** (F-15, partial):
+  `hmac.compare_digest` on both token paths (Bearer header, query
+  param) — behavior byte-identical. The DEFERRED halves and their
+  revisit criteria: flipping the bind default (0.0.0.0 → localhost)
+  would silently break the documented LAN-watch workflow on upgrade,
+  and per-install token generation needs a pairing/UX design; revisit
+  when repo visibility changes, a wide-audience packaged ship happens,
+  any write-capable monitor endpoint is ever proposed, or Eric calls
+  it. Rotation-by-release remains the documented interim.
+
+### CI
+
+- **The Windows build workflow derives its version** rather than
+  retargeting stamps: all five version literals now derive from
+  `$env:VIDLIFT_VERSION` (written from pyproject before every use) —
+  the drift class that cost two releases (0.4.15.2's stale literals,
+  0.4.15.3's retarget) is dead; a repo-side gate structurally forbids
+  version literals in the workflow, so a bump touches exactly four
+  files (pyproject, `__init__`, version_info, CHANGELOG).
+
 ## [0.4.15.3] - 2026-11-02
 
 ### Fixed
