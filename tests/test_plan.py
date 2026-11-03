@@ -248,3 +248,48 @@ def test_b22_expectation_strings_stable_across_all_source_classes():
         plan_mod._expectation(report_h264)
         == "likely modest improvement; inspect the sample before a full run"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.4.15.4 (F-14b): the plan's transcription model derives from config
+# ---------------------------------------------------------------------------
+
+
+def _transcribed_candidate_report():
+    """A candidate report with NO subtitle tracks: the transcribed
+    seam is the only selection (subtitles=[] — report_for hardcodes a
+    carried srt track otherwise)."""
+    report = report_for(path="/media/Movie.avi")
+    report.subtitles = []
+    return report
+
+
+@pytest.mark.usefixtures("transcription_engine_on")
+def test_transcription_model_tracks_the_config_constant(monkeypatch):
+    """The derivation pin, not a literal pin: patching the config
+    constant must change a freshly built plan's model — impossible
+    while the hardcoded 'medium' literal stood."""
+    import vidlift.config
+
+    monkeypatch.setattr(
+        vidlift.config, "TRANSCRIPTION_MODEL_DEFAULT", "large-v3"
+    )
+    plan = build_file_plan(
+        _transcribed_candidate_report(), transcription_enabled=True
+    )
+    assert plan.transcription is not None
+    assert plan.transcription["model"] == "large-v3"
+
+
+@pytest.mark.usefixtures("transcription_engine_on")
+def test_transcription_model_default_arm_is_the_config_constant():
+    """The default arm asserts identity with the config constant — the
+    resolved plan model IS the shipped default, sourced from ONE
+    place."""
+    from vidlift.config import TRANSCRIPTION_MODEL_DEFAULT
+
+    plan = build_file_plan(
+        _transcribed_candidate_report(), transcription_enabled=True
+    )
+    assert plan.transcription is not None
+    assert plan.transcription["model"] == TRANSCRIPTION_MODEL_DEFAULT

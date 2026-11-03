@@ -423,8 +423,12 @@ def build_file_plan(
         raise PlanError("gb_per_hour must be greater than zero")
     if report.video is None:
         raise PlanError("cannot plan a file with no video stream")
-    from .transcribe import (
+    # v0.4.15.4 (F-14b): sourced from config — config owns the Mode A
+    # constants (transcribe re-exports the enabled half); the old
+    # hardcoded "medium" literal silently defeated the config constant.
+    from .config import (
         TRANSCRIPTION_ENABLED_DEFAULT,
+        TRANSCRIPTION_MODEL_DEFAULT,
     )
 
     if transcription_enabled is None:
@@ -438,7 +442,7 @@ def build_file_plan(
         and os.environ.get("VIDLIFT_TRANSCRIPTION_ENGINE", "") == "0"
     ):
         transcription_enabled = False
-    transcription_model = transcription_model or "medium"
+    transcription_model = transcription_model or TRANSCRIPTION_MODEL_DEFAULT
     transcription_device = transcription_device or "auto"
     transcription_language = transcription_language or ""
     width, height = output_geometry(report, target)

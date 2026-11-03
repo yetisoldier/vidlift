@@ -179,7 +179,14 @@ def _cmd_probe(files: list[str]) -> int:
     return 0
 
 
-def _cmd_plan(files: list[str], *, target: str, gbph: float, output_dir: str | None) -> int:
+def _cmd_plan(
+    files: list[str],
+    *,
+    target: str,
+    gbph: float,
+    output_dir: str | None,
+    no_transcribe: bool = False,
+) -> int:
     reports = []
     failures = 0
     for path in files:
@@ -191,7 +198,14 @@ def _cmd_plan(files: list[str], *, target: str, gbph: float, output_dir: str | N
     if reports:
         try:
             batch = build_batch_plan(
-                reports, target=target, gb_per_hour=gbph, output_dir=output_dir
+                reports,
+                target=target,
+                gb_per_hour=gbph,
+                output_dir=output_dir,
+                # v0.4.15.4 (F-14a): the headless off switch threads
+                # through the absent-defaults rule — None rides the
+                # config default, never a hardcoded read.
+                transcription_enabled=(False if no_transcribe else None),
             )
         except PlanError as exc:
             print(f"plan error: {exc}", file=sys.stderr)
@@ -228,6 +242,7 @@ def _cmd_run(
     upscale_profile: str = "live-action",
     resume: bool = False,
     denoise: str = "off",
+    no_transcribe: bool = False,
 ) -> int:
     """Drive one file through the runner and print its state.
 
@@ -253,6 +268,10 @@ def _cmd_run(
             replace_source=replace_source,
             profile=upscale_profile,
             resume=resume,
+            # v0.4.15.4 (F-14a): the headless off switch — None rides the
+            # config default (run.py's absent-defaults rule); False is
+            # the explicit CLI off.
+            transcription_enabled=(False if no_transcribe else None),
         )
     except (ProbeError, PlanError, RunError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -504,6 +523,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         help="directory for planned outputs (default: beside each input)",
     )
+    plan_parser.add_argument(
+        "--no-transcribe",
+        action="store_true",
+        help=(
+            "disable Mode A fallback transcription for this run "
+            "(default: enabled — config TRANSCRIPTION_ENABLED_DEFAULT)"
+        ),
+    )
     run_parser = sub.add_parser(
         "run", help="run one file end-to-end through the runner pipeline"
     )
@@ -589,6 +616,14 @@ def build_parser() -> argparse.ArgumentParser:
             "analog captures); leave off for clean DVD/Blu-ray rips — the upscale "
             "already softens grain, and denoising a clean source costs fine detail "
             "for no gain. Adds almost no time compared to the upscale itself."
+        ),
+    )
+    run_parser.add_argument(
+        "--no-transcribe",
+        action="store_true",
+        help=(
+            "disable Mode A fallback transcription for this run "
+            "(default: enabled — config TRANSCRIPTION_ENABLED_DEFAULT)"
         ),
     )
     run_parser.add_argument(
@@ -714,6 +749,7 @@ def main(argv: list[str] | None = None) -> int:
             target=args.target,
             gbph=args.gbph,
             output_dir=args.output_dir,
+            no_transcribe=args.no_transcribe,
         )
     if args.command == "run":
         return _cmd_run(
@@ -731,6 +767,7 @@ def main(argv: list[str] | None = None) -> int:
             upscale_profile=args.upscale_profile,
             resume=args.resume,
             denoise=args.denoise,
+            no_transcribe=args.no_transcribe,
         )
     if args.command == "subs":
         return _cmd_subs(

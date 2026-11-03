@@ -490,6 +490,10 @@ class _Seam:
     # v0.4.12: the row identity map the terminal writer keys on; seams
     # seed it per-test like a real batch (submission order).
     _batch_row_for_job = {}
+    # v0.4.15.4 (F-13c): the tracked running id the terminal writer
+    # clears on a matching terminal — a class-level default keeps the
+    # bare seam's reads defined (the real window carries it per-instance).
+    _running_job_id = None
 
 
 def _seam_with(run_total, rows=2):

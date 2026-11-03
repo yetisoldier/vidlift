@@ -168,6 +168,16 @@ class FakeClient:
             ids.append(record.job_id)
         return ids
 
+    def enqueue_subs(self, paths):
+        """The Mode B surface (v0.4.14): one subs job per picked file,
+        the pick order preserved."""
+        ids = []
+        for path in paths:
+            record = self.registry.enqueue(kind="subs", paths=[path], options={})
+            self.executor.notify_new_work()
+            ids.append(record.job_id)
+        return ids
+
     def status_snapshot(self, job_id):
         record = self.registry.get(job_id)
         if record is None:
@@ -416,6 +426,10 @@ def test_g4_cancel_via_registry_and_row_follows_state(window, tmp_path):
     window.start_upscale()
     job_id = window.job_ids[0]
     window.client.registry.require(job_id).state = "running"
+    # v0.4.15.4 (F-13c): the cancel targets the TRACKED running id —
+    # the claim edge is the running tick (the real journey: a running
+    # observed before the button could be clicked).
+    window._tick_elapsed()
     window.cancel_upscale()
     assert window.client.cancel_calls == [job_id]
     # The cancel disabled the button while the cancel is in flight.
@@ -453,6 +467,9 @@ def test_g6_close_event_cancels_and_waits(window, tmp_path, monkeypatch):
     window.start_upscale()
     job_id = window.job_ids[0]
     window.client.registry.require(job_id).state = "running"
+    # v0.4.15.4 (F-13c): the close's cancel targets the tracked id —
+    # the claim edge is the running tick.
+    window._tick_elapsed()
     from vidlift.gui import _CLOSE_WAIT_RUN_MS
 
     assert _CLOSE_WAIT_RUN_MS == 30000
@@ -844,6 +861,10 @@ class _StageHarness(QMainWindow):
         self._stage_eta = None
         self._stage_fraction = None
         self._stage_fraction_measured = 0.0
+        # v0.4.15.4 (F-13c): the tracked running id the consume method
+        # maintains (a class-level default keeps the bare harness's
+        # reads defined; the real window carries it per-instance).
+        self._running_job_id = None
         self.run_total = 1
         self.run_counts = [None]
         self._progress_chunk_color = None
@@ -1203,3 +1224,202 @@ def test_f6_render_batch_overrides_transcribed_note_when_checkbox_off(
     window.transcribe_subs.setChecked(True)
     window.render_batch(batch_plan_from([plan]))
     assert window.file_table.item(0, 6).text() == plan.subtitle_note
+
+
+# ---- v0.4.15.4 F-13: GUI robustness edges ----------------------------------
+
+
+def _make_drop_event(paths: list[str]):
+    """A real QDragEnterEvent-family drop: QMimeData URLs over
+    nonexistent local paths (the else arm appends them unsuffixed — no
+    tmp files needed). Returns ``(event, mime)`` — the caller MUST keep
+    the QMimeData alive for the dropEvent call's lifetime (Qt does not
+    own a hand-built event's data; a GC'd mime is a dangling
+    mimeData())."""
+    from PyQt6.QtCore import QMimeData, QPointF, Qt, QUrl
+    from PyQt6.QtGui import QDropEvent
+
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(path) for path in paths])
+    event = QDropEvent(
+        QPointF(1.0, 1.0),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    return event, mime
+
+
+def test_f13a_drop_event_enforces_max_files_cap(window, monkeypatch):
+    """F-13a: the drop path enforces the SAME MAX_FILES cap add_folder
+    enforces. 501 fake file URLs → the warning dialog fires naming the
+    limit and _add_paths is NEVER called (the asymmetry between the
+    folder picker and the drop is dead)."""
+    from PyQt6.QtWidgets import QMessageBox
+
+    dialogs: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        staticmethod(lambda *a, **k: dialogs.append(a[2] if len(a) > 2 else str(a))),
+    )
+    added: list[list[str]] = []
+    monkeypatch.setattr(
+        MainWindow, "_add_paths", lambda self, paths: added.append(list(paths))
+    )
+    paths = [f"/fake/drop-{i}.avi" for i in range(501)]
+    event, _mime = _make_drop_event(paths)
+    window.dropEvent(event)
+    assert added == [], "the 501-file drop must not reach the planner"
+    assert len(dialogs) == 1
+    assert "501" in dialogs[0] and "500" in dialogs[0]
+
+
+def test_f13a_drop_event_at_the_cap_boundary_passes(window, monkeypatch):
+    """The boundary pin: exactly MAX_FILES (500) drops normally — the
+    cap is >500, not >=500 (parity with add_folder's rule)."""
+    from PyQt6.QtWidgets import QMessageBox
+
+    dialogs: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", staticmethod(lambda *a, **k: dialogs.append(a))
+    )
+    added: list[list[str]] = []
+    monkeypatch.setattr(
+        MainWindow, "_add_paths", lambda self, paths: added.append(list(paths))
+    )
+    paths = [f"/fake/drop-{i}.avi" for i in range(500)]
+    event, _mime = _make_drop_event(paths)
+    window.dropEvent(event)
+    assert dialogs == []
+    assert added == [paths]
+
+
+def test_f13b_enqueue_run_oserror_dialogs_instead_of_escaping(
+    window, monkeypatch, tmp_path
+):
+    """F-13b: a full/read-only state dir raises OSError from the
+    enqueue's jobs.json write — the dialog is the boundary (the old
+    catch list missed OSError and the exception escaped the Qt slot:
+    the documented Eric crash-abort class). The wrapped text reads with
+    context, job_ids land empty, and the call returns."""
+    from PyQt6.QtWidgets import QMessageBox
+
+    dialogs: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", staticmethod(lambda *a, **k: dialogs.append(a[2]))
+    )
+
+    def exploding_enqueue(paths, options=None, engine="auto"):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(window.client, "enqueue_run", exploding_enqueue)
+    window.batch = batch_plan_from([_plan_for(tmp_path)])
+    window.start_upscale()  # must not raise
+    assert dialogs == [
+        "could not record the batch: [Errno 28] No space left on device"
+    ]
+    assert window.job_ids == []
+
+
+def test_f13b_enqueue_subs_oserror_dialogs_instead_of_escaping(
+    window, monkeypatch, tmp_path
+):
+    """F-13b on the Mode B path: the identical exposure and the
+    identical guard — the dialog fires and the empty-slate state
+    holds."""
+    from PyQt6.QtWidgets import QFileDialog, QMessageBox
+
+    dialogs: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", staticmethod(lambda *a, **k: dialogs.append(a[2]))
+    )
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        staticmethod(lambda *a, **k: ([str(tmp_path / "episode.mkv")], "")),
+    )
+
+    def exploding_enqueue_subs(paths):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(window.client, "enqueue_subs", exploding_enqueue_subs)
+    window.choose_subs_files()  # must not raise
+    assert dialogs == [
+        "could not record the batch: [Errno 28] No space left on device"
+    ]
+    assert window.job_ids == []
+
+
+# ---- v0.4.15.4 F-13c: "Cancel Current" means current -------------------------
+
+
+def test_f13c_cancel_button_stays_disabled_for_queued_only_batch(
+    window, tmp_path
+):
+    """Pin (a): a queued-only batch (the old rule's lie case) shows
+    Cancel Current DISABLED — a queued job has no 'current' to cancel;
+    Cancel Batch is the queue-clearing surface (still enabled)."""
+    plans = [_plan_for(tmp_path, "one.avi"), _plan_for(tmp_path, "two.avi")]
+    window.batch = batch_plan_from(plans)
+    window.render_batch(window.batch)
+    window.start_upscale()  # both queued; nothing claimed yet
+    assert window.cancel_button.isEnabled() is False
+    assert window.cancel_batch_button.isEnabled() is True
+    # cancelling a queued-only batch through the disabled button's slot
+    # is no-op-safe: no client.cancel call ever lands.
+    window.cancel_upscale()
+    assert window.client.cancel_calls == []
+
+
+def test_f13c_running_claim_enables_and_click_cancels_running_id_only(
+    window, tmp_path
+):
+    """Pin (b): the running claim edge ENABLES the button; the click
+    cancels EXACTLY the tracked running id — the queued sibling is
+    never passed to cancel."""
+    plans = [_plan_for(tmp_path, "one.avi"), _plan_for(tmp_path, "two.avi")]
+    window.batch = batch_plan_from(plans)
+    window.render_batch(window.batch)
+    window.start_upscale()
+    j1, j2 = list(window.job_ids)
+    reg = window.client.registry
+    r1 = reg.require(j1)
+    r1.state = "running"
+    r1.current_phase = "upscale"
+    window._tick_elapsed()
+    assert window._running_job_id == j1
+    assert window.cancel_button.isEnabled() is True
+    window.cancel_button.click()  # the real button path
+    assert window.client.cancel_calls == [j1]
+    assert j2 not in window.client.cancel_calls
+
+
+def test_f13c_running_job_terminal_reenables_nothing(window, tmp_path):
+    """Pin (c): the tracked running job's terminal DISABLES the button
+    again — its truth expired with it (nothing running right now)."""
+    plans = [_plan_for(tmp_path, "one.avi")]
+    window.batch = batch_plan_from(plans)
+    window.render_batch(window.batch)
+    window.start_upscale()
+    job_id = window.job_ids[0]
+    reg = window.client.registry
+    r1 = reg.require(job_id)
+    r1.state = "running"
+    window._tick_elapsed()
+    assert window.cancel_button.isEnabled() is True
+    r1.state = "cancelled"
+    window._tick_elapsed()
+    assert window._running_job_id is None
+    assert window.cancel_button.isEnabled() is False
+
+
+def test_f13c_cancel_current_tooltip_names_the_truth(window):
+    """Pin (d): the tooltip states the contract true by construction —
+    queued jobs stay queued, and Cancel Batch clears them."""
+    tooltip = window.cancel_button.toolTip()
+    assert tooltip == (
+        "Stop the running job safely; queued jobs stay queued "
+        "(use Cancel Batch to clear the queue)."
+    )

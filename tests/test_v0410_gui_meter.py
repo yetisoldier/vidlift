@@ -187,6 +187,9 @@ def test_all_cancelled_is_never_a_green_full_bar(qapp):
         _batch_slot_index: dict = {}
         # v0.4.12: the terminal writer keys the CELL on the batch row map.
         _batch_row_for_job: dict = {}
+        # v0.4.15.4 (F-13c): the tracked running id the terminal writer
+        # clears on a matching terminal (bare-seam class default).
+        _running_job_id = None
 
     window = _RenderSeam()
     window.run_total = 1
@@ -242,6 +245,9 @@ def test_terminal_snapshot_updates_counts_per_slot(qapp):
         _batch_slot_index: dict = {}
         # v0.4.12: the terminal writer keys the CELL on the batch row map.
         _batch_row_for_job: dict = {}
+        # v0.4.15.4 (F-13c): the tracked running id the terminal writer
+        # clears on a matching terminal (bare-seam class default).
+        _running_job_id = None
 
     window = _RenderSeam()
     window.run_total = 2

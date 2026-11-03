@@ -221,6 +221,10 @@ class _BarHarness(QMainWindow):
         # v0.4.15.3 (F-4): the measured-truth floor the overall bar's
         # monotonic rendering consults (bound method reads it).
         self._stage_fraction_measured = 0.0
+        # v0.4.15.4 (F-13c): the tracked running id the consume method
+        # maintains (a class-level default keeps the bare harness's
+        # reads defined; the real window carries it per-instance).
+        self._running_job_id = None
         self.run_total = 1
         self.run_counts = [None]
         self._progress_chunk_color = None

@@ -512,6 +512,12 @@ class MainWindow(QMainWindow):
         # current phase owns no fraction, so the bar is monotonic — it
         # never visibly RECEEDS at a phase change.
         self._stage_fraction_measured: float = 0.0
+        # v0.4.15.4 (F-13c): the ACTUALLY-running job id, tracked from
+        # the 1 Hz drain's running snapshots. "Cancel Current" keys on
+        # it — a queued-only batch has NO current job, and the old
+        # active_job_count() rule enabled the button over queued work
+        # its click would permanently kill.
+        self._running_job_id: str | None = None
 
         self.file_table = QTableWidget(0, 8)
         self.file_table.setHorizontalHeaderLabels(
@@ -663,7 +669,13 @@ class MainWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_upscale)
         self.cancel_button = QPushButton("Cancel Current")
         self.cancel_button.setEnabled(False)
-        self.cancel_button.setToolTip("Stop the running job safely; queued jobs stay queued.")
+        # v0.4.15.4 (F-13c): the tooltip is now true by construction —
+        # the button cancels ONLY the tracked running job; queued jobs
+        # are Cancel Batch's documented surface.
+        self.cancel_button.setToolTip(
+            "Stop the running job safely; queued jobs stay queued "
+            "(use Cancel Batch to clear the queue)."
+        )
         self.cancel_button.clicked.connect(self.cancel_upscale)
         # v0.4.13 (design §4.1): the batch-wide cancel — one action stops
         # the running job AND cancels every queued job in this batch
@@ -1293,8 +1305,17 @@ class MainWindow(QMainWindow):
             pending_ids = list(self.job_ids)
         try:
             fresh_ids = self.client.enqueue_subs(paths)
-        except (BatchTooLarge, FileNotFoundError, BridgeError) as exc:
-            QMessageBox.warning(self, "VidLift", str(exc))
+        except (
+            BatchTooLarge,
+            FileNotFoundError,
+            BridgeError,
+            OSError,
+        ) as exc:
+            # v0.4.15.4 (F-13b): the identical exposure on the Mode B
+            # enqueue path (same catch list, same crash-abort class).
+            QMessageBox.warning(
+                self, "VidLift", f"could not record the batch: {exc}"
+            )
             if pending_ids is not None:
                 # the live batch's ids survive untouched — only stale
                 # (unknown/terminal) window ids are dropped
@@ -1724,6 +1745,10 @@ class MainWindow(QMainWindow):
         # _follow_job_id=None so the FIRST claim is an identity edge.
         self._follow_mode = True
         self._follow_job_id = None
+        # v0.4.15.4 (F-13c): a new slate has no running job yet — the
+        # tracked id expires with the previous batch's truth (before
+        # this method's _sync_run_controls reads the rule).
+        self._running_job_id = None
         # v0.4.10 (R2): the batch bar restarts from a KNOWN color.
         self._progress_chunk_color = None
         self.progress.setRange(0, self.run_total)
@@ -1769,6 +1794,9 @@ class MainWindow(QMainWindow):
         self.run_counts = []
         self.run_total = 0
         self.run_summary = None
+        # v0.4.15.4 (F-13c): a fresh submission reseeds the run state —
+        # no running job belongs to the new slate yet.
+        self._running_job_id = None
 
     def start_upscale(self) -> None:
         if self.client.active_job_count() > 0 or self.job_ids:
@@ -1811,8 +1839,20 @@ class MainWindow(QMainWindow):
                 options=options,
                 engine=self.engine_choice,
             )
-        except (BatchTooLarge, FileNotFoundError, BridgeError) as exc:
-            QMessageBox.warning(self, "VidLift", str(exc))
+        except (
+            BatchTooLarge,
+            FileNotFoundError,
+            BridgeError,
+            OSError,
+        ) as exc:
+            # v0.4.15.4 (F-13b): the enqueue writes jobs.json — a full or
+            # read-only state dir raises OSError, which used to escape
+            # the Qt slot (the documented crash-abort class on frozen
+            # builds). The client's contract intentionally surfaces IO
+            # as IO; this slot is the boundary where a dialog exists.
+            QMessageBox.warning(
+                self, "VidLift", f"could not record the batch: {exc}"
+            )
             self.job_ids = []
             return
         self.engine_combo.setEnabled(False)
@@ -1829,15 +1869,18 @@ class MainWindow(QMainWindow):
         self._begin_job_slate(self.job_ids, row_offset=0)
 
     def cancel_upscale(self) -> None:
-        """The single cancel path (design §5): the registry's own
-        claim-time CancelFlag, exactly what an MCP agent's cancel flips."""
-        for job_id in self.job_ids:
-            result = self.client.cancel(job_id)
-            if result in ("cancelling", "cancelled"):
-                break
-        self.cancel_button.setEnabled(False)
-        self.stage_label.setText("Cancelling...")
-        self._set_summary("Cancelling", "Stopping the current file safely.")
+        """Cancel the RUNNING job only (v0.4.15.4, F-13c): 'Current'
+        means current — queued jobs are Cancel Batch's documented
+        surface; this button must never convert a queued job to
+        cancelled."""
+        job_id = self._running_job_id
+        if job_id is None:
+            return
+        result = self.client.cancel(job_id)
+        if result in ("cancelling", "cancelled"):
+            self.cancel_button.setEnabled(False)
+            self.stage_label.setText("Cancelling...")
+            self._set_summary("Cancelling", "Stopping the current file safely.")
 
     def cancel_batch_upscale(self) -> None:
         """The v0.4.13 batch-wide cancel (design §4.1): ONE client call —
@@ -1876,17 +1919,27 @@ class MainWindow(QMainWindow):
         )
 
     def _sync_run_controls(self) -> None:
-        active = self.client.active_job_count() > 0 and bool(self.job_ids)
-        self.cancel_button.setEnabled(active)
+        # v0.4.15.4 (F-13c): "Cancel Current" is enabled iff THIS window
+        # owns a RUNNING job (the tracked running id). The old
+        # active_job_count() rule counted QUEUED work — a queued-only
+        # batch enabled the button whose click permanently converted a
+        # queued job to cancelled: every word of the tooltip was false
+        # for exactly the case it described. Queued clearing is Cancel
+        # Batch's documented surface (below, §4.2, with its confirm
+        # dialog).
+        self.cancel_button.setEnabled(
+            self._running_job_id is not None and bool(self.job_ids)
+        )
         # v0.4.13 (design §4.2): Cancel Batch enabled iff this window
         # owns a live batch set — INCLUDING the idle-queue case (nothing
         # running right now, queued jobs remain): cancel_batch marks all
-        # queued and the batch drains. Independent of Cancel Current's
-        # rule (which additionally requires an active count); the
-        # asymmetry is honest — Cancel Current targets nothing when idle,
-        # Cancel Batch still has queued targets.
+        # queued and the batch drains.
         self.cancel_batch_button.setEnabled(bool(self.job_ids))
-        if active:
+        # v0.4.13: Start/Plan stay locked while the client still has
+        # live work (the enqueue-armed liveness truth); F-13c changed
+        # ONLY the cancel button's rule — this arm is the old active
+        # rule's surviving half, byte-identical.
+        if self.client.active_job_count() > 0 and bool(self.job_ids):
             self.start_button.setEnabled(False)
             self.plan_button.setEnabled(False)
         elif not self.job_ids:
@@ -1987,6 +2040,16 @@ class MainWindow(QMainWindow):
                     f"{Path(snapshot.get('file_path') or '?').name}: {state}"
                 )
         self.job_ids = still_active if still_active else []
+        # v0.4.15.4 (F-13c): "Cancel Current" re-syncs on the
+        # running-truth EDGE only (a claim enabled it / a terminal land
+        # disabled it) — never every tick. Reading the button's state
+        # keeps the bare consume methods resync-free (they are
+        # seam-bound in tests without the widget set).
+        running_truth = self._running_job_id is not None and bool(
+            self.job_ids
+        )
+        if self.cancel_button.isEnabled() != running_truth:
+            self._sync_run_controls()
         # v0.4.13 addendum ITEM 2 (§3.3-g): the follow logic lives HERE
         # (evented on poll data — a selection-side hook could never
         # distinguish a fresh claim from a stale read without this tick's
@@ -2057,6 +2120,18 @@ class MainWindow(QMainWindow):
         self._render_detail_for_row(rows[0].row())
 
     def _consume_running_snapshot(self, row: int | None, snapshot: dict, stage: str) -> None:
+        # v0.4.15.4 (F-13c): the window tracks the ACTUALLY-running job
+        # id — the 1 Hz drain delivers exactly these snapshots — so
+        # "Cancel Current" can mean CURRENT. Edge-keyed: a running tick
+        # with an unchanged id is a level, not a claim.
+        running_id = snapshot.get("job_id")
+        if (
+            snapshot.get("state") == "running"
+            and isinstance(running_id, str)
+            and running_id
+            and running_id != self._running_job_id
+        ):
+            self._running_job_id = running_id
         # §3b: the phase-change busy/reset keys on the stage's PHASE
         # FACTS (the label renders progress detail per tick — heartbeat
         # seconds tick inside one and the same stage — so comparing
@@ -2255,6 +2330,12 @@ class MainWindow(QMainWindow):
         if isinstance(job_id, str) and job_id in self._batch_row_for_job:
             row = self._batch_row_for_job[job_id]
         slot = self._batch_slot_for(job_id, row if row is not None else -1)
+        if job_id == self._running_job_id:
+            # v0.4.15.4 (F-13c): the tracked running job reached a
+            # terminal state — the button's truth expires with it
+            # (mid-batch until the next claim; batch-end sync below
+            # re-syncs regardless).
+            self._running_job_id = None
         if 0 <= slot < len(self.run_counts):
             if self.run_counts[slot] is None:
                 # v0.4.15.4 (N-1): a resolving job RETIRES its measured
@@ -2805,6 +2886,9 @@ class MainWindow(QMainWindow):
         # v0.4.15.3 (F-4): the batch is over — the measured floor goes
         # with it (a new batch must start its own monotonic truth).
         self._stage_fraction_measured = 0.0
+        # v0.4.15.4 (F-13c): the batch is over — no tracked running job
+        # survives a finished batch (the button's truth with it).
+        self._running_job_id = None
         self.engine_combo.setEnabled(True)
         # v0.4.8 (D5): re-enable the profile combo with its honest tooltip.
         self.profile_combo.setEnabled(True)
@@ -2892,6 +2976,17 @@ class MainWindow(QMainWindow):
                 )
             else:
                 expanded.append(str(candidate))
+        # v0.4.15.4 (F-13a): the drop path enforces the SAME MAX_FILES
+        # cap add_folder enforces — one batch-size policy, and the modal
+        # names the limit (a silent truncation would teach users to
+        # re-drop; the sibling's wording generalized to the drop case).
+        if len(expanded) > MAX_FILES:
+            QMessageBox.warning(
+                self,
+                "VidLift",
+                f"That drop holds {len(expanded)} videos; add at most {MAX_FILES} at once.",
+            )
+            return
         self._add_paths(expanded)
 
 
