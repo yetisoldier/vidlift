@@ -583,3 +583,38 @@ def test_queue_views_queued_then_running(client, tmp_path):
     assert [r.job_id for r in running] == [running_record.job_id]
     assert [r.job_id for r in queued] == [q1.job_id, q2.job_id]
     assert client.active_job_count() == 3
+
+
+# ---------------------------------------------------------------------------
+# v0.4.15.4 (F-15): the token compares are constant-time
+# ---------------------------------------------------------------------------
+
+
+def test_token_compare_routes_through_compare_digest(client, monkeypatch):
+    """The spy pin: BOTH token paths (the Bearer header and the
+    ``?token=`` query) route through ``hmac.compare_digest`` — kills the
+    regression class of someone 'simplifying' back to ``==``. Behavior
+    is byte-identical (right token 200 / wrong token 401 are the
+    existing behavioral pins beside this one)."""
+    import hmac as hmac_mod
+
+    _start(client, token="sekrit")
+    base = _base()
+    real = hmac_mod.compare_digest
+    calls: list[tuple[str, str]] = []
+
+    def spy(candidate: str, configured: str):
+        calls.append((str(candidate), str(configured)))
+        return real(candidate, configured)
+
+    monkeypatch.setattr(hmac_mod, "compare_digest", spy)
+
+    assert _get(base, "/status", token="sekrit")[0] == 200
+    assert _get(base, "/status?token=sekrit")[0] == 200
+    assert calls, "neither token path routed through compare_digest"
+    pairs = list(calls)
+    assert ("sekrit", "sekrit") in pairs, f"no honest pair compared: {pairs}"
+
+    # the hardened compare keeps the wrong-token truth exactly.
+    assert _get(base, "/status", token="wrong")[0] == 401
+    assert _get(base, "/status?token=wrong")[0] == 401

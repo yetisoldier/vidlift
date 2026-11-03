@@ -32,7 +32,12 @@ from vidlift.subs_job import mplex
 _FFMPEG = shutil.which("ffmpeg")
 _FPROBE = shutil.which("ffprobe")
 
+# v0.4.15.4 (N-3): the file honors the convention its name advertises —
+# real-ffmpeg integration marks `slow` (the marker is REGISTERED in
+# pyproject; the canonical suite invocation has no -m filter, so these
+# still run in every gate run, now warning-free).
 pytestmark = [
+    pytest.mark.slow,
     pytest.mark.skipif(_FFMPEG is None, reason="host ffmpeg required"),
     pytest.mark.skipif(_FPROBE is None, reason="host ffprobe required"),
 ]

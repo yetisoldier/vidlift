@@ -186,17 +186,31 @@ class _Handler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         """``Authorization: Bearer <token>`` OR ``?token=***`` query
         (sibling monitor.py:330-334); an empty configured token means
-        local-only open."""
+        local-only open.
+
+        v0.4.15.4 (F-15): constant-time compares (hmac.compare_digest).
+        The LAN monitor is read-only by construction and the baked-token
+        tradeoff is documented (config.py); the compare should still not
+        be a timing oracle — hardening that changes nothing else. The
+        deferred halves (bind default 0.0.0.0 → localhost, per-install
+        token generation) stay deferred with revisit criteria in the
+        CHANGELOG: repo visibility change, a wide-audience packaged
+        ship, any write-capable monitor endpoint, or Eric's call."""
+        import hmac
+
         token = getattr(self.server, "token", "")
         if not token:
             return True
         auth = self.headers.get("Authorization", "")
-        if auth == f"Bearer {token}":
+        if auth.startswith("Bearer ") and hmac.compare_digest(
+            auth[len("Bearer "):], token
+        ):
             return True
         from urllib.parse import parse_qs, urlparse
 
         q = parse_qs(urlparse(self.path).query)
-        return q.get("token", [""])[0] == token
+        candidate = q.get("token", [""])[0]
+        return bool(candidate) and hmac.compare_digest(candidate, token)
 
     def do_GET(self) -> None:  # noqa: N802 (http.server naming)
         path = self.path.split("?", 1)[0].rstrip("/")

@@ -23,3 +23,6 @@ include = ["vidlift"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: real-ffmpeg/engine integration tests (deselect with: -m 'not slow')",
+]
