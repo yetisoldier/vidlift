@@ -2,6 +2,14 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.16.1] - 2026-11-03
+
+### Fixed
+
+- **Fail-path propagation in the GUI**: failures during early phases (e.g. `probe` or `transcribe`) now correctly settle on every surface. The details panel, LIVE overlay, and both status bars now reflect the `failed` state immediately, ending stale "running" labels and busy animations.
+- **Failure reasons are surfaced**: the actual exception text (e.g. `{phase} command failed (exit N)`) is now carried to the user. This is implemented as an additive `error` key on history rows—round-tripping through the local client, MCP `tool_list`, and the HTTP `/history` pass-through. `api_version` remains 1; records persisted before this release load with `error: null`.
+- **Version-stamp fix**: resolved a drift where `packaging/version_info.txt` numeric tuples (`filevers` / `prodvers`) remained at `0.4.16.0` while string stamps and package metadata had moved to `0.4.16.1`. All stamps now agree.
+
 ## [0.4.16.0] - 2026-11-03
  
 ### Added

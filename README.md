@@ -211,6 +211,7 @@ In the main window, you can toggle **Enable subtitle OCR**. When enabled, VidLif
 | GPU probe failed or driver outdated | Outdated GPU driver | Update your NVIDIA/AMD drivers to the latest version. |
 | App crashes on start | Missing Vulkan runtime | Install the latest Vulkan SDK or GPU driver. |
 | Output size is too large | High bitrate setting | Check the "Plan" screen; try a different engine if available. |
+| A run appears stuck on "running" after it failed | Stale UI state (pre-v0.4.16.1) | Update to v0.4.16.1; failures now settle correctly on all surfaces and report the reason. |
 
 Full guide → [docs/usage.md#troubleshooting](docs/usage.md#troubleshooting)
 

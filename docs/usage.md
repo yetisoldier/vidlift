@@ -222,6 +222,14 @@ Check the latest log in **.vidlift-runs**. Heartbeat lines and a changing
 last-activity time indicate useful work. AI upscale and final verification can
 each take a long time.
 
+### The job shows running after it failed
+
+Fixed in v0.4.16.1. Earlier builds could leave the details panel, the LIVE
+overlay, and the status bars showing a stale running state after a run had
+already failed during an early phase such as `probe` or `transcribe`. Those
+surfaces now settle on `failed`, and the reason is reported in the details
+panel, the overlay, and the job history.
+
 ### Subtitles are missing
 
 Bitmap subtitle OCR is best effort. Inspect the manifest's **subtitles** block
