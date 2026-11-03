@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1235,7 +1236,11 @@ def _make_drop_event(paths: list[str]):
     tmp files needed). Returns ``(event, mime)`` — the caller MUST keep
     the QMimeData alive for the dropEvent call's lifetime (Qt does not
     own a hand-built event's data; a GC'd mime is a dangling
-    mimeData())."""
+    mimeData()).
+
+    The drop handler re-normalizes separators (QUrl → Path → str), so
+    ``paths`` MUST be built platform-natively via ``str(Path(...))`` —
+    a hardcoded POSIX literal mismatches on Windows."""
     from PyQt6.QtCore import QMimeData, QPointF, Qt, QUrl
     from PyQt6.QtGui import QDropEvent
 
@@ -1268,7 +1273,7 @@ def test_f13a_drop_event_enforces_max_files_cap(window, monkeypatch):
     monkeypatch.setattr(
         MainWindow, "_add_paths", lambda self, paths: added.append(list(paths))
     )
-    paths = [f"/fake/drop-{i}.avi" for i in range(501)]
+    paths = [str(Path("/fake") / f"drop-{i}.avi") for i in range(501)]
     event, _mime = _make_drop_event(paths)
     window.dropEvent(event)
     assert added == [], "the 501-file drop must not reach the planner"
@@ -1289,7 +1294,7 @@ def test_f13a_drop_event_at_the_cap_boundary_passes(window, monkeypatch):
     monkeypatch.setattr(
         MainWindow, "_add_paths", lambda self, paths: added.append(list(paths))
     )
-    paths = [f"/fake/drop-{i}.avi" for i in range(500)]
+    paths = [str(Path("/fake") / f"drop-{i}.avi") for i in range(500)]
     event, _mime = _make_drop_event(paths)
     window.dropEvent(event)
     assert dialogs == []
