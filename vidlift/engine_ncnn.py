@@ -2295,7 +2295,6 @@ class GpuPhaseLock:
     """
 
     HEARTBEAT_SECONDS = 10.0
-    STALE_AFTER_HEARTBEATS = 6  # ~60 s of silence = stale
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)

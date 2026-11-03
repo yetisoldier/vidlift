@@ -123,9 +123,6 @@ def run_subs_job(
     a pre-existing output FAILS the job (not-ready, the caller
     decides; run-side guard mirrors the plan-time collision gate).
     """
-    from .run import find_tools  # lazy: run.py is heavy
-
-    del find_tools  # (resolved ffmpeg/ffprobe come from the caller)
 
     def _step(name: str) -> None:
         if on_step is not None:

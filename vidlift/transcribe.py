@@ -198,13 +198,9 @@ class WhisperEngine(TranscribeEngine):
     def detect_language(
         self, audio_path: str, *, offset_seconds: float = 0.0
     ) -> LanguageGuess:
-        from faster_whisper.audio import decode_audio
-
-        audio = decode_audio(
-            audio_path, sampling_rate=16000, split_stereo=False
+        audio = _decode_audio_prefix(
+            audio_path, offset_seconds=offset_seconds
         )
-        if offset_seconds > 0:
-            audio = audio[int(offset_seconds * 16000) :]
         lang, confidence, _all_probs = self.model.detect_language(audio)
         return LanguageGuess(code=lang or "", confidence=float(confidence))
 
@@ -252,6 +248,67 @@ class WhisperEngine(TranscribeEngine):
             if on_segment is not None:
                 on_segment(segment)
         return out
+
+
+# ---- language-detect audio window (v0.4.15.4, F-10) --------------------------
+#
+# The docstring's promised bound, now enforced: faster-whisper's
+# detect consumes ~30 s of features from the wav; decoding the WHOLE
+# file spent ~1 GB of RAM on a 4 h source for a 30 s answer. 120 s is
+# ample headroom, never a quality gate. (The constant lives HERE, ahead
+# of its only consumer — the helper below binds it as a def-time
+# default — and is cross-referenced beside LANGUAGE_CONFIDENCE_FLOOR in
+# the language section, where the discipline constants cluster; the
+# language section owns the confidence docs, this section owns the
+# decode-window math.)
+DETECT_AUDIO_SECONDS = 120
+
+
+def _decode_audio_prefix(
+    audio_path: str,
+    *,
+    offset_seconds: float = 0.0,
+    limit_seconds: float = DETECT_AUDIO_SECONDS,
+    sampling_rate: int = 16000,
+):
+    """Bounded memory twin of faster_whisper.audio.decode_audio.
+
+    v0.4.15.4 (F-10): decode ONLY [offset, offset+limit) — a 4h source
+    must not spend ~1 GB of RAM for a 30s language answer. Mirrors
+    faster-whisper's resample chain (s16 mono @16k -> float32/32768)
+    with sample-precise early stop. Returns an np.float32 mono array.
+    Version-drift watch: the mirrored source is
+    ``faster_whisper.audio.decode_audio`` (faster-whisper >=1.2, av
+    14.2.0 — pyproject pins ``av<15``); the accounting behavior is
+    pinned in tests, so an av upgrade that changes the chain fails
+    there instead of silently drifting.
+    """
+    import av
+    import numpy as np
+
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16", layout="mono", rate=sampling_rate
+    )
+    start = int(offset_seconds * sampling_rate)
+    stop = start + int(limit_seconds * sampling_rate)
+    pcm = np.empty(0, dtype=np.int16)  # accumulated s16 mono samples
+    done = False
+    with av.open(audio_path, mode="r", metadata_errors="ignore") as container:
+        for frame in container.decode(audio=0):
+            for rframe in resampler.resample(frame):
+                block = np.asarray(rframe.to_ndarray()).reshape(-1)
+                pcm = np.concatenate([pcm, block.astype(np.int16, copy=False)])
+                if pcm.size >= stop:
+                    done = True
+                    break
+            if done:
+                break
+    if not done:  # flush the resampler tail on short files
+        for rframe in resampler.resample(None):
+            block = np.asarray(rframe.to_ndarray()).reshape(-1)
+            pcm = np.concatenate([pcm, block.astype(np.int16, copy=False)])
+    audio = pcm[start:stop].astype(np.float32) / 32768.0
+    return audio
 
 
 def _engine_disabled_by_env() -> bool:
@@ -770,8 +827,12 @@ def resolve_model_dir(
     cache = model_cache_dir(state_root)
     target = cache / tag
     marker = target / ".complete"
-    if marker.is_file():
+    if marker.is_file() and (target / "model.bin").is_file():
         return str(target)
+    # v0.4.15.4 (F-11): a marker WITHOUT model.bin is self-contradictory
+    # debris (killed mid-write or manual deletion) — fall through to the
+    # size/sha-verified re-fetch instead of returning a dir that fails
+    # engine construction with a confusing error.
     expected_sha = MODEL_SHA256.get(tag)
     if expected_sha is None:
         raise TranscriptionError(
@@ -835,14 +896,19 @@ def _default_fetcher() -> Callable:
                 with open(tmp, "wb") as fh:
                     shutil.copyfileobj(response, fh, 1024 * 1024)
             if size_hint is not None and tmp.stat().st_size != size_hint:
-                tmp.unlink(missing_ok=True)
                 raise TranscriptionError(
                     f"download of {target_path.name} was truncated "
                     f"({size_hint} bytes expected)"
                 )
-        finally:
-            pass
-        os.replace(tmp, target_path)
+            os.replace(tmp, target_path)
+        except BaseException:
+            # v0.4.15.4 (F-11): a failed/interrupted fetch must never
+            # strand the .part.tmp staging file (os.replace consumed
+            # the name on success, so this is failure-only cleanup).
+            # BaseException — not Exception — so KeyboardInterrupt and
+            # cancel-style control flow don't strand debris either.
+            tmp.unlink(missing_ok=True)
+            raise
 
     return fetch
 
@@ -942,6 +1008,9 @@ def resolve_transcription_device(requested: str) -> str:
 # ---- language (auto-detect + config pin; translation is a NON-GOAL) ----
 
 LANGUAGE_CONFIDENCE_FLOOR = 0.5
+# The detect-decode window bound lives beside the helper that enforces
+# it (_decode_audio_prefix, defined after the WhisperEngine class): the
+# engine detects on a bounded prefix, DETECT_AUDIO_SECONDS = 120.
 
 
 def detect_language(
@@ -954,7 +1023,8 @@ def detect_language(
 
     Returns ``(language_for_call, guess_or_None, warnings)``. A config
     pin wins outright (the design's `ko` / `zh-cn` / `en` discipline).
-    Otherwise the engine detects on the first 60-120 s of speech; below
+    Otherwise the engine detects on a bounded prefix (first 120 s;
+    DETECT_AUDIO_SECONDS); below
     the confidence floor the top guess PROCEEDS with a warning
     (fail-open discipline, never a refusal). ``guess`` is None when a
     pin made detection unnecessary.
@@ -1387,10 +1457,6 @@ def align_verify_cues(
     dropped = 0
     out: list[Cue] = []
     for cue in cues:
-        covering = [
-            seg for seg in segments
-            if seg.words and seg.start <= cue.start_ms / 1000 + 0.01
-        ]
         aligned = _aligned_bounds(cue, segments)
         if aligned is None:
             out.append(cue)
@@ -1526,9 +1592,6 @@ def build_audio_extract_command(
         "-c:a", "pcm_s16le",
         wav_path,
     ]
-
-
-MAX_EXTRACT_SECONDS = 4 * 3600  # sanity bound: a 4h wav is ~460 MB
 
 
 def transcribe_source_to_srt(

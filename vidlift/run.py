@@ -1416,7 +1416,7 @@ def find_claimable_scratch(
         except FileExistsError:
             continue
         except OSError:
-            claimed_by = None  # sentinel unavailable: degrade-open
+            pass  # sentinel unavailable: degrade-open (no claim marker)
         total = len(completed)
         return {
             "claimed_run_id": run_id,
@@ -1546,7 +1546,6 @@ def gc_stale_scratch(
             deleted.append(str(candidate))
         if deleted:
             decision["paths"] = deleted
-            decision["reason"] = decision["reason"]
             removed.append(decision)
             if log_line is not None:
                 log_line(

@@ -382,7 +382,7 @@ def _subtitle_note(
         skipped.append(f"{skipped_other} unknown stream(s) listed only")
     if skipped:
         parts.append("; " + ", ".join(skipped))
-    return ". ".join(parts) if False else "; ".join(parts)
+    return "; ".join(parts)
 
 
 def _process_verdict(report: FileReport) -> str:
