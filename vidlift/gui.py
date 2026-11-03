@@ -111,16 +111,23 @@ _BUSY_MEASURING_LABEL = "measuring — counting frames…"
 # (run.py merges progress dicts, so stale frame counters ride every
 # later phase's payload; the label must never say "measuring" — or a
 # bare "estimating" — for work that has its own name.)
+# v0.4.15.4 (N-2): key parity with the emitted phases — "plan"
+# (run.py's PHASE_PLAN, emitted for real) pulses its own label; the
+# dead "finalize" key is dropped (no writer emits it). "done" stays
+# out deliberately: terminal snapshots never busy-pulse. The parity is
+# pinned structurally (tests: the emitted-phase set asserts key-set
+# equality), so a future phase addition fails the suite instead of
+# silently falling back.
 _PHASE_BUSY_LABELS = {
     "upscale": _BUSY_MEASURING_LABEL,
     "probe": "probing ...",
+    "plan": "planning ...",
     "prepare": "preparing ...",
     "encode": "encoding ...",
     "verify": "verifying ...",
     "subtitles": "working subtitles ...",
     "transcribe": "transcribing audio ...",
     "subs-mux": "muxing subtitles ...",
-    "finalize": "finalizing ...",
 }
 
 # closeEvent budget (ms): the run worker gets the same 30 s ffmpeg
@@ -2249,6 +2256,17 @@ class MainWindow(QMainWindow):
             row = self._batch_row_for_job[job_id]
         slot = self._batch_slot_for(job_id, row if row is not None else -1)
         if 0 <= slot < len(self.run_counts):
+            if self.run_counts[slot] is None:
+                # v0.4.15.4 (N-1): a resolving job RETIRES its measured
+                # floor. The floor is the RUNNING job's last honest
+                # fraction; without this reset the finished job's 1.0
+                # rides into the next job's probe window and the
+                # overall bar inflates to (resolved+1)/total, then
+                # visibly RECEDES at the next job's first measured
+                # tick — the lie-class F-4 exists to kill (v0.4.15.3's
+                # floor fixed phase-change recede; this line closes the
+                # job-boundary recede the same design introduced).
+                self._stage_fraction_measured = 0.0
             self.run_counts[slot] = state
         self.run_summary = summarize_batch(self.run_counts)
         self._apply_batch_summary(self.run_summary)

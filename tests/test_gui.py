@@ -1025,6 +1025,162 @@ def test_f6_plan_batch_passes_transcribe_checkbox_to_builder(
     assert captured.get("transcription_enabled") is True
 
 
+# ---- v0.4.15.4 N-1: overall bar truth at job boundaries ----------------------
+
+
+def test_n1_overall_bar_never_inflates_or_recedes_at_job_boundary(
+    window, tmp_path
+):
+    """The N-1 regression, promoted: when job1 RESOLVES, its terminal
+    fill must retire the measured floor. Karen's 2-job evidence: after
+    job1's terminal fill, job2's first RUNNING tick (probe — no
+    fraction of its own) must render ~50% — NO inflation to 100% — and
+    the transition from job1's upscale end must NOT visibly recede.
+    Job2's first real measurement then renders strictly above the
+    probe value (the monotonic truth)."""
+    plans = [_plan_for(tmp_path, "one.avi"), _plan_for(tmp_path, "two.avi")]
+    window.batch = batch_plan_from(plans)
+    window.render_batch(window.batch)
+    window.start_upscale()
+    j1, j2 = list(window.job_ids)
+    reg = window.client.registry
+
+    # Job1 ends its upscale at the honest measured 100%: (0+1.0)/2 = 50%.
+    r1 = reg.require(j1)
+    r1.state = "running"
+    r1.current_phase = "upscale"
+    r1.progress = {"frames_done": 3600, "frames_total": 3600}
+    window._tick_elapsed()
+    end_value = window.overall_bar.bar.value()
+    assert end_value == pytest.approx(0.5 * 1000, rel=1e-3)
+
+    # Job1 resolves: the terminal fill retires the floor with it.
+    r1.state = "succeeded"
+    r1.ok = True
+    r1.finished_at = time.time()
+    window._tick_elapsed()
+    assert window.run_counts == ["succeeded", None]
+    assert window._stage_fraction_measured == 0.0
+
+    # Job2's first running tick is the PROBE (no fraction of its own):
+    # with the retired floor the overall bar holds (1+0.0)/2 ≈ 50%.
+    r2 = reg.require(j2)
+    r2.state = "running"
+    r2.current_phase = "probe"
+    window._tick_elapsed()
+    probe_value = window.overall_bar.bar.value()
+    probe_fraction = probe_value / 1000.0
+    assert probe_fraction <= 0.5 + 0.01, (  # ε: bar quantization headroom
+        "the overall bar INFLATED to the finished job's measured floor "
+        f"at the job boundary (N-1 lie: {probe_fraction})"
+    )
+    assert probe_value >= end_value, (
+        "the overall bar RECEDED at the job boundary (N-1 lie)"
+    )
+
+    # Job2's first real measurement: monotonic, strictly above the
+    # probe value (72/3600 = 2% → (1+0.02)/2 = 51%).
+    r2.current_phase = "upscale"
+    r2.progress = {"frames_done": 72, "frames_total": 3600}
+    window._tick_elapsed()
+    next_value = window.overall_bar.bar.value()
+    assert next_value > probe_value, (
+        "the overall bar receded at the first measured tick after the "
+        "job boundary (N-1 lie)"
+    )
+
+
+def test_n1_floor_reset_at_slot_fill_is_idempotent(window, tmp_path):
+    """The idempotence edge: a RE-delivered terminal snapshot (the same
+    job) must NOT reset anything mid-next-job — the guard keys on the
+    empty slot (`is None`), so once a slot is resolved the floor the
+    NEXT job earned survives the replay."""
+    plans = [_plan_for(tmp_path, "one.avi"), _plan_for(tmp_path, "two.avi")]
+    window.batch = batch_plan_from(plans)
+    window.render_batch(window.batch)
+    window.start_upscale()
+    j1, j2 = list(window.job_ids)
+    reg = window.client.registry
+
+    r1 = reg.require(j1)
+    r1.state = "running"
+    r1.current_phase = "upscale"
+    r1.progress = {"frames_done": 900, "frames_total": 3600}  # 25%
+    window._tick_elapsed()
+    assert window._stage_fraction_measured == pytest.approx(0.25)
+
+    r1.state = "succeeded"
+    r1.ok = True
+    r1.finished_at = time.time()
+    window._tick_elapsed()  # slot 0 fills; the floor retires with it
+    assert window.run_counts == ["succeeded", None]
+    assert window._stage_fraction_measured == 0.0
+
+    r2 = reg.require(j2)
+    r2.state = "running"
+    r2.current_phase = "upscale"
+    r2.progress = {"frames_done": 1800, "frames_total": 3600}  # 50%
+    window._tick_elapsed()
+    assert window._stage_fraction_measured == pytest.approx(0.5)
+
+    # Job1's terminal snapshot RE-delivered: slot 0 is already resolved
+    # — the guard (`is None`) must not fire, the floor must survive.
+    window._consume_terminal_snapshot(
+        0, {"job_id": j1, "state": "succeeded"}
+    )
+    assert window.run_counts == ["succeeded", None]
+    assert window._stage_fraction_measured == pytest.approx(0.5), (
+        "a re-delivered terminal snapshot reset the running job's "
+        "measured floor (N-1 idempotence edge)"
+    )
+
+
+# ---- v0.4.15.4 N-2: busy-label phase parity ----------------------------------
+
+
+def test_n2_busy_label_map_covers_every_emitted_phase():
+    """The map's keys cover EXACTLY the emitted phase set: run.py's
+    PHASE_* constants ∪ the two jobs.py Mode-B literals, minus "done"
+    (terminal snapshots never busy-pulse). A future phase ADDITION
+    fails this pin instead of silently falling back to
+    "estimating ...", and a dead key fails it too."""
+    from vidlift.run import (
+        PHASE_ENCODE,
+        PHASE_PLAN,
+        PHASE_PREPARE,
+        PHASE_PROBE,
+        PHASE_SUBTITLES,
+        PHASE_UPSCALE,
+        PHASE_VERIFY,
+    )
+
+    from vidlift.gui import _PHASE_BUSY_LABELS
+
+    emitted = {
+        PHASE_PROBE,
+        PHASE_PLAN,
+        PHASE_PREPARE,
+        PHASE_UPSCALE,
+        PHASE_ENCODE,
+        PHASE_VERIFY,
+        PHASE_SUBTITLES,
+        "subs-mux",  # jobs.py's Mode-B literal (set_live current_phase)
+        "transcribe",  # jobs.py's Mode-B literal
+        "done",  # emitted (terminal) — never busy-pulsed
+    }
+    assert set(_PHASE_BUSY_LABELS) == emitted - {"done"}
+    # the dead "finalize" key is gone — no writer emits it.
+    assert "finalize" not in _PHASE_BUSY_LABELS
+
+
+def test_n2_plan_phase_busy_label_is_named(qapp):
+    """The plan phase (run.py's PHASE_PLAN, emitted for real) pulses
+    its OWN busy label — no longer the generic 'estimating ...'."""
+    win = _StageHarness(qapp)
+    win.consume(_running_snap("plan", {}))
+    assert win.stage_bar.eta_label.text() == "planning ..."
+
+
 @pytest.mark.usefixtures("transcription_engine_on")
 def test_f6_render_batch_overrides_transcribed_note_when_checkbox_off(
     window, tmp_path
