@@ -146,6 +146,48 @@ def test_invalid_target_raises():
         output_geometry(report_for(), target="1080p")
 
 
+# ---- v0.4.15.3 F-6: the note never promises transcription the run won't do ---
+
+
+@pytest.mark.usefixtures("transcription_engine_on")
+def test_plan_note_and_selection_share_one_transcription_derivation():
+    """F-6 (Karen's F6a/F6b, promoted): with transcription DISABLED on
+    the no-subs fixture, subtitle_plan is None AND the note carries no
+    'transcribing' promise (the honest 'none'); with it ENABLED the
+    note still renders the transcribed disposition. The note and the
+    selection now share the resolved flag as ONE derivation input."""
+    # a report with NO subtitle streams and sidecars (the transcribed
+    # arm's precondition).
+    rep = classify(
+        parse_probe(
+            "movie.avi",
+            ffprobe_json(
+                format_name="avi",
+                video={
+                    "codec_name": "mpeg4",
+                    "width": 640,
+                    "height": 272,
+                    "sample_aspect_ratio": "1:1",
+                    "field_order": "progressive",
+                    "r_frame_rate": "25/1",
+                    "avg_frame_rate": "25/1",
+                },
+                audio=[{"codec_name": "aac", "channels": 2}],
+            ),
+        )
+    )
+
+    off = build_file_plan(rep, transcription_enabled=False)
+    assert off.subtitle_plan is None
+    assert "transcribing" not in off.subtitle_note
+    assert off.subtitle_note == "none"
+
+    on = build_file_plan(rep, transcription_enabled=True)
+    assert on.subtitle_plan is not None
+    assert on.subtitle_plan.source == "transcribed"
+    assert "transcribing" in on.subtitle_note
+
+
 # ---- v0.4.8 b22: plan expectations stay profile-agnostic (design D6) -------------
 
 

@@ -522,6 +522,59 @@ def test_subs_collision_blocked_row_never_overwrites(
     next(gen, None)
 
 
+def test_subs_rows_output_cell_uses_subs_output_path_for_every_extension(
+    qapp, monkeypatch, tmp_path
+):
+    """F-5 (v0.4.15.3): every row's Output cell is exactly
+    subs_output_path(p) — the one regex-based derivation. The .ts case
+    must produce movie.subs.mp4, NOT the old slice's 'movi.subs.mp4',
+    and no row may carry a doubled dot."""
+    from vidlift.subs_job import subs_output_path
+
+    gen = _window(qapp, monkeypatch, tmp_path, _ScriptedClient())
+    win = next(gen)
+    paths = [
+        "/m/movie.ts",
+        "/m/movie.divx",
+        "/m/movie.mpeg",
+        "/m/movie.mp4",
+    ]
+    rows = win._subs_file_rows(paths)
+    for row, path in zip(rows, paths):
+        assert row[4] == subs_output_path(path), path
+        assert ".." not in row[4]
+    assert rows[0][4] == "/m/movie.subs.mp4"  # not 'movi.subs.mp4'
+    assert rows[1][4] == "/m/movie.subs.mp4"  # '.divx' fully stripped
+    assert rows[2][4] == "/m/movie.subs.mp4"  # '.mpeg' fully stripped
+    assert rows[3][4] == "/m/movie.subs.mp4"
+    next(gen, None)
+
+
+def test_subs_rows_collision_preflight_fires_for_non_4char_extensions(
+    qapp, monkeypatch, tmp_path
+):
+    """F-5 (v0.4.15.3): with movie.subs.mp4 pre-existing beside
+    movie.ts, the Status cell is the blocked verdict — the pre-flight
+    finally fires for extensions the old path[:-4] slice mangled (which
+    silently disabled this guard for .ts/.divx/.mpeg)."""
+    source = tmp_path / "done-ep.ts"
+    source.write_bytes(b"source-bytes")
+    existing = tmp_path / "done-ep.subs.mp4"
+    existing.write_bytes(b"already-there")
+
+    gen = _window(qapp, monkeypatch, tmp_path, _ScriptedClient())
+    win = next(gen)
+    rows = win._subs_file_rows([str(source)])
+    assert rows[0][0] == (
+        "blocked — subtitles output already exists (will not be overwritten)"
+    )
+    assert "output exists: done-ep.subs.mp4" in rows[0][7]
+    assert "will not be overwritten" in rows[0][7]
+    # the untouched prior output
+    assert existing.read_bytes() == b"already-there"
+    next(gen, None)
+
+
 def test_subs_eta_stays_honest_no_digits_for_transcribe(
     qapp, monkeypatch, tmp_path
 ):

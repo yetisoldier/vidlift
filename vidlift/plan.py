@@ -283,7 +283,10 @@ def select_subtitle_track(
 
 
 def _subtitle_note(
-    report: FileReport, *, transcription_language: str = ""
+    report: FileReport,
+    *,
+    transcription_language: str = "",
+    transcription_enabled: bool | None = None,
 ) -> str:
     """Describe the PLAN, not just the inventory (design §B.7).
 
@@ -296,12 +299,19 @@ def _subtitle_note(
     v0.4.14: the note renders the transcribed disposition too, under
     the SAME shipped default the planner uses (a note can never
     contradict the plan's own selection).
+
+    v0.4.15.3 (F-6): the RESOLVED transcription flag is threaded in —
+    None keeps the locked default (every existing direct caller), and
+    build_file_plan passes its post-resolution, post-env-guard value
+    so the note and the selection share ONE derivation input.
     """
     from .transcribe import TRANSCRIPTION_ENABLED_DEFAULT
 
+    if transcription_enabled is None:
+        transcription_enabled = TRANSCRIPTION_ENABLED_DEFAULT
     selected = select_subtitle_track(
         report,
-        transcription_enabled=TRANSCRIPTION_ENABLED_DEFAULT,
+        transcription_enabled=transcription_enabled,
         transcription_language=transcription_language,
     )
     if selected is None:
@@ -473,8 +483,15 @@ def build_file_plan(
         video_bitrate_kbps=video_kbps,
         estimated_output_bytes=estimated_bytes,
         expectation=_expectation(report),
+        # v0.4.15.3 (F-6): the flag here is the fully RESOLVED one
+        # (caller value -> default -> env guard at :426 above) — the
+        # note and the selection share the same derivation input, so
+        # the plan table can never promise transcription the run won't
+        # do.
         subtitle_note=_subtitle_note(
-            report, transcription_language=transcription_language
+            report,
+            transcription_language=transcription_language,
+            transcription_enabled=transcription_enabled,
         ),
         process_verdict=_process_verdict(report),
         subtitle_plan=subtitle_plan,

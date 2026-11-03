@@ -71,6 +71,11 @@ from .monitor import (
 from .run import UPSCALE_STEP_PREPARED_COUNT as PREPARED_COUNT_PROBE_STEP
 from .plan import BatchPlan, PlannedFile, build_batch_plan
 from .probe import ProbeError, probe_and_classify
+# v0.4.15.3 (F-5): the Mode B output name has ONE derivation (regex
+# stem-strip in subs_job) — the GUI's display, pre-flight, and run
+# guard reuse it so they can never diverge on non-4-char extensions
+# (.ts/.divx/.mpeg): the old path[:-4] slice mangled those stems.
+from .subs_job import subs_output_path
 from .run import MissingToolError, find_tools
 from .run import summarize_batch, BatchSummary
 from .ui.gpu_meter import (
@@ -101,6 +106,22 @@ _LOG_PIN_TOLERANCE_PX = 8
 # still producing the denominator — it names what is being measured,
 # never a fabricated percent.
 _BUSY_MEASURING_LABEL = "measuring — counting frames…"
+# v0.4.15.3 (F-4): the busy label keys on the PHASE — only the upscale
+# count probe "measures"; every other unmeasured phase names ITSELF.
+# (run.py merges progress dicts, so stale frame counters ride every
+# later phase's payload; the label must never say "measuring" — or a
+# bare "estimating" — for work that has its own name.)
+_PHASE_BUSY_LABELS = {
+    "upscale": _BUSY_MEASURING_LABEL,
+    "probe": "probing ...",
+    "prepare": "preparing ...",
+    "encode": "encoding ...",
+    "verify": "verifying ...",
+    "subtitles": "working subtitles ...",
+    "transcribe": "transcribing audio ...",
+    "subs-mux": "muxing subtitles ...",
+    "finalize": "finalizing ...",
+}
 
 # closeEvent budget (ms): the run worker gets the same 30 s ffmpeg
 # terminate window the sibling's validation established; terminate is
@@ -296,7 +317,16 @@ def run_stage_label(snapshot: dict | None) -> str:
     progress_state = progress or {}
     frames_done = progress_state.get("frames_done")
     frames_total = progress_state.get("frames_total")
-    if frames_done is not None and frames_total:
+    # v0.4.15.3 (F-4): the frame suffix renders only in the phase that
+    # OWNS the frame denominators (upscale). run.py's record_step
+    # merges (never replaces) progress dicts, so upscale's final
+    # counters ride every later phase's payload — rendering them there
+    # printed "encoding frames 3600/3600" through a whole verify.
+    if (
+        frames_done is not None
+        and frames_total
+        and phase == "upscale"
+    ):
         chunk_text = f" frames {frames_done}/{frames_total}"
     if phase == "probe":
         base = "probe — reading source metadata"
@@ -470,6 +500,11 @@ class MainWindow(QMainWindow):
         self._stage_now = "queued"
         self._stage_eta: float | None = None
         self._stage_fraction: float | None = None
+        # v0.4.15.3 (F-4): the last MEASURED stage fraction (0.0 until a
+        # measurable tick). The overall queue bar renders this while the
+        # current phase owns no fraction, so the bar is monotonic — it
+        # never visibly RECEEDS at a phase change.
+        self._stage_fraction_measured: float = 0.0
 
         self.file_table = QTableWidget(0, 8)
         self.file_table.setHorizontalHeaderLabels(
@@ -1121,10 +1156,19 @@ class MainWindow(QMainWindow):
     def _subs_file_rows(self, paths: list[str]) -> list[list[str]]:
         """The subs table rows (same 8-column schema as the plan view;
         the Status cell carries the subs verdict instead of the upscale
-        one) — the shared-table render contract for subs batches."""
+        one) — the shared-table render contract for subs batches.
+
+        v0.4.15.3 (F-5): the output path comes straight from
+        :func:`subs_output_path` — one naming derivation for display,
+        pre-flight, and the run guard. The old ``path[:-4]`` slice
+        mangled non-4-char extensions (``movie.ts`` read as stem
+        ``movi``) and silently disabled the collision pre-flight for
+        those files.
+        """
         rows: list[list[str]] = []
         for path in paths:
-            existing = Path(path[:-4] + ".subs.mp4")
+            out_path = subs_output_path(path)
+            existing = Path(out_path)
             status = (
                 "blocked — subtitles output already exists (will not be overwritten)"
                 if existing.exists()
@@ -1136,11 +1180,11 @@ class MainWindow(QMainWindow):
                     path,
                     "transcribe",
                     "keep original",
-                    path[:-4] + ".subs.mp4",
+                    out_path,
                     "",
                     "transcribed from the file's own audio",
                     (
-                        "output exists: " + Path(path[:-4] + ".subs.mp4").name
+                        "output exists: " + existing.name
                         + " (will not be overwritten)"
                         if existing.exists()
                         else ""
@@ -1348,11 +1392,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "VidLift", "No files could be probed.\n\n" + "\n".join(failures[:5]))
             return
         try:
+            # v0.4.15.3 (F-6): the checkbox rides the PLAN call — the
+            # plan table must never promise transcription the run
+            # won't do when the user has disabled it at plan time.
             self.batch = build_batch_plan(
                 reports,
                 target="720p",
                 gb_per_hour=gbph,
                 output_dir=self.output_dir.text().strip() or None,
+                transcription_enabled=self.transcribe_subs.isChecked(),
             )
         except Exception as exc:
             QMessageBox.critical(self, "VidLift planning failed", str(exc))
@@ -1378,6 +1426,17 @@ class MainWindow(QMainWindow):
                 and item.subtitle_plan.ocr_required
             ):
                 subtitle_note = "OCR disabled; no bitmap subtitles"
+            # v0.4.15.3 (F-6): the transcription mirror of the OCR
+            # override — a plan built (or planned earlier) with
+            # transcription on renders the honest disabled note when
+            # the checkbox is now off (covers "user unchecks after
+            # pressing Plan" without a replan).
+            if (
+                not self.transcribe_subs.isChecked()
+                and item.subtitle_plan is not None
+                and item.subtitle_plan.source == "transcribed"
+            ):
+                subtitle_note = "transcription disabled; no subtitles transcribed"
             values = [
                 item.process_verdict,
                 report.path,
@@ -1672,6 +1731,9 @@ class MainWindow(QMainWindow):
         self._stage_now = "queued"
         self._stage_eta = None
         self._stage_fraction = None
+        # v0.4.15.3 (F-4): the measured-truth floor resets with the
+        # slate (and ONLY at a slate boundary — never on stage change).
+        self._stage_fraction_measured = 0.0
         # v0.4.12 (item 2): ETA state starts fresh with every batch.
         self._eta_state = {}
         self._eta_phase_now = None
@@ -2044,6 +2106,17 @@ class MainWindow(QMainWindow):
                 progress = snapshot_progress
         frames_done = progress.get("frames_done")
         frames_total = progress.get("frames_total")
+        phase_now = snapshot.get("current_phase") or ""
+        # v0.4.15.3 (F-4): frame counters belong to the UPSCALE phase
+        # only — run.py merges (never replaces) progress dicts, so
+        # upscale's counters ride every later phase; honoring them
+        # outside upscale pins the stage bar at a stale 100% for the
+        # whole encode/verify. Empty phase (older/stub writers): fall
+        # back to the stage-label text so legacy upscale payloads still
+        # count.
+        frame_phase = phase_now == "upscale" or (
+            not phase_now and "upscaling" in key
+        )
         # v0.4.5 (§3b/§3c, D-eta): the stage label's phase_note suffix
         # rides the payload; the same computed string goes through
         # _set_text, so identical values never repaint the label.
@@ -2068,8 +2141,11 @@ class MainWindow(QMainWindow):
                 f"{rendered} — last activity {int(age // 60)} min ago"
             )
         self._set_text(self.stage_label, rendered + eta_suffix)
-        if frames_total and frames_done is not None and frames_total > 0:
+        if frame_phase and frames_total and frames_done is not None and frames_total > 0:
             self._stage_fraction = max(0.0, min(1.0, frames_done / frames_total))
+            # v0.4.15.3 (F-4): the measured floor rides every real
+            # measurement — the overall bar's monotonic truth.
+            self._stage_fraction_measured = self._stage_fraction
             # §3c: honest ETA the moment it exists. The bridge's
             # _eta_seconds math is UNTOUCHED; it still requires a
             # measured benchmark constant AND frames_total > 0. When
@@ -2078,17 +2154,30 @@ class MainWindow(QMainWindow):
             # no number invented.
             self.stage_bar.set_value(self._stage_fraction, self._stage_eta)
         elif self._stage_fraction is None:
-            # §3c state 1: measuring… names what the pipeline is doing
-            # to GET an ETA (the count pass), never a bare "estimating"
-            # pulse forever. A duplicated busy call is a no-op anyway.
-            self.stage_bar.set_busy(True, _BUSY_MEASURING_LABEL)
+            # §3c state 1, v0.4.15.3 (F-4): the pulse NAMES the phase —
+            # only the upscale count pass "measures"; every other
+            # unmeasurable phase names ITSELF (a duplicated busy call
+            # is a no-op anyway).
+            self.stage_bar.set_busy(
+                True, _PHASE_BUSY_LABELS.get(phase_now, "estimating ...")
+            )
         # Overall queue: resolved jobs + current fraction, over total.
         # v0.4.10 (R2): resolved = reached ANY terminal state (the
         # queue position is honest even when a job cancelled/failed);
         # the headline batch BAR renders the colored succeeded-
         # dominated truth separately (_apply_batch_summary).
         resolved_units = sum(1 for c in self.run_counts if c is not None)
-        frac_units = self._stage_fraction or 0.0
+        # v0.4.15.3 (F-4): the overall bar renders last-MEASURED truth
+        # (monotonic, never fabricated); the stage bar renders the
+        # CURRENT phase — measured fraction when measurable, honest
+        # busy pulse when not. Without the measured floor the overall
+        # bar would visibly RECEDE at every phase change (encode/verify
+        # own no fraction).
+        frac_units = (
+            self._stage_fraction
+            if self._stage_fraction is not None
+            else self._stage_fraction_measured
+        )
         total_units = max(1, self.run_total)
         overall = (resolved_units + frac_units) / total_units
         self.overall_bar.set_value(overall, None)
@@ -2695,6 +2784,9 @@ class MainWindow(QMainWindow):
         self._stage_now = "queued"
         self._stage_eta = None
         self._stage_fraction = None
+        # v0.4.15.3 (F-4): the batch is over — the measured floor goes
+        # with it (a new batch must start its own monotonic truth).
+        self._stage_fraction_measured = 0.0
         self.engine_combo.setEnabled(True)
         # v0.4.8 (D5): re-enable the profile combo with its honest tooltip.
         self.profile_combo.setEnabled(True)

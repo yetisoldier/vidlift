@@ -218,6 +218,9 @@ class _BarHarness(QMainWindow):
         self._stage_now = "upscale"
         self._stage_eta = None
         self._stage_fraction = None
+        # v0.4.15.3 (F-4): the measured-truth floor the overall bar's
+        # monotonic rendering consults (bound method reads it).
+        self._stage_fraction_measured = 0.0
         self.run_total = 1
         self.run_counts = [None]
         self._progress_chunk_color = None

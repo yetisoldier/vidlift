@@ -11,7 +11,7 @@ from vidlift.probe import SubtitleInfo, classify, parse_probe
 
 pytest.importorskip("PyQt6")
 
-from PyQt6.QtWidgets import QApplication, QLabel
+from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
 
 from vidlift.gui import (
     ENGINE_CHOICES,
@@ -814,3 +814,236 @@ def test_b18_detail_text_appends_anime_sentence_only_for_anime(
     assert "not for live-action content" in with_anime
     # default call (no profile kwarg) omits it — plan surfaces untouched
     assert "Anime upscaling model" not in detail_text(plan)
+
+
+# ---- v0.4.15.3 F-4: phase-keyed stage bar (stale counters lie) ------------
+
+
+@pytest.fixture
+def qapp():
+    return QApplication.instance() or QApplication([])
+
+
+class _StageHarness(QMainWindow):
+    """The minimal widget set _consume_running_snapshot touches over a
+    SEQUENCE of snapshots (multi-tick: upscale -> encode -> verify —
+    exactly the merged-counter shape run.py ships). Same binding set as
+    test_progress_honesty._BarHarness, plus the F-4 measured floor."""
+
+    def __init__(self, qapp: QApplication) -> None:
+        super().__init__()
+        from PyQt6.QtWidgets import QPlainTextEdit, QTableWidget, QTableWidgetItem
+
+        from vidlift.ui.widgets import EtaProgressBar
+
+        self.stage_label = QLabel("")
+        self.stage_bar = EtaProgressBar()
+        self.overall_bar = EtaProgressBar()
+        self.run_log_tail = QPlainTextEdit()
+        self._stage_now = "queued"
+        self._stage_eta = None
+        self._stage_fraction = None
+        self._stage_fraction_measured = 0.0
+        self.run_total = 1
+        self.run_counts = [None]
+        self._progress_chunk_color = None
+        # the encode-phase ETA denominator reads the plan seam (None:
+        # honest no-duration, the harness's shape).
+        self.batch = None
+        self.job_ids = ["vl-test-f4"]
+        self.file_table = QTableWidget(1, 1)
+        self.file_table.setItem(0, 0, QTableWidgetItem(""))
+
+        self._consume_running_snapshot = (
+            MainWindow._consume_running_snapshot.__get__(self)
+        )
+        self._set_text = MainWindow._set_text.__get__(self)
+        self._render_log_tail = MainWindow._render_log_tail.__get__(self)
+        self._eta_state = {}
+        self._eta_phase_now = None
+        self._eta_rendered = None
+        self._batch_eta_rendered = None
+        self._eta_current_job = MainWindow._eta_current_job.__get__(self)
+        self._eta_suffix_for_stage = MainWindow._eta_suffix_for_stage.__get__(self)
+        self._render_damped_eta = MainWindow._render_damped_eta.__get__(self)
+        self._eta_state_key = MainWindow._eta_state_key.__get__(self)
+        self._ETA_EWMA_ALPHA = MainWindow._ETA_EWMA_ALPHA
+        self._ETA_DAMPING_FRACTION = MainWindow._ETA_DAMPING_FRACTION
+        self._reset_eta_for_phase = MainWindow._reset_eta_for_phase.__get__(self)
+        self._duration_for_snapshot = MainWindow._duration_for_snapshot.__get__(self)
+        self._fmt_eta = MainWindow._fmt_eta.__get__(self)
+
+    def consume(self, snapshot: dict) -> None:
+        from vidlift.gui import run_stage_label
+
+        self._consume_running_snapshot(0, snapshot, run_stage_label(snapshot))
+
+
+def _running_snap(phase: str, progress: dict, **extra) -> dict:
+    return {
+        "state": "running",
+        "current_phase": phase,
+        "job_id": "vl-test-f4",
+        "progress": progress,
+        **extra,
+    }
+
+
+_STALE_FRAMES = {"frames_done": 3600, "frames_total": 3600}
+
+
+def test_f4_stale_counters_never_pin_encode_verify_bar(qapp):
+    """Karen's Scenario A/B, promoted to a pin: after the upscale's
+    final tick, the encode and verify snapshots CARRY the stale
+    counters (run.py merges, never replaces) — the stage bar must stay
+    a busy pulse named by the phase, never the measuring label, never
+    the stale 1000."""
+    from vidlift.gui import _BUSY_MEASURING_LABEL
+
+    win = _StageHarness(qapp)
+    # upscale ends: the counters are real here — 100% is honest now.
+    win.consume(_running_snap("upscale", dict(_STALE_FRAMES)))
+    assert win.stage_bar.bar.value() == 1000
+
+    # encode begins; the counters ride the payload exactly as run.py
+    # ships them after its merge.
+    win.consume(
+        _running_snap("encode", {"step": "encode", **_STALE_FRAMES})
+    )
+    assert win.stage_bar._busy is True
+    assert win.stage_bar.eta_label.text() == "encoding ..."
+    assert win.stage_bar.eta_label.text() != _BUSY_MEASURING_LABEL
+    assert win._stage_fraction is None  # the stale counters are not honored
+    assert win.stage_bar.bar.maximum() == 0  # busy pulse (0..0), not 1000/1000
+
+    # verify begins; the stale counters STILL ride the payload.
+    win.consume(
+        _running_snap("verify", {"step": "verify", **_STALE_FRAMES})
+    )
+    assert win.stage_bar._busy is True
+    assert win.stage_bar.eta_label.text() == "verifying ..."
+    assert win.stage_bar.eta_label.text() != _BUSY_MEASURING_LABEL
+    assert win._stage_fraction is None
+    assert win.stage_bar.bar.maximum() == 0
+
+
+def test_f4_mid_upscale_still_measures_and_count_probe_label_unchanged(qapp):
+    """Non-regression: the gate did not over-fire — a legitimate
+    upscale fraction still drives set_value, and the count pass keeps
+    its honest measuring label."""
+    from vidlift.gui import _BUSY_MEASURING_LABEL
+    from vidlift.run import UPSCALE_STEP_PREPARED_COUNT
+
+    win = _StageHarness(qapp)
+    win.consume(
+        _running_snap(
+            "upscale",
+            {"step": "chunk", "chunk_index": 3, "chunk_total": 12,
+             "frames_done": 1800, "frames_total": 3600},
+        )
+    )
+    assert win._stage_fraction == pytest.approx(0.5)
+    assert win.stage_bar.bar.maximum() == 1000  # out of busy (0..0)
+    assert win.stage_bar.bar.value() == 500
+
+    # the count probe: measuring is the phase's own name during upscale.
+    win._stage_now = "queued"  # simulate a fresh consume of the count pass
+    win.consume(
+        _running_snap("upscale", {"step": UPSCALE_STEP_PREPARED_COUNT})
+    )
+    assert win.stage_bar.eta_label.text() == _BUSY_MEASURING_LABEL
+
+
+def test_f4_overall_bar_never_recedes_across_phases(qapp):
+    """The overall queue bar renders last-MEASURED truth: at the encode
+    tick (no fraction owned) it must hold the upscale's measured value,
+    not drop back to 0."""
+    win = _StageHarness(qapp)
+    win.consume(_running_snap("upscale", {"step": "chunk",
+                                          "frames_done": 1800,
+                                          "frames_total": 3600}))
+    mid = win.overall_bar.bar.value()
+    assert mid == pytest.approx((0 + 0.5) * 1000, rel=1e-3)
+    win.consume(_running_snap("upscale", {"step": "chunk",
+                                          "frames_done": 3600,
+                                          "frames_total": 3600}))
+    end = win.overall_bar.bar.value()
+    assert end == 1000
+    win.consume(_running_snap("encode", {"step": "encode", **_STALE_FRAMES}))
+    during_encode = win.overall_bar.bar.value()
+    assert during_encode >= end, (
+        "the overall bar receded at the phase change (a lie of its own)"
+    )
+
+
+def test_f4_encode_stage_label_renders_without_stale_frames():
+    """run_stage_label on an encode snapshot carrying the merged stale
+    counters renders exactly 'encoding' — the lying
+    'encoding frames 3600/3600' suffix is gone."""
+    from vidlift.gui import run_stage_label
+
+    label = run_stage_label(
+        _running_snap("encode", {"step": "encode", **_STALE_FRAMES})
+    )
+    assert label == "encoding"
+
+
+# ---- v0.4.15.3 F-6: plan view never promises un-run transcription --------
+
+
+def test_f6_plan_batch_passes_transcribe_checkbox_to_builder(
+    window, monkeypatch
+):
+    """The GUI's plan call threads the checkbox: unchecked -> the
+    builder receives transcription_enabled=False (and checked -> True),
+    so the note and the selection share ONE derivation input."""
+    import vidlift.gui as gui_mod
+    from vidlift.plan import build_batch_plan as real_build_batch_plan
+    from vidlift.run import ToolBox
+
+    captured: dict = {}
+
+    def spy(reports, **kwargs):
+        captured.update(kwargs)
+        return real_build_batch_plan(reports, **kwargs)
+
+    monkeypatch.setattr(gui_mod, "build_batch_plan", spy)
+    monkeypatch.setattr(
+        gui_mod, "probe_and_classify",
+        lambda path, binary: _report(),
+    )
+    monkeypatch.setattr(
+        gui_mod, "find_tools",
+        lambda: ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+    )
+    window.files = ["/media/movie.avi"]
+    window.transcribe_subs.setChecked(False)
+    window.plan_batch()
+    assert captured.get("transcription_enabled") is False
+    window.transcribe_subs.setChecked(True)
+    window.plan_batch()
+    assert captured.get("transcription_enabled") is True
+
+
+@pytest.mark.usefixtures("transcription_engine_on")
+def test_f6_render_batch_overrides_transcribed_note_when_checkbox_off(
+    window, tmp_path
+):
+    """Mirrors the OCR override: a transcribed plan (still holding its
+    plan-time note) renders the honest disabled note under an unchecked
+    checkbox — covers 'user unchecks after pressing Plan' with no
+    replan; checking it again restores the plan's own note."""
+    report = _report()
+    plan = build_file_plan(report, gb_per_hour=1.5)
+    assert plan.subtitle_plan is not None
+    assert plan.subtitle_plan.source == "transcribed"
+
+    window.transcribe_subs.setChecked(False)
+    window.render_batch(batch_plan_from([plan]))
+    assert window.file_table.item(0, 6).text() == (
+        "transcription disabled; no subtitles transcribed"
+    )
+
+    window.transcribe_subs.setChecked(True)
+    window.render_batch(batch_plan_from([plan]))
+    assert window.file_table.item(0, 6).text() == plan.subtitle_note
