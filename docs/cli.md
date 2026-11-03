@@ -44,6 +44,7 @@ Options:
 - **--target 720p:** output frame target
 - **--gbph NUMBER:** approximate output gigabytes per hour; default 1.5
 - **--output-dir PATH:** shared output directory
+- **--no-transcribe:** disables Mode A audio transcription / subtitle transcription for that run or plan
 
 Planning does not start an upscale.
 
@@ -66,6 +67,7 @@ Options:
 - **--ffmpeg PATH / --ffprobe PATH:** override bundled binaries
 - **--realesrgan PATH:** override the bundled ncnn executable
 - **--realesrgan-models PATH:** override the bundled model directory
+- **--no-transcribe:** disables Mode A audio transcription / subtitle transcription for that run or plan
 
 Engine behavior:
 
