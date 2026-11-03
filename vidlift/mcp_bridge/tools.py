@@ -426,6 +426,104 @@ def _activity_age_seconds(record) -> float | None:
     return max(0.0, time.time() - float(record.last_activity_at))
 
 
+def _transcription_echo(record, state, manifest) -> dict:
+    """Additive status key (visibility ADR-3): the RESOLVED
+    transcription device, honest-null everywhere a fact was not
+    recorded — NEVER projected, NEVER inferred (the anti-lie rule;
+    ``engine_note`` is not consulted).
+
+    ``device``: where the transcription RAN — "cuda" | "cpu" |
+    "cpu (cuda unavailable)" (the v0.4.15.3 R1 fallback wording) | null.
+    ``device_requested``: the caller's pin ("auto"|"cuda"|"cpu") when
+    the job carried one (subs options), else null (run jobs: the pin
+    lives in the plan, not the record options). null = not recorded,
+    never guessed.
+
+    Resolution order: a ``subs`` record echoes its own terminal
+    ``result["device"]`` (v0.4.15.3 D4; "" reads as null — the honest
+    unknown under a foreign engine factory) plus the requested pin;
+    run-kind jobs read the LIVE Mode A truth (``state.subtitles`` —
+    null while transcription is still in flight is the CORRECT answer)
+    and fall back to the finished/failed manifest echo
+    (``manifest["run"]["subtitles"]`` mirrors ``state.subtitles`` —
+    that IS the manifest layout ``_build_manifest`` writes, run.py;
+    v0.4.16 D-3: the one-shot post-close read was keyed on a
+    non-existent top-level ``manifest["subtitles"]`` and every
+    terminal run job echoed ``device: null``).
+
+    The defensive ``getattr`` read (instead of a bare attribute) keeps
+    this additive reader tolerant of foreign state shapes the payload
+    already serves verbatim — a new REQUIRED state attribute would be
+    a contract break, not a pass-through.
+    """
+    echo: dict = {"device": None, "device_requested": None}
+    if record.kind == "subs":
+        requested = (record.options or {}).get("device")
+        echo["device_requested"] = requested if requested else None
+        result = record.result or {}
+        echo["device"] = result.get("device") or None  # "" = D4 honest unknown
+        return echo
+    # run-kind jobs (Mode A)
+    subs_block = getattr(state, "subtitles", None) if state is not None else None
+    block = None
+    if isinstance(subs_block, dict):
+        block = subs_block
+    elif manifest is not None and isinstance(
+        (manifest.get("run") or {}).get("subtitles"), dict
+    ):
+        block = manifest["run"]["subtitles"]
+    if block:
+        tr = block.get("transcription") or {}
+        echo["device"] = tr.get("device") or None
+    return echo
+
+
+def _transcription_model_echo(record, state, services) -> dict:
+    """Additive (model-management ADR-2): transcription-model presence /
+    download state, derived at read — never projected, never persisted as
+    a state string. In-flight byte truth comes from the live
+    ``progress["model_download"]`` (same-process) or the persisted mirror
+    (cross-process, trusted only while the record is running — a terminal
+    record's mirror can be a dead writer's last beat); the GUI install
+    board covers idle-queue installs; the disk predicate is the ground
+    truth everywhere else.
+
+    Additive key per the v0.4.1/v0.4.9 convention: ``api_version`` never
+    bumps for additive keys (monitor.py's header documents the rule);
+    readers that ignore unknown keys are unaffected.
+    """
+    if record.kind == "subs":
+        pin = (record.options or {}).get("model") or None
+    else:
+        pin = None
+    # Lazy: tools.py import weight (transcribe is heavy-adjacent and the
+    # payload path runs on foreign fakes too).
+    from ..transcribe import DEFAULT_MODEL, KNOWN_MODELS, model_install_state
+
+    # resolve_model_dir's own rule: an unknown pin is a user PATH, not a
+    # tag — the block then honestly reports the DEFAULT tag's machine state.
+    tag = pin if pin in KNOWN_MODELS else DEFAULT_MODEL
+    live_dl = None
+    if state is not None:
+        live_dl = (getattr(state, "progress", None) or {}).get("model_download")
+    else:
+        snapshot = getattr(record, "progress_snapshot", None) or {}
+        if record.state == "running" and snapshot:
+            # Cross-process: the mirror is trusted only for a RUNNING
+            # record (a terminal record's mirror is a dead writer's last
+            # beat — derive from disk instead, D-12).
+            live_dl = (snapshot.get("progress") or {}).get("model_download")
+    # Soft-read (N5/adapted from ADR-4): foreign BridgeServices fakes in
+    # the existing suite carry no board attribute — degrade to disk.
+    board = getattr(services, "model_install_board", None)
+    return model_install_state(
+        tag,
+        state_root=getattr(services, "state_dir", None),
+        board=board,
+        progress_download=live_dl if isinstance(live_dl, dict) else None,
+    )
+
+
 def _status_payload(services: BridgeServices, record) -> dict:
     """The full runner observability contract (Section 4.5): verbatim
     RunState.to_dict() fields when the job is live; honest
@@ -460,6 +558,22 @@ def _status_payload(services: BridgeServices, record) -> dict:
         "error": record.error,
         "eta_seconds": None,
     }
+    # Additive (visibility ADR-3): the RESOLVED transcription device
+    # echo rides every payload, beside the subtitles block it derives
+    # from — one key, honest-null when nothing was recorded. Additive
+    # keys never bump api_version (monitor.py's header documents the
+    # convention; the v0.4.1 subtitles-block precedent). Readers that
+    # ignore unknown keys are unaffected; the GUI's 1 Hz tick, the HTTP
+    # /status envelope and the MCP status tool all serve this ONE shape.
+    payload["transcription"] = _transcription_echo(record, state, manifest)
+    # v0.4.16 (model-management ADR-2, additive): transcription-model
+    # presence/download state rides every payload beside the visibility
+    # device echo — one sibling helper, honest-null, derived at read.
+    # Additive keys never bump api_version (monitor.py's header
+    # convention; the v0.4.1 subtitles-block precedent).
+    payload["transcription_model"] = _transcription_model_echo(
+        record, state, services
+    )
     # v0.4.9 (progress mirror, design §2.1): when the in-memory state
     # box is absent (reader process ≠ writer process), the payload's
     # progress/current_phase fall back to the WRITER's persisted mirror

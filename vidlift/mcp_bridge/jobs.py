@@ -18,9 +18,14 @@ behavior-identically to whatever runner is underneath.
 
 Cancel plumbing: each running job owns a :class:`CancelFlag` the
 registry's ``cancel()`` flips; ``run_file``'s ``cancel`` callable
-observes it; the engine adapter's child-process discipline
-(terminate, wait 10 s, kill) is the engine's responsibility, ported
-in P1. A cancelled job closes ``cancelled``, never ``failed``.
+observes it — v0.4.16 (the §4.6 observe-fix): the tracked runner seams
+also forward the flag into the production subprocess runner and
+``run_file`` observes it at every phase/command boundary, so prepare,
+encode, verify, and the mux children terminate like the engine's own
+do (the engine adapter's child-process discipline — terminate, wait
+10 s, kill — stays the engine's responsibility, unchanged in P1). A
+cancelled job closes ``cancelled``, never ``failed`` — benchmark jobs
+included (the EngineCancelled mapping below).
 """
 
 from __future__ import annotations
@@ -143,6 +148,13 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
     # while the worker thread is blocked inside run_file.
     state_box: dict = {}
     record.set_live("state_box", state_box)
+    # v0.4.16 (D-1, Karen remediation): Mode A's download publisher
+    # lives inside run.py, which owns no JobRecord handle — the record
+    # rides the box so the publisher's beats touch it exactly like Mode
+    # B's `_model_download_publisher` does. run.py reads the key
+    # defensively: a box without a record (the CLI passes no box at
+    # all) publishes state-touches only, unchanged.
+    state_box["record"] = record
     # v0.4.5 (D2): re-pin the record so a reader's _maybe_reload
     # cannot re-install a stale file row over the live seams: the
     # record's _live state box and the cancel flag are process-local
@@ -184,8 +196,14 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
         executor = getattr(services, "executor", None)
         if executor is not None and hasattr(executor, "maybe_mirror"):
             executor.maybe_mirror()
-        runner = base_command_runner or _subprocess_runner
-        return runner(binary, args)
+        # v0.4.16 (the §4.6 observe-fix): the production runner receives
+        # the job's CancelFlag, so THIS executor child terminates on a
+        # cancel exactly like the engine's own children do (the engine
+        # adapter keeps its adapter-owned discipline). An injected seam
+        # (tests) keeps the legacy 2-arg call.
+        if base_command_runner is not None:
+            return base_command_runner(binary, args)
+        return _subprocess_runner(binary, args, cancel=cancel)
 
     def tracked_probe(binary: str, args: list[str]):
         record.touch()
@@ -197,8 +215,13 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
         executor = getattr(services, "executor", None)
         if executor is not None and hasattr(executor, "maybe_mirror"):
             executor.maybe_mirror()
-        runner = base_probe_runner or base_command_runner or _subprocess_runner
-        return runner(binary, args)
+        # v0.4.16 (the §4.6 observe-fix): same flag-forwarding rule as
+        # tracked — the probe's own ffprobe children terminate on a
+        # cancel too; an injected seam keeps the legacy 2-arg call.
+        base = base_probe_runner or base_command_runner
+        if base is not None:
+            return base(binary, args)
+        return _subprocess_runner(binary, args, cancel=cancel)
 
     try:
         tools = find_tools(
@@ -282,6 +305,38 @@ def _state_log_path(state):
     return log.path if log is not None else None
 
 
+def _model_download_publisher(record, state):
+    """The Mode B download-progress publisher (v0.4.16, model-management
+    ADR-3): model fetch bytes ride the SAME progress dict the GUI
+    tick / /status / mirror already consume — and every beat TOUCHES
+    the record/state so a 17-minute download never again reads as
+    climbing activity_age_seconds (Eric's silent-download repro). The
+    fact is popped by on_step at the first post-resolve step (see
+    _execute_subs_job) so it never outlives the download. Runs on the
+    worker thread and only mutates ``state.progress`` + touch (the
+    existing publisher discipline); the factory shape keeps the
+    publisher directly drivable by tests."""
+    _publish_state = {"t": 0.0}
+
+    def on_download_progress(done: int, total: int | None) -> None:
+        now = time.time()
+        if now - _publish_state["t"] < 0.25 and total is not None and done < total:
+            return
+        _publish_state["t"] = now
+        progress = dict(state.progress or {})
+        progress["model_download"] = {
+            "bytes_done": int(done),
+            "bytes_total": int(total) if total is not None else None,
+            "file": "model.bin",  # support files are KB-scale; the byte-bearing fetch is model.bin
+        }
+        progress["step"] = "downloading transcription model (model.bin)"
+        state.progress = progress
+        state.touch()
+        record.touch()
+
+    return on_download_progress
+
+
 def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutcome:
     """One Mode B standalone subs job (v0.4.14 §Mode B, B1 soft-mux).
 
@@ -331,9 +386,13 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
         executor = getattr(services, "executor", None)
         if executor is not None and hasattr(executor, "maybe_mirror"):
             executor.maybe_mirror()
+        # v0.4.16 (the §4.6 observe-fix): the subs job's own children
+        # (extraction/mux) terminate on a cancel the same way the run
+        # job's do; an injected seam keeps the legacy 2-arg call.
         from ..run import _subprocess_runner
-        base = services.command_runner or _subprocess_runner
-        return base(binary, args)
+        if services.command_runner is not None:
+            return services.command_runner(binary, args)
+        return _subprocess_runner(binary, args, cancel=cancel)
 
     record.set_live("commands", [])
 
@@ -342,9 +401,12 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
         state.touch()
         record.set_live("current_phase", "probe")
         state.current_phase = "probe"
+        # v0.4.16 (the §4.6 observe-fix): same rule as the subs runner.
         from ..run import _subprocess_runner
-        base = services.probe_runner or services.command_runner or _subprocess_runner
-        return base(binary, args)
+        base = services.probe_runner or services.command_runner
+        if base is not None:
+            return base(binary, args)
+        return _subprocess_runner(binary, args, cancel=cancel)
 
     def on_segments(segments_done: int, _total: int) -> None:
         """v0.4.14 (Mode B): the core's on_progress carries segment
@@ -360,11 +422,24 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
         state.touch()
         record.touch()
 
+    # v0.4.16 (model management, ADR-3): publisher-side throttle —
+    # ≤4 Hz progress-dict churn (the mirror self-throttles at 10 s; a
+    # final beat always lands because the guard only skips beats that
+    # are both mid-download AND less than 0.25 s apart). The closure
+    # factory lives at module level so tests drive it directly (M-8).
+    on_download_progress = _model_download_publisher(record, state)
+
     def on_step(step: str) -> None:
         """The core's step names ride progress["step"] verbatim — the
         same heartbeat-surface discipline the run path uses; rendering
         lives GUI-side (run_stage_label)."""
         progress = dict(state.progress or {})
+        # v0.4.16 (model management): every post-resolve step clears the
+        # download fact — resolve returned, so transcription has moved
+        # on and stale byte counts must never ride later payloads (the
+        # pop is unconditional: any post-resolve step means resolve
+        # returned, H-3).
+        progress.pop("model_download", None)
         note = str(step)
         if note == "transcribe-run" and "segments_done" not in progress:
             progress["step"] = "transcribing — building language model"
@@ -396,6 +471,10 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
             state_root=services.state_dir,
             on_progress=on_segments,
             on_step=on_step,
+            # v0.4.16 (model management, ADR-3): the subscription already
+            # exists on run_subs_job (subs_job forwards it to the core);
+            # it was merely unpopulated by every caller until now.
+            on_download_progress=on_download_progress,
             should_cancel=cancel,
         )
     except EngineCancelled as exc:
@@ -432,7 +511,9 @@ def _execute_benchmark_job(
     from ..engine_ncnn import select_engine
     from ..plan import PlanError
     from ..probe import ProbeError
-    from ..run import RunError, find_tools
+    # v0.4.16: EngineCancelled is a RunError subclass BUT the mapping
+    # below must land `cancelled`, so it is caught by exact type FIRST.
+    from ..run import EngineCancelled, RunError, find_tools
 
     options = record.options
     sample_path = options["sample_path"]
@@ -460,6 +541,14 @@ def _execute_benchmark_job(
             cancel=cancel,
             state_root=services.state_dir,
         )
+    except EngineCancelled as exc:
+        # v0.4.16 (the §4.6 observe-fix): the engine observes the cancel
+        # (pre-frame check / live poll) and closes the benchmark
+        # cancelled — a cancelled BENCHMARK job used to fall through the
+        # generic run-error mapping below and close `failed`, leaving
+        # exactly the "history shows a mix: cancelled AND failed" rows
+        # Eric's monitor evidence shows. A cancel is not a failure.
+        return JobOutcome(ok=False, cancelled=True, error=str(exc))
     except (BenchmarkCacheError, ProbeError, PlanError, RunError) as exc:
         return JobOutcome(ok=False, error=str(exc))
     # The Section-4.3 completion result, verbatim field names: the

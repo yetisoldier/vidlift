@@ -88,18 +88,18 @@ VidLift performs:
 7. subtitle pass-through or OCR when possible
 
 ## 📡 Remote monitoring
-
+ 
 The desktop app serves a small read-only status API while it runs
 (LAN monitoring, on by default; the checkbox in the controls area
 turns it off). Every response is read-only — the server has no write
 verbs and no write surface; it can never enqueue or cancel anything.
-
+ 
 ```bash
 curl http://ninjabase2:8765/health                          # token-free liveness: {"ok": true, "busy": ...}
 curl "http://ninjabase2:8765/status?token=<token>"         # live queue: api_version 1 + one payload per active job
 curl "http://ninjabase2:8765/history?token=<token>"        # finished jobs, newest first
 ```
-
+ 
 - Token: `Authorization: Bearer <token>` or `?token=<token>`.
   The default token is baked into the app
   (`vidlift/monitor.py::MONITOR_TOKEN_DEFAULT`); override it in
@@ -116,8 +116,25 @@ curl "http://ninjabase2:8765/history?token=<token>"        # finished jobs, newe
   `phase_note`), the runner's own `log_tail`, and `eta_seconds` only
   when honestly known (a measured benchmark constant on a matching
   engine) — otherwise `null`, never a projection.
-
+- **Discovery & Model Visibility:** The `/status` envelope now includes:
+  - A **discovery card** (`monitor.json`) that allows remote agents to
+    automatically find the current effective monitor token and port.
+  - A **transcription model block** showing the status of the
+    `faster-whisper` model (installed, downloading with progress, or
+    unknown), allowing watchers to see machine-wide model truth even
+    with an idle queue.
+ 
+## 🎙️ Transcription Model Management
+ 
+VidLift uses the `faster-whisper` medium model for audio transcription. To ensure a smooth first-run experience:
+ 
+- **One-Click Install:** If the model is missing, the GUI provides an **Install** button. This runs as a background task to avoid freezing the interface or blocking the job queue.
+- **Honest Progress:** Model download progress is published in real-time to the GUI and the `/status` API. This prevents "silent stalls" where a long download might otherwise look like a hung application.
+- **Integrity Guaranteed:** Every model download is verified via a SHA-256 pin before use.
+- **GUI-Only Action:** Model installation is a GUI-only feature; the remote monitoring API remains strictly read-only.
+ 
 ## ⚙️ How it works
+
 VidLift automates a complex multi-stage pipeline so you don't have to:
 
 ```mermaid

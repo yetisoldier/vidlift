@@ -13,6 +13,9 @@ override this per-test.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 _GUARD_PATH = "/nonexistent/vidlift-test-guard/realesrgan-ncnn-vulkan"
@@ -134,4 +137,73 @@ def _no_network(monkeypatch):
         _socket.socket, "connect",
         _guard_socket_connect(_socket.socket.connect),
     )
+
+
+# v0.4.16 (hermeticity, forge task B): the suite's DEFAULT state-root
+# resolution never lands on the real user profile ``~/.vidlift``.
+#
+# Every production default resolution (``benchmark.state_dir()``) is
+# lazy-imported at CALL time by its consumers (the machine GPU-phase
+# lock, the model cache, the bridge's registry/monitor-card roots), so
+# one autouse patch makes each test's "default root" an isolated tmp
+# directory instead of real user state: no test run may ever churn
+# (create/unlink) ``~/.vidlift/.gpu-phase.lock``, warm-read
+# ``~/.vidlift/whisper/models``, or (were a GUI path under test) write
+# ``monitor.json`` into the user profile.
+#
+# Precedence is preserved exactly: an explicit argument wins, an
+# explicit ``$VIDLIFT_STATE_DIR`` wins second (env-pinned tests keep
+# passing), and ONLY the silent fallback (which used to be
+# ``Path.home() / ".vidlift"``) is redirected. The redirected root
+# carries the seeded transcription-model state the resolve fast-path
+# contract promises — the Mode A/seam tests resolve the model through
+# the default root and, on this dev box, previously read the dev
+# session's warm real cache; seeding the isolated root keeps their
+# resolution behavior identical (fast path, zero network) now that the
+# default root is hermetic.
+@pytest.fixture(autouse=True)
+def _hermetic_state_root(tmp_path_factory, monkeypatch):
+    from vidlift import benchmark as benchmark_mod
+
+    # A fixture-PRIVATE tmp dir (tmp_path_factory), NOT the test's own
+    # tmp_path: some existing tests assert their tmp_path holds exactly
+    # N entries after a run — a sibling seeded root inside it would
+    # break the pin.
+    root = tmp_path_factory.mktemp("vidlift-state")
+    seed_model_state(root)
+
+    def _isolated_state_dir(explicit=None):
+        if explicit:
+            return Path(explicit)
+        env = os.environ.get("VIDLIFT_STATE_DIR")
+        if env:
+            return Path(env)
+        return root
+
+    monkeypatch.setattr(benchmark_mod, "state_dir", _isolated_state_dir)
+
+
+def seed_model_state(state_root, tag: str = "medium") -> dict:
+    """The machine model-cache state the resolve fast-path contract
+    promises: ``.complete`` marker + ``model.bin`` (the contract checks
+    ONLY the marker's presence + model.bin's existence — resolve skips
+    all digest/size reads on this path, sha256 stays a download-time
+    gate). The support files ride along so the seeded cache matches the
+    real repos' file set. Returns the seeded model dir; tests that
+    assert cold-cache shapes pass their own explicit empty ``state_dir``
+    instead."""
+
+    import hashlib
+
+    model_dir = Path(state_root) / "whisper" / "models" / tag
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+    (model_dir / "tokenizer.json").write_text("{}", encoding="utf-8")
+    (model_dir / "model.bin").write_bytes(b"stub-model-bin")
+    (model_dir / "vocabulary.txt").write_text("", encoding="utf-8")
+    (model_dir / ".complete").write_text(
+        f"{tag}\n{hashlib.sha256(b'stub-model-bin').hexdigest()}\n",
+        encoding="utf-8",
+    )
+    return model_dir
 

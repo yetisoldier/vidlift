@@ -274,7 +274,17 @@ def find_tools(
     return ToolBox(ffmpeg=resolved["ffmpeg"], ffprobe=resolved["ffprobe"])
 
 
-def _subprocess_runner(binary: str, args: list[str]) -> tuple[int, str, str]:
+# v0.4.16 (cancel propagation, the §4.6 observe-fix): the escalation
+# timing of the engine adapter's own child-process discipline
+# (engine_ncnn._run_process, "terminate -> wait 10 s -> kill -> wait 5 s"),
+# mirrored here so run.py's own ffmpeg/ffprobe children stop the same way
+# a cancel-killed engine child already does. Module-level constants so
+# tests can shrink the wait without touching call sites.
+CANCEL_TERMINATE_SECONDS = 10.0
+CANCEL_KILL_SECONDS = 5.0
+
+
+def _subprocess_runner(binary: str, args: list[str], cancel=None) -> tuple[int, str, str]:
     # v0.4.4 (design §6): Popen+communicate instead of subprocess.run so
     # the Windows-only child-console suppression kwargs (startupinfo/
     # CREATE_NO_WINDOW — an empty dict elsewhere) reach the call. The
@@ -288,8 +298,77 @@ def _subprocess_runner(binary: str, args: list[str]) -> tuple[int, str, str]:
         errors="replace",
         **_proc.popen_kwargs(),
     )
-    stdout, stderr = proc.communicate()
-    return proc.returncode, stdout, stderr
+    if cancel is None:
+        stdout, stderr = proc.communicate()
+        return proc.returncode, stdout, stderr
+
+    # v0.4.16 (the §4.6 observe-fix): a cancel MUST stop the underlying
+    # work. With a live cancel flag the default communicate() — an
+    # unlimited blocking wait — is replaced by the engine adapter's
+    # binding discipline: drain threads (no pipe deadlock), a 0.2 s
+    # flag poll, then terminate -> wait -> kill -> wait, and the seam
+    # reports the cancel itself (EngineCancelled) so a cancelled child
+    # can never surface as a VideoToolError failure. The
+    # (rc, stdout, stderr) contract on the no-cancel path is untouched;
+    # the cancel path only ever raises.
+    if cancel():
+        # A cancel in flight before the child could even start: the
+        # engine adapter's own "cancelled before {label}" parity. The
+        # pipes stay undrained by any reader here, so close them
+        # explicitly (the child is reaped by the waits above; a leaked
+        # pipe FD per pre-cancelled command is the resource-hygiene
+        # defect to avoid).
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except OSError:
+                pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=CANCEL_TERMINATE_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=CANCEL_KILL_SECONDS)
+        raise EngineCancelled(f"cancelled during subprocess: {binary}")
+    captured: list[list[str]] = [[], []]
+
+    def _drain(pipe, sink: list[str]) -> None:
+        try:
+            for line in pipe:
+                sink.append(line)
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+    readers = [
+        threading.Thread(target=_drain, args=(pipe, captured[index]), daemon=True)
+        for index, pipe in enumerate((proc.stdout, proc.stderr))
+        if pipe is not None
+    ]
+    for reader in readers:
+        reader.start()
+    while proc.poll() is None:
+        if cancel():
+            proc.terminate()
+            try:
+                proc.wait(timeout=CANCEL_TERMINATE_SECONDS)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=CANCEL_KILL_SECONDS)
+            # the readers hit EOF when the child died; give them a beat
+            # to close their own pipes before the raise (same 1 s bound
+            # as the engine adapter's drain joins)
+            for reader in readers:
+                reader.join(timeout=1)
+            raise EngineCancelled(f"cancelled during subprocess: {binary}")
+        time.sleep(0.2)
+    proc.wait()
+    for reader in readers:
+        reader.join(timeout=1)
+    return proc.returncode, "".join(captured[0]), "".join(captured[1])
 
 
 # v0.4.0 (design B.6): heartbeat cadence for long phases — the pump
@@ -1886,7 +1965,23 @@ def run_file(
     """
     if tools is None:
         tools = find_tools()
-    run_cmd = command_runner or _subprocess_runner
+    # v0.4.16 (the §4.6 observe-fix): when the caller supplies no runner
+    # (the CLI path) the production subprocess runner receives the cancel
+    # flag, so a cancel stops this file's own children exactly as it
+    # stops the bridge's (jobs.py forwards the flag the same way) and the
+    # engine's (the adapter's own discipline). An injected runner keeps
+    # the legacy 2-arg seam (test fakes); run_file's own boundary
+    # observations below cover it.
+    if command_runner is not None:
+        run_cmd: Callable[[str, list[str]], tuple[int, str, str]] = command_runner
+    elif cancel is not None:
+
+        def _cancel_aware_default(binary: str, args: list[str]) -> tuple[int, str, str]:
+            return _subprocess_runner(binary, args, cancel=cancel)
+
+        run_cmd = _cancel_aware_default
+    else:
+        run_cmd = _subprocess_runner
     state = RunState(file_path=file_path)
     if state_box is not None:
         # The bridge's live-status seam: the state object IS the
@@ -1920,10 +2015,31 @@ def run_file(
         phase.finished_at = time.time()
         log(f"phase {phase.name}: done{(' ' + note) if note else ''}")
 
+    def observe_cancel() -> None:
+        # v0.4.16 (the §4.6 observe-fix): the binding cancel contract
+        # says "run_file's cancel callable observes it" — and so far it
+        # observed the flag ONLY inside the engine (upscale) and between
+        # transcription segments. Prepare, encode, verify, and the mux
+        # commands ran to completion (minutes to hours on a real file)
+        # with the flag flipped, the run continued into the NEXT phases,
+        # and the job closed succeeded (or failed, when the child died
+        # uncleanly and VideoToolError masked the cancel) — the registry
+        # transition to `cancelled` never fired and the UI tick
+        # faithfully kept rendering `running` (Eric's cancel repro).
+        # One seam, two check points per command (before issuing, and
+        # after returning BEFORE the nonzero-code guard so a terminated
+        # child can never read as VideoToolError), plus the phase
+        # boundaries the commands can't see (post-engine, post-verify).
+        if cancel is not None and cancel():
+            raise EngineCancelled(
+                f"cancelled in phase {state.current_phase}"
+            )
+
     def run_command(
         phase_name: str, command: list[str], *, heartbeat: bool = False,
         on_touch: Callable[[float], None] | None = None,
     ) -> None:
+        observe_cancel()  # a flipped cancel never issues the next command
         state.commands.append(list(command))
         log(f"{phase_name} command: {' '.join(command)}")
         if heartbeat:
@@ -1942,6 +2058,7 @@ def run_file(
         else:
             code, stdout, stderr = run_cmd(command[0], command[1:])
         state.touch()
+        observe_cancel()  # BEFORE the code guard: a killed child reads cancelled, never failed
         if code != 0:
             raise VideoToolError(phase_name, command, code, stderr or stdout)
 
@@ -2309,6 +2426,13 @@ def run_file(
             state.rejected_mezzanine = engine_result.rejected_mezzanine
             mezzanine_for_encode = engine_result.mezzanine_path
             frames_done = engine_result.frames_done
+        # v0.4.16 (the §4.6 observe-fix): the engine→encode boundary.
+        # The engine adapters honor the flag themselves (the stub's
+        # pre-frame check, the real engine's 0.2 s poll); this boundary
+        # covers an engine whose run() completes despite the flip — the
+        # cancel must land cancelled, not ride into encode/verify or
+        # close succeeded.
+        observe_cancel()
         log(
             f"engine: {state.engine_name}"
             f"{' (simulated, no Real-ESRGAN pass)' if state.engine_simulated else ''}"
@@ -2401,6 +2525,11 @@ def run_file(
         )
         state.verification = verification
         state.touch()
+        # v0.4.16 (the §4.6 observe-fix): the verify→subtitles boundary —
+        # a cancel that lands while the (minutes-long) full decode runs
+        # and the decode finishes anyway closes cancelled, never
+        # succeeded-with-manifest.
+        observe_cancel()
         if verification.ok:
             log("verification: ok (exists, decodes, geometry matches plan)")
         else:
@@ -2513,7 +2642,70 @@ def run_file(
                         transcribe_device = resolve_transcription_device(
                             knobs.get("device") or "auto"
                         )
-                        model_dir = resolve_model_dir(knobs.get("model"))
+                        # v0.4.16 (model management, ADR-3): Mode A's
+                        # publisher — download bytes ride the SAME
+                        # progress dict the GUI tick / /status / mirror
+                        # consume, and every beat touches the state so a
+                        # silent 17-minute download never again reads as
+                        # climbing activity (Eric's repro; a job here
+                        # also holds the GPU phase lock, so the
+                        # download-lock wait label rides on_lock_wait's
+                        # same record_step surface).
+                        _dl_state = {"t": 0.0}
+                        # v0.4.16 (D-1, Karen remediation): the bridge
+                        # executor's JobRecord rides the state_box seam
+                        # (jobs.py) — Mode B's publisher touches
+                        # record+state on every beat; Mode A must too, or
+                        # a first-use download inside a run-job leaves
+                        # record.last_activity_at frozen while the state
+                        # advances and every reader's
+                        # activity_age_seconds climbs past the 15-min
+                        # stale-activity threshold during a LIVE download.
+                        # Defensive read: the CLI passes no state_box (no
+                        # reader needs record freshness there).
+                        box_record = (
+                            state_box.get("record") if state_box else None
+                        )
+
+                        def _on_model_download(done: int, total: int | None) -> None:
+                            now = time.time()
+                            if (
+                                now - _dl_state["t"] < 0.25
+                                and total is not None
+                                and done < total
+                            ):
+                                return
+                            _dl_state["t"] = now
+                            progress = dict(state.progress or {})
+                            progress["model_download"] = {
+                                "bytes_done": int(done),
+                                "bytes_total": (
+                                    int(total) if total is not None else None
+                                ),
+                                "file": "model.bin",
+                            }
+                            progress["step"] = (
+                                "downloading transcription model (model.bin)"
+                            )
+                            state.progress = progress
+                            state.touch()
+                            if box_record is not None:
+                                box_record.touch()
+
+                        model_dir = resolve_model_dir(
+                            knobs.get("model"),
+                            on_download_progress=_on_model_download,
+                            # the GPU lock's waiter: the download-lock
+                            # wait gets the same visible labeling (its
+                            # signature matches the callback contract).
+                            on_lock_wait=_transcribe_wait_label,
+                        )
+                        # Clear the fact the moment resolve returns — the
+                        # next record_step re-merges progress without it,
+                        # but a download never outlives its resolve.
+                        progress = dict(state.progress or {})
+                        progress.pop("model_download", None)
+                        state.progress = progress
                         log(
                             f"transcription: model {model_dir} device "
                             f"{transcribe_device} (cuda=int8_float16, "
@@ -2547,6 +2739,26 @@ def run_file(
                         # never fails the run. Convert to SubtitleOcrError
                         # so the shared fail-open handler below records
                         # it; the lock releases via the finally.
+                        # v0.4.16 (D-2, Karen remediation): the
+                        # fail-open conversion pops the download fact
+                        # unconditionally (mirrors Mode B's on_step pop,
+                        # H-3) — a terminally failed download (network,
+                        # sha mismatch, truncation) must never leave
+                        # status surfaces reporting "downloading" for
+                        # the rest of the run. The ``step`` label moves
+                        # on with it: the byte fact pop alone leaves
+                        # progress["step"] at "downloading transcription
+                        # model (model.bin)" and the stage label renders
+                        # that verbatim (this phase's own step cadence
+                        # ends here — no later core step re-labels, the
+                        # difference from Mode B's on_step pop path).
+                        progress = dict(state.progress or {})
+                        progress.pop("model_download", None)
+                        progress["step"] = (
+                            "subtitles failed open (transcription "
+                            "unavailable)"
+                        )
+                        state.progress = progress
                         raise SubtitleOcrError(
                             "transcription unavailable; no subtitles "
                             f"carried: {exc}"
@@ -2715,6 +2927,13 @@ def run_file(
                 note=subtitles_block["status"],
             )
         state.subtitles = subtitles_block
+        # v0.4.16 (the §4.6 observe-fix): the subtitles→manifest
+        # boundary. The mux/OCR arms run through `runner=` seams (not
+        # run_command), so this is the last checkpoint before the
+        # run records success — a cancel that flipped during a
+        # sidecar mux/OCR pass closes cancelled here, never
+        # succeeded-with-manifest.
+        observe_cancel()
 
         # ---- manifest + finish ----
         state.ok = verification.ok

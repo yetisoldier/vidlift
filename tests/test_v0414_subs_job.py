@@ -509,9 +509,12 @@ def test_subs_job_executes_through_executor(tmp_path, no_lock, monkeypatch):
     # seam the real pipeline's runners via monkeypatch on run_subs_job?
     # No: _execute_subs_job passes services runners; None -> subprocess.
     # Instead patch the module-level _subprocess_runner import inside.
+    # v0.4.16 (the §4.6 observe-fix): the executor now forwards the job's
+    # CancelFlag to the production runner (optional kw); the patched
+    # fake accepts-and-ignores it exactly like a legacy 2-arg fake.
     monkeypatch.setattr(
         "vidlift.run._subprocess_runner",
-        lambda b, a: runner(b, a),
+        lambda b, a, cancel=None: runner(b, a),
     )
     record = registry.enqueue(
         kind="subs", paths=[str(src)],

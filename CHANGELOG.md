@@ -2,6 +2,174 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.16.0] - 2026-11-03
+ 
+### Added
+ 
+- **Transcription-model management** (F1 detect, F2 progress, F3
+  install, F4 surfacing): the faster-whisper `medium` model's
+  presence, download progress, and one-click install are now visible
+  everywhere VidLift already reports truth — no new endpoints, no new
+  MCP tools, no new dependencies, `api_version` stays 1.
+   - **In-run download progress** (Eric's 17-minute silent-stall fix):
+     the fetch seam's contract gains an optional third positional —
+     `fetch(url, target_path, on_progress=None)` with
+     `on_progress(done_bytes, total_bytes_or_None)` fired per copied
+     chunk by the default fetcher (Content-Length carries the total;
+     a close-delimited response publishes `None` and never a
+     fabricated percent). `resolve_model_dir` and
+     `transcribe_source_to_srt` forward it; the Mode B publisher
+     (`_execute_subs_job`) and Mode A's direct resolve publish
+     `progress["model_download"] = {bytes_done, bytes_total, file}`
+     into the SAME progress dict the GUI tick / `/status` / mirror
+     consume, and every beat touches the live record/state so
+     `activity_age_seconds` stops climbing during a long download. The
+     fact is popped at the first post-resolve step; conditional-arity
+     call discipline keeps every legacy 2-arg test fake passing
+     unmodified.
+   - **Per-tag download lock (ADR-5)**: the model-download critical
+     section serializes on `<tag>/.download.lock` — O_CREAT|O_EXCL
+     create-close (no Windows sharing violations), the download's own
+     progress heartbeats the lock's mtime at ≤1 Hz, a lock older than
+     `MODEL_LOCK_STALE_SECONDS` (30 min) is reclaimed, a
+     second-arriving downloader re-runs the fast-path check after
+     acquiring (no double fetch), and an unwritable cache dir degrades
+     OPEN (no hang, no refusal — the sha256 pin remains the integrity
+     backstop).
+   - **GUI pill + Install button (ADR-4)**: a title-stack pill beside
+     the monitor pill — `Subs model (medium): installed / not
+     installed — first subtitles use downloads ~1.5 GB / downloading —
+     X / Y (pct%) / state unknown (cache unreadable)` — plus an
+     explicit Install button running `resolve_model_dir` on a
+     `QThreadPool`/`QRunnable` (the GPU-meter pattern; never the
+     serial JobExecutor). Install is a GUI-only action: no new MCP
+     tool, no new monitor route, no enqueue kind — Hermes stays
+     structurally read-only.
+   - **Status surfacing (ADR-2)**: additive `transcription_model`
+     block (tag, state, cache_dir, bytes_done, bytes_total, file,
+     error) on every per-job `_status_payload` AND once on the
+     `/status` envelope (so a watcher sees machine truth with an idle
+     queue). Derived at read — in-flight job bytes → the GUI install
+     board (`ModelInstallBoard`, in-memory, process-local) → the disk
+     predicate (the resolve fast-path's own `.complete` marker AND
+     `model.bin` rule) → `unknown` on an unreadable cache. Never
+     persisted as a state string.
+   - **Run-panel render**: a download beat renders
+     `downloading transcription model — X / Y (pct%)` in both the
+     `subtitles` (Mode A) and `transcribe` (Mode B) phases, with the
+     stage bar determinate when the total is known and
+     honestly-indeterminate when it is not (no new phase, no
+     `_PHASE_BUSY_LABELS` churn).
+- **Suite hermeticity**: the default state-root resolution
+  (`benchmark.state_dir()`) lands on a per-test tmp root during tests
+  — the suite no longer creates/unlinks the real
+  `~/.vidlift/.gpu-phase.lock` (50 cycles per run observed) nor reads
+  the dev session's warm model cache; an explicit
+  `$VIDLIFT_STATE_DIR` pin still wins, and the isolated root carries
+  the seeded model cache the resolve fast-path contract promises.
+ 
+### Fixed
+ 
+- **A 17-minute model download looked like a hang**: every download
+  beat now touches the running record and state (≤4 Hz publisher
+  throttle), so the GUI's stale-activity warning, the `/status`
+  `activity_age_seconds`, and the 10-second mirror all stay honest
+  during first-use model fetches.
+- **Cancel was silently dropped outside the engine phases** (the
+  §4.6 observe-fix; Eric's 2026-11-03 repro: "cancel current"/"cancel
+  batch" left the job rendered `running` — `/status` read `running`
+  long after the click and `/history` held a mix of `cancelled` AND
+  `failed` rows): `run_file` observed the job's cancel flag only
+  inside the engine adapter (upscale) and between transcription
+  segments. A cancel landing during prepare, encode, verify, or a
+  sidecar mux ran the (minutes-to-hours) child to completion, the run
+  CONTINUED into the next phases, and the job closed `succeeded` — the
+  registry transition to `cancelled` never fired, so the GUI's 1 Hz
+  tick and the monitor faithfully rendered `running`. A terminated
+  child (whatever the cause) surfaced as `VideoToolError`, closing the
+  job `failed` and masking the cancel vocabulary. Fixed on three legs,
+  all inside the documented binding semantics ("run_file's cancel
+  callable observes it"; the engine adapter keeps its own discipline):
+  - **`run_file` observes the flag at every boundary** (run.py): before
+    each phase command, after each command returns — before the
+    nonzero-code guard, so a killed child reads cancelled, never
+    failed — after the engine, after verify, and before the success
+    manifest. A cancelled run writes the cancelled manifest and never
+    spends GPU work after the flip (a pre-cancelled run no longer
+    issues the prepare command).
+  - **`_subprocess_runner` is cancel-aware** (run.py): with a live
+    flag, the unlimited `communicate()` wait becomes the engine
+    adapter's binding child discipline (drain threads, 0.2 s poll,
+    terminate -> wait 10 s -> kill -> wait 5 s) and raises
+    `EngineCancelled` — the underlying ffmpeg/ffprobe child actually
+    stops. Without a flag the (rc, stdout, stderr) contract is
+    byte-identical.
+  - **The executor forwards the flag through its tracked runners**
+    (jobs.py): run/subs jobs' production children terminate on the
+    flip like the engine's own do; a cancelled BENCHMARK job now
+    closes `cancelled` (it used to fall through the run-error mapping
+    as `failed`). Canceled state reaches the registry within the
+    wind-down (≤ ~10 s worst case), and the GUI tick / monitor
+    `/status` reflect it on the following read — regression tests in
+    `tests/test_v0416_cancel_propagation.py` plus the GUI-tick test in
+    `test_gui.py`.
+- **Karen's v0.4.16 validation remediation** (2026-11-03 report; three
+  honesty fixes the promised test matrices' absence had let slip,
+  plus three hardening fixes — the matrices themselves are landed
+  with this release, so each fix now has its cell pinned):
+  - **Mode A download beats now touch the JobRecord** (D-1): run.py's
+    in-run download publisher touched only the live state, so a
+    first-use model download inside a run-job left the record's
+    `last_activity_at` frozen while the state advanced — every
+    reader's `activity_age_seconds` kept climbing during a LIVE
+    download (the GUI's stale-activity warning, the stage label,
+    `/status` crossed the 15-min threshold on a 17-minute fetch). The
+    executor now carries the record in run_file's state_box seam and
+    the publisher touches record+state per beat, mirroring the Mode B
+    publisher. The model-management spec's H-2 heartbeat-parity test
+    is landed (`tests/test_v0416_mode_a_honesty.py`).
+  - **A failed in-run download no longer reports "downloading"** (D-2):
+    Mode A's fail-open conversion popped nothing — a terminal download
+    failure (network error, sha mismatch, truncation) left the
+    `model_download` byte fact AND its "downloading" step label riding
+    status surfaces for the rest of the run. The conversion now pops
+    the fact and moves the step label on (mirroring Mode B's
+    unconditional pop). The H-3 Mode A analog test is landed.
+  - **Terminal run jobs echo their device** (D-3): `_transcription_echo`'s
+    manifest arm read top-level `manifest["subtitles"]` but every real
+    manifest stores the subtitles block at `manifest["run"]["subtitles"]`
+    — Hermes's one-shot read of a finished/failed run job always saw
+    `transcription.device: null`. The read now keys the real layout.
+    The T-1..T-6 device-echo matrix is landed
+    (`tests/test_v0416_transcription_echo.py`).
+  - **The per-tag download lock can no longer spin on a mid-wait
+    permission flip** (D-4): round-0 contention followed by the cache
+    dir going read-only looped the OSError retry at 1 Hz forever
+    (the degrade-OPEN arm fired only on round 0). A PermissionError on
+    ANY round — or 3 consecutive non-FileExistsError OSErrors — now
+    degrades OPEN the same way (the sha256 pin remains the backstop;
+    never a hang). Probe regression tests appended to the lock matrix.
+  - **The discovery card is owner-only** (D-5): the card carries the
+    effective monitor token but was created world/group-readable
+    (0o664 under this umask). It is now created 0o600 (and the state
+    dir 0o700 when VidLift creates it), so the token no longer
+    bypasses the `/status`/`/history` gate on shared machines.
+  - **The discovery card's staging name is pid-unique** (D-6): the
+    fixed `monitor.json.tmp` let two GUI instances sharing a state
+    dir interleave one staging file — atomic `os.replace` moves only
+    this writer's own completed card now.
+  - The visibility spec's D-1..D-6 discovery-card matrix is landed
+    (`tests/test_v0416_discovery_card.py`), the model-management
+    spec's H-2/H-3 Mode A cells in
+    `tests/test_v0416_mode_a_honesty.py`; no behavior claim in the
+    entries above extends beyond what the landed tests pin.
+ 
+### Known issues
+- **Lock stale-reclaim spin (R-1)**: the lock stale-reclaim logic can
+  spin on a read-only directory containing a stale lock; non-gating
+  follow-up.
+
+
 ## [0.4.15.4] - 2026-11-03
 
 ### Fixed

@@ -1,4 +1,4 @@
-"""Speech transcription to SRT subtitles for VidLift (v0.4.15.2).
+"""Speech transcription to SRT subtitles for VidLift (v0.4.16).
 
 The v0.4.14 design §"Transcription core": one shared transcription core
 under Modes A (upscale fallback) and B (standalone subs). faster-whisper
@@ -43,11 +43,13 @@ a manifest note — never silently, never twice mid-run.
 from __future__ import annotations
 
 import array
+import contextlib
 import hashlib
 import os
 import re
-import shutil
 import sys
+import threading
+import time
 import wave
 import urllib.error
 import urllib.request
@@ -66,11 +68,13 @@ __all__ = [
     "KNOWN_MODELS",
     "MIN_DOWNLOAD_SIZE",
     "MODEL_SHA256",
+    "MODEL_LOCK_STALE_SECONDS",
     "TRANSCRIPTION_ENABLED_DEFAULT",
     "TranscribeEngine",
     "TranscriptionError",
     "TranscriptionResult",
     "WhisperEngine",
+    "ModelInstallBoard",
     "align_verify_cues",
     "CUE_LEAD_IN_MS",
     "CUE_LEAD_OUT_MS",
@@ -79,6 +83,7 @@ __all__ = [
     "make_whisper_engine_with_fallback",
     "model_cache_dir",
     "model_download_url_for",
+    "model_install_state",
     "resolve_transcription_device",
     "resolve_model_dir",
     "segments_to_cues",
@@ -790,25 +795,184 @@ def model_cache_dir(state_root: str | os.PathLike | None) -> Path:
     return Path(state_root) / "whisper" / "models"
 
 
+MODEL_LOCK_STALE_SECONDS = 1800  # 30 min: heartbeats keep an active lock young
+# v0.4.16 (D-4): a degraded cache dir (read-only mid-wait) must break the
+# wait-out, never spin — degrade-OPEN after this many CONSECUTIVE
+# non-FileExistsError OSErrors (PermissionError degrades immediately).
+MODEL_LOCK_OERROR_DEGRADE_ROUNDS = 3
+
+
+@contextlib.contextmanager
+def _model_download_lock(target_dir: Path, on_wait=None):
+    """Per-tag download critical section (v0.4.16, model-management ADR-5).
+
+    O_CREAT|O_EXCL lockfile ``<tag>/.download.lock`` — create-close, never
+    held open (no Windows sharing-violation trap). The download's own
+    progress callback heartbeats its mtime (≤1 Hz), so a live writer never
+    looks stale; a lock older than MODEL_LOCK_STALE_SECONDS is dead weight
+    (killed process) and is reclaimed once. Degrade-OPEN on an unwritable
+    cache dir: proceed WITHOUT the lock — the sha256 pin remains the
+    integrity backstop; never a hang, never a refusal (the GPU-phase-lock
+    honesty rule, mirrored). The caller re-runs its fast-path check after
+    acquire: the winner likely finished while we waited.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    lock = target_dir / ".download.lock"
+    waited = 0.0
+    rounds = 0
+    # v0.4.16 (D-4): consecutive non-FileExistsError OSErrors — the
+    # bounded trigger below; reset by ordinary contention (a
+    # FileExistsError means the filesystem is still writable).
+    oserror_streak = 0
+    held_token = False
+    try:
+        while True:
+            try:
+                lock_fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                # Normal contention (NOT a permission failure). The
+                # stale-check runs BEFORE sleeping: a dead writer's
+                # lock is reclaimed unilaterally (the retry IS the
+                # correctness); a live one earns a labeled wait.
+                rounds += 1
+                oserror_streak = 0  # contention != degradation (D-4)
+                try:
+                    stale = (
+                        time.time() - os.stat(lock).st_mtime
+                        > MODEL_LOCK_STALE_SECONDS
+                    )
+                except OSError:
+                    stale = False  # stat/unlink races with the other process
+                if stale:
+                    try:
+                        os.unlink(lock)
+                    except OSError:
+                        pass  # races are retries, not errors
+                    continue
+                if on_wait is not None:
+                    try:
+                        on_wait(_lock_holder_pid(lock), waited)
+                    except Exception:
+                        pass  # a label hook never blocks the download
+                time.sleep(1.0)
+                waited += 1.0
+            except OSError as exc:
+                # v0.4.16 (model management, ADR-5): Degrade-OPEN on
+                # the FIRST create attempt (permissions, read-only
+                # fs) — proceed WITHOUT the lock (yield False); the
+                # sha256 pin remains the integrity backstop. Never
+                # a hang, never a refusal.
+                # v0.4.16 (D-4, Karen remediation): a MID-WAIT
+                # degradation (the cache dir made read-only while we
+                # wait on a live contender) degrades-OPEN too — a
+                # PermissionError on ANY round, or
+                # MODEL_LOCK_OERROR_DEGRADE_ROUNDS consecutive
+                # non-FileExistsError OSErrors, breaks out the same
+                # way, so the downloading thread can never spin
+                # silently forever. Ordinary stat/open races keep the
+                # 1 Hz retry cadence (an intervening FileExistsError
+                # resets the streak — contention is not degradation).
+                if (
+                    rounds == 0
+                    or isinstance(exc, PermissionError)
+                    or oserror_streak + 1 >= MODEL_LOCK_OERROR_DEGRADE_ROUNDS
+                ):
+                    break
+                oserror_streak += 1
+                # a later-round failure is a stat/open race — retry, but
+                # never as a hot loop (the same 1 Hz cadence the
+                # FileExistsError arm uses)
+                time.sleep(1.0)
+                waited += 1.0
+                continue  # stat/unlink races are retries, not errors
+            else:
+                try:
+                    os.write(
+                        lock_fd, f"{os.getpid()}\n{time.time()}\n".encode("utf-8")
+                    )
+                finally:
+                    os.close(lock_fd)  # create-close, never held open
+                held_token = True
+                break
+        yield held_token
+    finally:
+        # Release only when held; unlink races (a stale-reclaimer freed
+        # it already) are not errors. Never held open, so nothing can
+        # leak a Windows sharing violation.
+        if held_token:
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
+
+
+def _lock_heartbeat(callback, lock_path: Path) -> Callable[[int, int | None], None]:
+    """v0.4.16 (model management, ADR-5): wrap a download-progress
+    callback so every beat ALSO refreshes the lock's mtime (≤1 Hz) —
+    a live download keeps its lock young with zero extra threads.
+    ``callback=None`` installs a no-op beat: the heartbeat exists
+    purely to keep the lock young, never to invent observables."""
+    last = [0.0]
+
+    def _heartbeat(done: int, total: int | None) -> None:
+        now = time.time()
+        if now - last[0] >= 1.0:
+            last[0] = now
+            try:
+                os.utime(lock_path, None)
+            except OSError:
+                pass  # the lock is a courtesy, never a failure source
+        if callback is not None:
+            callback(done, total)
+
+    return _heartbeat
+
+
+def _lock_holder_pid(lock: Path) -> int | None:
+    """Best-effort holder pid from the lockfile's first line — content
+    is ``pid\\ntimestamp\\n``; anything unreadable stays None (the wait
+    label renders ``?``, exactly like the GPU lock's unknown holder)."""
+    try:
+        head = (lock.read_text(encoding="utf-8").split("\n") or [""])[0].strip()
+        return int(head) if head else None
+    except (OSError, ValueError):
+        return None
+
+
 def resolve_model_dir(
     pin: str | None = None,
     *,
     state_root: str | os.PathLike | None = None,
     fetch=None,
+    on_download_progress: Callable[[int, int | None], None] | None = None,
+    on_lock_wait: Callable[[int | None, float], None] | None = None,
 ) -> str:
     """Resolve the transcription engine model: explicit pin (a user
     model PATH or a known tag) -> the machine-shared cache.
 
     Known tag: download on first use into
     ``<state_root>/whisper/models/<tag>/`` with the sha256-pinned
-    model.bin (``.part`` resume; MIN_DOWNLOAD_SIZE guard; final size +
+    model.bin (``.part`` resume — a size-matching staged ``.part``
+    short-circuits the fetch; MIN_DOWNLOAD_SIZE guard; final size +
     digest checked before rename). Honest progress through
-    ``on_download_progress(done_bytes, total_bytes_or_None)``.
-    A known tag whose cache exists just returns the path (no fetch).
+    ``on_download_progress(done_bytes, total_bytes_or_None)`` — now
+    TRUE, not decorative (v0.4.16, ADR-3): every copied chunk of the
+    default fetcher fires it, and ``total_bytes_or_None`` is the
+    server's Content-Length or None when absent. A known tag whose
+    cache exists just returns the path (no fetch).
 
     An unknown pin is treated as a PATH the user supplied (the config
     pin override large-v3/user-path discipline); a readable directory
     wins verbatim, a missing one raises TranscriptionError naming it.
+
+    v0.4.16 (model management, ADR-5): the download critical section
+    (from the failed fast-path through the ``.complete`` marker write)
+    serializes per tag on ``<tag>/.download.lock`` — a second acquirer
+    re-runs the fast-path check after acquiring (the winner likely
+    finished while it waited: no double fetch), ``on_lock_wait(
+    holder_pid_or_None, waited_seconds)`` mirrors the GPU lock's wait
+    label, and an unwritable cache dir degrades OPEN (no lock, sha256
+    still gates completion).
     """
     if _engine_disabled_by_env():
         raise TranscriptionError(
@@ -839,52 +1003,84 @@ def resolve_model_dir(
             f"no sha256 pin for model '{tag}'; refusing an unpinned "
             "transcription model download"
         )
-    if fetch is None:
+    # v0.4.16 (model management, ADR-3/5): the progress consumer that
+    # rides into _download_file. The caller's callback (when one was
+    # supplied) is wrapped so every beat ALSO heartbeats the download
+    # lock's mtime (≤1 Hz) — a live download never looks stale. With
+    # no caller consumer:
+    #   - the DEFAULT fetcher still installs a NO-OP beat (its
+    #     per-chunk channel keeps the lock young on the legacy
+    #     no-progress path), while
+    #   - an INJECTED fetch keeps the legacy 2-arg no-progress shape
+    #     byte-identical (M-1: the conditional-arity discipline —
+    #     legacy test fakes never receive a third argument).
+    use_default_fetcher = fetch is None
+    if use_default_fetcher:
         fetch = _default_fetcher()
-    for filename, expected_size in MODEL_SUPPORT_FILES.get(tag, ()):
-        path = target / filename
-        if not path.is_file() or path.stat().st_size != expected_size:
+    lock_path = target / ".download.lock"
+    if on_download_progress is not None or use_default_fetcher:
+        progress = _lock_heartbeat(on_download_progress, lock_path)
+    else:
+        progress = None
+    with _model_download_lock(target, on_wait=on_lock_wait):
+        # Second-acquirer fast path (ADR-5): re-run the contract check
+        # AFTER acquiring — the winning racer may have completed while
+        # we waited for the lock.
+        if (target / ".complete").is_file() and (target / "model.bin").is_file():
+            return str(target)
+        for filename, expected_size in MODEL_SUPPORT_FILES.get(tag, ()):
+            path = target / filename
+            if not path.is_file() or path.stat().st_size != expected_size:
+                _download_file(
+                    target,
+                    filename,
+                    model_download_url_for(tag, filename),
+                    expected_size=expected_size,
+                    fetch=fetch,
+                    on_progress=progress,
+                )
+        bin_path = target / "model.bin"
+        if (
+            not bin_path.is_file()
+            or bin_path.stat().st_size < MIN_DOWNLOAD_SIZE
+        ):
             _download_file(
                 target,
-                filename,
-                model_download_url_for(tag, filename),
-                expected_size=expected_size,
+                "model.bin",
+                model_download_url_for(tag, "model.bin"),
+                expected_size=None,
                 fetch=fetch,
-                on_progress=None,
+                on_progress=progress,
             )
-    bin_path = target / "model.bin"
-    if (
-        not bin_path.is_file()
-        or bin_path.stat().st_size < MIN_DOWNLOAD_SIZE
-    ):
-        _download_file(
-            target,
-            "model.bin",
-            model_download_url_for(tag, "model.bin"),
-            expected_size=None,
-            fetch=fetch,
-            on_progress=None,
-        )
-    digest = _sha256_file(bin_path)
-    if digest != expected_sha:
-        try:
-            os.remove(bin_path)
-        except OSError:
-            pass
-        raise TranscriptionError(
-            f"transcription model '{tag}' failed its sha256 pin "
-            f"(got {digest[:16]}..., expected {expected_sha[:16]}...); "
-            "the download was deleted — retry to refetch"
-        )
-    marker.write_text(f"{tag}\n{expected_sha}\n", encoding="utf-8")
-    return str(target)
+        digest = _sha256_file(bin_path)
+        if digest != expected_sha:
+            try:
+                os.remove(bin_path)
+            except OSError:
+                pass
+            raise TranscriptionError(
+                f"transcription model '{tag}' failed its sha256 pin "
+                f"(got {digest[:16]}..., expected {expected_sha[:16]}...); "
+                "the download was deleted — retry to refetch"
+            )
+        marker.write_text(f"{tag}\n{expected_sha}\n", encoding="utf-8")
+        return str(target)
 
 
 def _default_fetcher() -> Callable:
     """The real HTTP fetcher: URL -> ``<target>.part`` (one file, no
-    double suffixes — the caller's ``.part`` IS the staging name)."""
+    double suffixes — the caller's ``.part`` IS the staging name).
 
-    def fetch(url: str, target_path: Path) -> None:
+    v0.4.16 (model management, ADR-3): the contract is
+    ``Callable[[str, Path], None]  ->  Callable[[str, Path,
+    Callable[[int, int | None], None] | None], None]`` —
+    ``fetch(url, target_path, on_progress=None)``; ``on_progress(done_bytes,
+    total_bytes_or_None)`` fires per copied chunk when supplied. Call sites
+    pass the third argument ONLY when a progress consumer exists
+    (conditional arity — the shape that keeps every legacy 2-arg fake
+    valid on no-progress paths)."""
+
+    def fetch(url: str, target_path: Path, on_progress=None) -> None:
         tmp = target_path.with_name(target_path.name + ".tmp")
         size_hint: int | None = None
         try:
@@ -893,14 +1089,22 @@ def _default_fetcher() -> Callable:
                 if length:
                     size_hint = int(length)
                 tmp.parent.mkdir(parents=True, exist_ok=True)
+                done = 0
                 with open(tmp, "wb") as fh:
-                    shutil.copyfileobj(response, fh, 1024 * 1024)
-            if size_hint is not None and tmp.stat().st_size != size_hint:
-                raise TranscriptionError(
-                    f"download of {target_path.name} was truncated "
-                    f"({size_hint} bytes expected)"
-                )
-            os.replace(tmp, target_path)
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        done += len(chunk)
+                        if on_progress is not None:
+                            on_progress(done, size_hint)
+                if size_hint is not None and tmp.stat().st_size != size_hint:
+                    raise TranscriptionError(
+                        f"download of {target_path.name} was truncated "
+                        f"({size_hint} bytes expected)"
+                    )
+                os.replace(tmp, target_path)
         except BaseException:
             # v0.4.15.4 (F-11): a failed/interrupted fetch must never
             # strand the .part.tmp staging file (os.replace consumed
@@ -928,7 +1132,14 @@ def _download_file(
         os.replace(part, target_dir / filename)
         return
     try:
-        fetch(url, part)
+        # v0.4.16 (model management, ADR-3): conditional-arity discipline —
+        # the third argument is passed ONLY when a progress consumer
+        # exists (the shape that keeps every legacy 2-arg fake valid on
+        # no-progress paths).
+        if on_progress is not None:
+            fetch(url, part, on_progress)
+        else:
+            fetch(url, part)
     except TranscriptionError:
         raise
     except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
@@ -974,6 +1185,170 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+# ---- install state (v0.4.16, model management ADR-1/2/4) --------------------
+
+
+class ModelInstallBoard:
+    """In-memory, process-local install/install-attempt truth (v0.4.16,
+    ADR-4). The GUI's install worker (and only it, today) writes; the
+    status surfaces read. No file, no mirror — the board dies with the
+    process, which is honest: a dead install is not downloading. One
+    threading.Lock guards a single-slot snapshot dict; readers copy under
+    the lock and never hold it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._slot: dict | None = None
+
+    # -- writers (the GUI install worker's thread) --------------------------
+
+    def begin(self, tag: str) -> None:
+        """An install attempt starts: state=downloading, bytes 0/None."""
+        with self._lock:
+            self._slot = {
+                "tag": tag,
+                "state": "downloading",
+                "bytes_done": 0,
+                "bytes_total": None,
+                "file": None,
+                "error": None,
+                "updated_at": time.time(),
+            }
+
+    def update(self, *, bytes_done: int, bytes_total: int | None, file: str) -> None:
+        """A download beat; keeps the slot's freshness stamp current."""
+        with self._lock:
+            if self._slot is not None and self._slot["state"] == "downloading":
+                self._slot["bytes_done"] = int(bytes_done)
+                self._slot["bytes_total"] = (
+                    int(bytes_total) if bytes_total is not None else None
+                )
+                self._slot["file"] = file
+                self._slot["updated_at"] = time.time()
+
+    def succeed(self, tag: str) -> None:
+        """The install landed; state=installed (disk agrees; the UI
+        re-checks anyway)."""
+        with self._lock:
+            self._slot = {
+                "tag": tag,
+                "state": "installed",
+                "bytes_done": None,
+                "bytes_total": None,
+                "file": None,
+                "error": None,
+                "updated_at": time.time(),
+            }
+
+    def fail(self, tag: str, error: str) -> None:
+        """The install failed: state=not-installed, error=message."""
+        with self._lock:
+            self._slot = {
+                "tag": tag,
+                "state": "not-installed",
+                "bytes_done": None,
+                "bytes_total": None,
+                "file": None,
+                "error": error,
+                "updated_at": time.time(),
+            }
+
+    # -- readers --------------------------------------------------------------
+
+    def snapshot(self) -> dict | None:
+        """The board's one slot (copied under the lock), or None when
+        nothing was ever recorded (fresh process). Keys are exactly the
+        ``transcription_model`` payload keys plus ``updated_at``."""
+        with self._lock:
+            slot = self._slot
+        return dict(slot) if slot is not None else None
+
+
+def model_install_state(
+    tag: str,
+    *,
+    state_root: str | os.PathLike | None = None,
+    board: ModelInstallBoard | None = None,
+    progress_download: dict | None = None,
+) -> dict:
+    """The additive ``transcription_model`` block (v0.4.16).
+
+    Derive-at-read, never persist a state string. Order (architecture §6):
+    1. ``progress_download`` (a live job's ``progress["model_download"]``):
+       the in-flight truth — ``downloading`` with its byte fields.
+    2. a fresh board snapshot whose ``state == "downloading"`` (a GUI
+       install in flight while no job rides this record).
+    3. the disk predicate — ADR-1, the resolve fast-path contract verbatim:
+       ``.complete`` marker AND ``model.bin`` present → ``installed``;
+       else ``not-installed``.
+    4. OSError on the disk probe → ``state="unknown"`` (honest: a
+       permissions failure is not "missing").
+    ``bytes_*``/``file`` are null unless downloading; ``error`` rides only a
+    board ``fail`` snapshot (until the next begin/succeed clears it)."""
+    cache_dir = model_cache_dir(state_root) / tag
+
+    def _disk_installed() -> bool:
+        # ADR-1: the resolve fast-path's OWN predicate, verbatim — the
+        # indicator and the resolver can never disagree.
+        return (
+            Path(cache_dir, ".complete").is_file()
+            and Path(cache_dir, "model.bin").is_file()
+        )
+
+    try:
+        disk_installed = _disk_installed()
+    except OSError:
+        state = "unknown"
+        error = None
+    else:
+        state = "installed" if disk_installed else "not-installed"
+        error = None
+    bytes_done: int | None = None
+    bytes_total: int | None = None
+    file: str | None = None
+    live = progress_download if isinstance(progress_download, dict) else None
+    if live is not None and live.get("bytes_done") is not None:
+        try:
+            parsed_done = int(live["bytes_done"])  # may raise on junk
+            raw_total = live.get("bytes_total")
+            parsed_total = int(raw_total) if raw_total is not None else None
+        except (TypeError, ValueError):
+            # S-11 (foreign-state tolerance): a malformed live fact
+            # degrades to the disk derivation, never a crash.
+            live = None
+        else:
+            # A live job's in-flight byte truth beats idle disk truth:
+            # the bytes have not landed the marker yet.
+            state = "downloading"
+            bytes_done = parsed_done
+            bytes_total = parsed_total
+            file = live.get("file") or "model.bin"
+    if live is None:
+        snap = board.snapshot() if board is not None else None
+        # Board priority rule (binding): a snapshot participates ONLY
+        # when its tag is the queried one; a downloading board beats
+        # disk, a fail snapshot contributes only its error (post-failure
+        # truth is "not-installed + why"), a succeed snapshot contributes
+        # nothing (disk is the truth).
+        if snap is not None and snap.get("tag") == tag:
+            if snap.get("state") == "downloading":
+                state = "downloading"
+                bytes_done = snap.get("bytes_done")
+                bytes_total = snap.get("bytes_total")
+                file = snap.get("file") or None
+            elif snap.get("state") == "not-installed" and state == "not-installed":
+                error = snap.get("error") or None
+    return {
+        "tag": tag,
+        "state": state,
+        "cache_dir": str(cache_dir),
+        "bytes_done": bytes_done,
+        "bytes_total": bytes_total,
+        "file": file,
+        "error": error,
+    }
 
 
 # ---- device resolution --------------------------------------------------------
@@ -1673,9 +2048,14 @@ def transcribe_source_to_srt(
                 on_fallback=_default_on_fallback,
             )
         on_step and on_step("transcribe-resolve")
+        # v0.4.16 (model management, ADR-3): the previously decorative
+        # on_download_progress parameter becomes load-bearing — the
+        # download's chunk beats now reach the caller (Mode B's
+        # publisher / Mode A's run-side publisher) through the seam.
         model_dir = resolve_model_dir(
             model_pin,
             state_root=state_root,
+            on_download_progress=on_download_progress,
         )
         engine = (
             engine_factory(model_dir, **engine_kwargs)

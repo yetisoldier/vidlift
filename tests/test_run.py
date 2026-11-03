@@ -1592,7 +1592,19 @@ class TestRunFileFailures:
                 path, tools=tools, probe_runner=runner, command_runner=runner,
                 log_dir=str(tmp_path / "runs"), cancel=lambda: True,
             )
-        assert excinfo.value.state.current_phase == PHASE_UPSCALE  # type: ignore[attr-defined]
+        state = excinfo.value.state  # type: ignore[attr-defined]
+        # v0.4.16 (the §4.6 observe-fix): the cancel now lands at the
+        # FIRST boundary — the prepare command itself is never issued
+        # (a pre-cancelled run no longer spends the expensive prepare
+        # ffmpeg pass before the engine's pre-frame check stops it at
+        # upscale). The cancelled stop before the AI pass is the
+        # behavior under test; the phase where it fires moved earlier.
+        assert state.current_phase == PHASE_PREPARE
+        # the prepare command was never issued (the old flow wasted it)
+        assert not any(
+            str(parts[-1]).endswith(".prepared.mkv")
+            for _b, parts in runner.commands
+        )
 
 
 class TestVerification:

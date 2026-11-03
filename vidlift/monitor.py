@@ -133,11 +133,37 @@ def status_payload(view: "StatusView") -> dict:
     benchmark. ``elapsed_seconds`` is left to the reader
     (``server_time - started_at``); nothing is computed the GUI does
     not compute.
+
+    v0.4.16 (model-management ADR-2): one machine-scoped
+    ``transcription_model`` block rides the ENVELOPE — any active job's
+    in-flight download beats idle disk truth; the GUI install board
+    (soft-read via getattr — foreign clients/fakes degrade to the disk
+    derivation) then the disk predicate. Additive key; ``api_version``
+    stays 1; ``/health`` gains nothing.
     """
     running, queued = view._client.queue_views()
     active_ids = [record.job_id for record in running]
     active_ids += [record.job_id for record in queued]
     active = [s for s in view.enqueue_snapshots(active_ids) if s is not None]
+    # Soft getattr chain throughout: a foreign client/fake lacking
+    # services or the board must not 500 the envelope.
+    client = getattr(view, "_client", None)
+    services = getattr(client, "services", None)
+    board = getattr(services, "model_install_board", None)
+    # In-flight job download beats idle disk truth for the machine block:
+    in_flight = None
+    for job in active:
+        dl = (job.get("transcription_model") or {})
+        if dl.get("state") == "downloading":
+            in_flight = dl
+            break
+    from .transcribe import DEFAULT_MODEL, model_install_state
+
+    model_block = in_flight or model_install_state(
+        DEFAULT_MODEL,
+        state_root=getattr(services, "state_dir", None),
+        board=board,
+    )
     return {
         "api_version": API_VERSION,
         "version": __version__,
@@ -146,6 +172,9 @@ def status_payload(view: "StatusView") -> dict:
         "uptime_seconds": round(time.time() - _STARTED_AT, 3),
         "active_jobs": active,
         "queued_count": len(queued),
+        # v0.4.16 (after queued_count, per the impl spec's placement): the
+        # machine-scoped model truth, so Hermes sees it with an IDLE queue.
+        "transcription_model": model_block,
         "server_time": time.time(),
     }
 

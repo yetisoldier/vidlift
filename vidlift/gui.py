@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QTimer
+from PyQt6.QtCore import QSettings, Qt, QTimer, QThreadPool
 from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent, QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -54,6 +54,8 @@ from .config import (
     MONITOR_HOST_DEFAULT,
     MONITOR_PORT_DEFAULT,
     MONITOR_TOKEN_DEFAULT,
+    MONITOR_DISCOVERY_FILENAME,
+    MONITOR_DISCOVERY_SCHEMA,
     QSETTINGS_MONITOR_KEYS,
     DENOISE_DEFAULT,
     QSETTINGS_DENOISE_KEYS,
@@ -61,6 +63,7 @@ from .config import (
 from .mcp_bridge.client_local import (
     BatchTooLarge,
     LocalBridgeClient,
+    default_state_dir,
 )
 from .mcp_bridge.tools import BridgeError
 from .monitor import (
@@ -71,6 +74,11 @@ from .monitor import (
 from .run import UPSCALE_STEP_PREPARED_COUNT as PREPARED_COUNT_PROBE_STEP
 from .plan import BatchPlan, PlannedFile, build_batch_plan
 from .probe import ProbeError, probe_and_classify
+# v0.4.16 (model management, ADR-4): the GUI-owned install worker — the
+# GPU-meter pattern (QThreadPool/QRunnable + signals), never the serial
+# JobExecutor, never a remote surface.
+from .ui.model_install import ModelInstallRunnable, ModelInstallSignals
+from .transcribe import DEFAULT_MODEL, model_install_state
 # v0.4.15.3 (F-5): the Mode B output name has ONE derivation (regex
 # stem-strip in subs_job) — the GUI's display, pre-flight, and run
 # guard reuse it so they can never diverge on non-4-char extensions
@@ -335,6 +343,27 @@ def run_stage_label(snapshot: dict | None) -> str:
         and phase == "upscale"
     ):
         chunk_text = f" frames {frames_done}/{frames_total}"
+    # v0.4.16 (model management, F2): an in-flight model download renders
+    # its byte truth BEFORE the phase dispatch — the download rides the
+    # existing transcribe/subtitles phases (no new phase, no new busy
+    # label; the N-2 parity pins stay intact), and the honest
+    # total-unknown shape never fabricates a percent.
+    dl = progress.get("model_download")
+    if isinstance(dl, dict) and phase in ("transcribe", "subtitles"):
+        done = dl.get("bytes_done")
+        total = dl.get("bytes_total")
+        if isinstance(done, (int, float)) and done >= 0:
+            if isinstance(total, (int, float)) and total > 0:
+                pct = min(100.0, done * 100.0 / total)
+                return (
+                    f"downloading transcription model — "
+                    f"{format_bytes(int(done))} / {format_bytes(int(total))} "
+                    f"({pct:.0f}%)"
+                )
+            return (
+                f"downloading transcription model — "
+                f"{format_bytes(int(done))} (total size unknown)"
+            )
     if phase == "probe":
         base = "probe — reading source metadata"
     elif phase == "prepare":
@@ -498,6 +527,25 @@ class MainWindow(QMainWindow):
         self.monitor_pill = QLabel("")
         self.monitor_pill.setObjectName("VersionBadge")
         self.monitor_port_reported: int | None = None
+
+        # ---- v0.4.16 (model management, ADR-4): the subs-model pill
+        # + Install button, beside the monitor pill (the proven chrome
+        # for a machine-state fact with an action affordance; visible
+        # at launch, pre-plan — model presence is global machine
+        # state, not per-plan input).
+        self.subs_model_pill = QLabel("")
+        self.subs_model_pill.setObjectName("VersionBadge")
+        self.subs_model_button = QPushButton("Install")
+        self.subs_model_button.setObjectName("ModelInstallButton")
+        self.subs_model_button.setToolTip(
+            "Download the transcription model (~1.5 GB, one time, "
+            "sha256-verified) used by Add subtitles. Downloads in the "
+            "background; jobs keep running."
+        )
+        self.subs_model_button.clicked.connect(self._install_subs_model)
+        # The in-flight click guard (G-5): exactly one install runnable
+        # at a time; reads False until the first Install click.
+        self._subs_model_installing = False
 
         # Sibling port: the 1 Hz single-writer liveness timer.
         self._elapsed_timer = QTimer(self)
@@ -723,6 +771,9 @@ class MainWindow(QMainWindow):
         # its first sample lands on a fully built top bar. With
         # nvidia-smi absent it simply renders "GPU n/a" every 0.5 s.
         self.gpu_meter.start()
+        # v0.4.16 (model management, ADR-4): the subs-model pill's first
+        # truth lands with the window (construction-time disk check).
+        self._refresh_subs_model_pill()
 
     # -- engine persistence (design §7) ---------------------------------
 
@@ -761,7 +812,17 @@ class MainWindow(QMainWindow):
         """The persisted monitor settings (QSettings, §4.4); a missing
         value reads as the module default — ON by default at
         0.0.0.0:8765 with the baked token (vidlift.config). A stored
-        empty token means local-only open."""
+        empty token means local-only open.
+
+        ``token_source`` (visibility ADR-2) names WHERE the effective
+        token came from, resolved HERE because ``contains`` is the only
+        honest presence test and this is the one method reading
+        QSettings: absent → ``default`` (the baked module constant is
+        in force — the zero-action pairing fast path); present-and-
+        nonempty → ``qsettings`` (an override a watcher must re-pair
+        for); present-empty → ``empty-open`` (open mode; the served
+        semantics are UNCHANGED — this is a label, a canary for the
+        paired watcher, never a behavior switch)."""
         settings = self._settings()
         try:
             port = int(
@@ -776,12 +837,91 @@ class MainWindow(QMainWindow):
             enabled = enabled.lower() not in ("false", "0", "no", "off", "")
         host = settings.value(QSETTINGS_MONITOR_KEYS["host"], MONITOR_HOST_DEFAULT)
         token = settings.value(QSETTINGS_MONITOR_KEYS["token"], MONITOR_TOKEN_DEFAULT)
+        if not settings.contains(QSETTINGS_MONITOR_KEYS["token"]):
+            token_source = "default"
+        elif str(token or ""):
+            token_source = "qsettings"
+        else:
+            token_source = "empty-open"
         return {
             "enabled": bool(enabled),
             "host": str(host or MONITOR_HOST_DEFAULT),
             "port": port,
             "token": str(token or ""),
+            "token_source": token_source,
         }
+
+    def _write_monitor_discovery(
+        self, *, enabled: bool, port: int | None, token: str, token_source: str
+    ) -> None:
+        """ADR-2 discovery card: ``<state_dir>/monitor.json`` (atomic
+        temp+replace, pid-unique staging; owner-only 0o600 — the token
+        is a secret, D-5/D-6). Carries the EFFECTIVE port/token the monitor
+        serves so a paired watcher (Hermes) learns the CURRENT pair
+        without reading QSettings — the port-fallback walk makes the
+        real port unknowable a priori, and a QSettings token override
+        is invisible to the network. The token is a SECRET: never
+        logged, never in window chrome, never committed — the card
+        lives in the user-profile state dir (same trust zone as the
+        QSettings store). Best-effort by design (the BridgeLog swallow
+        discipline): a failed card write must never take the monitor
+        down — the truth surface (/status) is unaffected.
+
+        The card root is the window's OWN client registry root —
+        production resolves identically to
+        ``client_local.default_state_dir()`` (both honor
+        ``$VIDLIFT_STATE_DIR`` first: ``build_services`` resolves None
+        through ``benchmark.state_dir()``, and run_gui.py exports the
+        env var before construction when frozen), and ADR-2's
+        provisioning artifact then sits beside the registry the
+        monitor actually reads — by identity, not by coincidence.
+        Bridge-less harness instances (suite fakes with no services)
+        write nothing: there is no registry root to provision beside,
+        and the suite must never touch real user state."""
+        services = getattr(self.client, "services", None)
+        if services is None:
+            return
+        import json
+        import os
+
+        card = {
+            "schema": MONITOR_DISCOVERY_SCHEMA,
+            "enabled": enabled,
+            "bind_host": str(self._monitor_settings()["host"]),
+            "port": port,
+            "lan_base_url": f"http://{lan_ip()}:{port}" if port is not None else None,
+            "token": token,
+            "token_source": token_source,
+            "version": __version__,
+            "written_at": time.time(),
+        }
+        path = Path(services.state_dir) / MONITOR_DISCOVERY_FILENAME
+        # v0.4.16 (D-6, Karen remediation): the staging name is
+        # pid-unique — the registry explicitly supports multi-writer
+        # convergence, so two GUI instances sharing one state dir must
+        # never interleave into one fixed `monitor.json.tmp`; os.replace
+        # moves ONLY this writer's own completed card (the old fixed
+        # name let writer A's replace publish writer B's mid-write file).
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            # v0.4.16 (D-5, Karen remediation): the card carries the
+            # EFFECTIVE monitor token — a secret — so it is created
+            # owner-only: 0o600 at file creation (umask can only
+            # tighten further) and 0o700 when WE are the ones creating
+            # the state dir. The old 0o664 write made the token
+            # group/world-readable on shared machines; os.replace then
+            # carries the tightened mode onto the final artifact.
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(
+                str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                file.write(json.dumps(card, indent=2))
+            os.replace(tmp, path)
+        except OSError:
+            # A provisioning artifact is the one thing here allowed to
+            # fail silently-ish: no monitor behavior depends on it.
+            pass
 
     def _start_monitor(self) -> None:
         """Construction-time start (default-on, §4.1): a daemon thread
@@ -793,6 +933,15 @@ class MainWindow(QMainWindow):
         self.monitor_check.setChecked(bool(monitor["enabled"]))
         self.monitor_check.blockSignals(was_blocked)
         if not monitor["enabled"]:
+            # ADR-2: the serving state resolved to OFF — the card
+            # records it so a paired watcher never pairs from a stale
+            # "on" card.
+            self._write_monitor_discovery(
+                enabled=False,
+                port=None,
+                token=monitor["token"],
+                token_source=monitor["token_source"],
+            )
             self._refresh_monitor_pill()
             return
         import os
@@ -804,6 +953,12 @@ class MainWindow(QMainWindow):
         ):
             # Explicit opt-out (test/CI runs, headless containers):
             # the setting stays ON; only THIS launch skips the bind.
+            self._write_monitor_discovery(
+                enabled=False,
+                port=None,
+                token=monitor["token"],
+                token_source=monitor["token_source"],
+            )
             self._refresh_monitor_pill()
             return
         try:
@@ -814,11 +969,27 @@ class MainWindow(QMainWindow):
                 token=monitor["token"],
             )
         except OSError as exc:
+            self._write_monitor_discovery(
+                enabled=False,
+                port=None,
+                token=monitor["token"],
+                token_source=monitor["token_source"],
+            )
             self.monitor_pill.setText(f"Monitor off (port busy: {exc})")
             return
         if actual_port != monitor["port"]:
             self._settings().setValue(QSETTINGS_MONITOR_KEYS["port"], actual_port)
         self.monitor_port_reported = actual_port
+        # ADR-2: the card carries the ACTUAL port (fallback-shifted
+        # bindings are exactly the case a watcher cannot learn
+        # otherwise) and the effective token, rewritten on every
+        # resolution.
+        self._write_monitor_discovery(
+            enabled=True,
+            port=actual_port,
+            token=monitor["token"],
+            token_source=monitor["token_source"],
+        )
         self._refresh_monitor_pill()
 
     def _toggle_monitor(self, checked: bool) -> None:
@@ -840,12 +1011,34 @@ class MainWindow(QMainWindow):
                         QSETTINGS_MONITOR_KEYS["port"], actual_port
                     )
                 self.monitor_port_reported = actual_port
+                # ADR-2: the card carries the ACTUAL bound port and the
+                # effective token, rewritten at every resolution.
+                self._write_monitor_discovery(
+                    enabled=True,
+                    port=actual_port,
+                    token=monitor["token"],
+                    token_source=monitor["token_source"],
+                )
             else:
                 stop_server()
                 self.monitor_port_reported = None
+                resolved = self._monitor_settings()
+                self._write_monitor_discovery(
+                    enabled=False,
+                    port=None,
+                    token=resolved["token"],
+                    token_source=resolved["token_source"],
+                )
         except OSError as exc:
             self._settings().setValue(QSETTINGS_MONITOR_KEYS["enabled"], False)
             self.monitor_port_reported = None
+            resolved = self._monitor_settings()
+            self._write_monitor_discovery(
+                enabled=False,
+                port=None,
+                token=resolved["token"],
+                token_source=resolved["token_source"],
+            )
             self.monitor_pill.setText(f"Monitor off ({exc})")
             return
         self._refresh_monitor_pill()
@@ -861,6 +1054,129 @@ class MainWindow(QMainWindow):
             self.monitor_pill.setText(f"Monitor on: {lan_ip()}:{self.monitor_port_reported}")
         else:
             self.monitor_pill.setText("Monitor off")
+
+    # -- v0.4.16 subs-model pill + install (model management, ADR-4) ----
+
+    def _refresh_subs_model_pill(self, live_dl: dict | None = None) -> None:
+        """ADR-1/4: the disk predicate, re-read on every call (1 Hz while a
+        slate lives; on construction; after an install settles). The pill
+        NAMES its tag — a config-pinned different model is the job's own pin,
+        never this indicator's lie.
+
+        ``live_dl`` rides the tick path (_consume_running_snapshot): the
+        polled snapshot's ``progress["model_download"]`` so the pill counts
+        bytes during IN-RUN downloads too (the board covers idle installs;
+        in-run truth arrives via the existing 1 Hz poll — no second timer).
+        """
+        services = getattr(self.client, "services", None)
+        board = getattr(services, "model_install_board", None)
+        block = model_install_state(
+            DEFAULT_MODEL,
+            state_root=default_state_dir(),
+            board=board,
+            progress_download=live_dl if isinstance(live_dl, dict) else None,
+        )
+        state = block["state"]
+        tag = block["tag"]
+        if state == "installed":
+            self.subs_model_pill.setText(f"Subs model ({tag}): installed")
+            self.subs_model_button.setVisible(False)
+        elif state == "downloading":
+            done = block["bytes_done"]
+            total = block["bytes_total"]
+            if total is not None and total > 0 and isinstance(done, (int, float)) and done >= 0:
+                pct = min(100.0, done * 100.0 / total)
+                self.subs_model_pill.setText(
+                    f"Subs model ({tag}): downloading — "
+                    f"{format_bytes(int(done))} / {format_bytes(int(total))} ({pct:.0f}%)"
+                )
+            elif isinstance(done, (int, float)) and done >= 0:
+                self.subs_model_pill.setText(
+                    f"Subs model ({tag}): downloading — "
+                    f"{format_bytes(int(done))} (total size unknown)"
+                )
+            else:
+                self.subs_model_pill.setText(
+                    f"Subs model ({tag}): downloading…"
+                )
+            self.subs_model_button.setVisible(True)
+            self.subs_model_button.setEnabled(False)
+            self.subs_model_button.setText("Downloading…")
+        elif state == "unknown":
+            self.subs_model_pill.setText(
+                f"Subs model ({tag}): state unknown (cache unreadable)"
+            )
+            self.subs_model_button.setVisible(True)
+            self.subs_model_button.setEnabled(True)
+            self.subs_model_button.setText("Install")
+        else:  # not-installed — the install affordance is the point
+            self.subs_model_pill.setText(
+                f"Subs model ({tag}): not installed — first subtitles "
+                "use downloads ~1.5 GB"
+            )
+            self.subs_model_button.setVisible(True)
+            self.subs_model_button.setEnabled(True)
+            self.subs_model_button.setText("Install")
+
+    def _install_subs_model(self) -> None:
+        """ADR-4: GUI-owned install on a QThreadPool runnable (the GPU-meter
+        pattern — the GUI's only background idiom), NEVER the serial
+        JobExecutor (a 1.5 GB fetch must not starve the queue) and NEVER any
+        remote surface (N4). resolve_model_dir is the whole implementation:
+        sha256-pinned, lock-serialized, .part-resuming. In-flight click guard
+        via self._subs_model_installing."""
+        if getattr(self, "_subs_model_installing", False):
+            return
+        services = getattr(self.client, "services", None)
+        board = getattr(services, "model_install_board", None)
+        if board is None:
+            # No board to report into (foreign/no services): the install
+            # would still work, but nothing could observe it — refuse
+            # honestly instead of silently running an invisible download.
+            QMessageBox.warning(
+                self,
+                "Transcription model",
+                "Install is unavailable: no services object carries the "
+                "install board.",
+            )
+            return
+        self._subs_model_installing = True
+        board.begin(DEFAULT_MODEL)
+        signals = ModelInstallSignals()
+        # v0.4.16 (lifetime): the shim must outlive the install — the
+        # window holds the reference until the settle slot runs (a
+        # QThreadPool runnable may emit long after this method's local
+        # frame is gone; an unparented shim would otherwise be
+        # collected mid-install and its emits would raise).
+        self._subs_model_signals = signals
+        signals.progress.connect(self._on_subs_model_progress)
+        signals.finished.connect(self._on_subs_model_finished)
+        runnable = ModelInstallRunnable(
+            DEFAULT_MODEL,
+            state_dir=default_state_dir(),
+            board=board,
+            signals=signals,
+            fetch=None,  # tests inject a fake here via the constructor
+        )
+        QThreadPool.globalInstance().start(runnable)
+        self._refresh_subs_model_pill()
+
+    def _on_subs_model_progress(self, info: dict) -> None:
+        self._refresh_subs_model_pill()  # the board now carries the truth; one render path
+
+    def _on_subs_model_finished(self, ok: bool, message: str) -> None:
+        self._subs_model_installing = False
+        self._refresh_subs_model_pill()
+        # the shim's lifetime anchor (see _install_subs_model) is only
+        # cleared when the install settled
+        self._subs_model_signals = None
+        if not ok:
+            QMessageBox.warning(
+                self,
+                "Transcription model install failed",
+                f"{message}\n\nThe model was NOT installed. Check the network "
+                "connection and try again — the button stays available.",
+            )
 
     def _replace_source_changed(self, checked: bool) -> None:
         """Persist the replace-source preference (QSettings, house
@@ -915,6 +1231,18 @@ class MainWindow(QMainWindow):
         title_stack.addWidget(title)
         title_stack.addWidget(self._version_pill(), alignment=Qt.AlignmentFlag.AlignLeft)
         title_stack.addWidget(self.monitor_pill, alignment=Qt.AlignmentFlag.AlignLeft)
+        # v0.4.16 (model management, ADR-4): the subs-model pill and its
+        # Install button share one inline row (spacing 6, no margins —
+        # it reads as one control cluster) directly under the monitor
+        # pill; the row rides the existing left-aligned title stack.
+        subs_model_row = QWidget()
+        subs_model_row_layout = QHBoxLayout(subs_model_row)
+        subs_model_row_layout.setContentsMargins(0, 0, 0, 0)
+        subs_model_row_layout.setSpacing(6)
+        subs_model_row_layout.addWidget(self.subs_model_pill)
+        subs_model_row_layout.addWidget(self.subs_model_button)
+        subs_model_row_layout.addStretch(1)
+        title_stack.addWidget(subs_model_row, alignment=Qt.AlignmentFlag.AlignLeft)
         title_stack.addWidget(QLabel("Plan and run batch SD video upscales"))
         title_row.addLayout(title_stack)
         title_row.addStretch(1)
@@ -1084,6 +1412,7 @@ class MainWindow(QMainWindow):
             QPushButton:pressed { background: #1b2022; }
             QPushButton:disabled { color: #758079; border-color: #353d41; }
             #PrimaryButton { background: #d8943a; border-color: #f0b45c; color: #15110a; font-weight: 700; }
+            #ModelInstallButton { padding: 3px 10px; font-size: 11px; }
             #StartButton { background: #3d9865; border-color: #65bd88; color: #07150d; font-weight: 700; }
             #StartButton:disabled { background: #26302a; border-color: #35443a; color: #758079; }
             QProgressBar { background: #15191b; border: 1px solid #30383c; border-radius: 6px; color: #edf0ec; text-align: center; min-height: 22px; }
@@ -2186,6 +2515,15 @@ class MainWindow(QMainWindow):
             snapshot_progress = snapshot.get("progress")
             if isinstance(snapshot_progress, dict):
                 progress = snapshot_progress
+        # v0.4.16 (model management, ADR-4/G-11): the pill keys on the
+        # SAME tick's snapshot — an in-run download counts bytes on the
+        # title stack via the existing 1 Hz poll (no second timer). The
+        # guard keeps the bare harnesses (which bind this consume method
+        # without the pill widgets) untouched.
+        if getattr(self, "subs_model_pill", None) is not None:
+            self._refresh_subs_model_pill(
+                live_dl=progress.get("model_download")
+            )
         frames_done = progress.get("frames_done")
         frames_total = progress.get("frames_total")
         phase_now = snapshot.get("current_phase") or ""
@@ -2236,13 +2574,35 @@ class MainWindow(QMainWindow):
             # no number invented.
             self.stage_bar.set_value(self._stage_fraction, self._stage_eta)
         elif self._stage_fraction is None:
-            # §3c state 1, v0.4.15.3 (F-4): the pulse NAMES the phase —
-            # only the upscale count pass "measures"; every other
-            # unmeasurable phase names ITSELF (a duplicated busy call
-            # is a no-op anyway).
-            self.stage_bar.set_busy(
-                True, _PHASE_BUSY_LABELS.get(phase_now, "estimating ...")
-            )
+            # v0.4.16 (model management, F2): a byte-KNOWN download beat
+            # renders determinately on the stage bar for this tick (the
+            # set_value path exits busy; EtaProgressBar set_value). The
+            # render is stage-bar-only — the overall bar's F-4 measured
+            # floor is deliberately NOT keyed on download bytes (the
+            # transcribe unit's batch accounting is unchanged).
+            dl_beat = progress.get("model_download")
+            dl_total = dl_beat.get("bytes_total") if isinstance(dl_beat, dict) else None
+            dl_done = dl_beat.get("bytes_done") if isinstance(dl_beat, dict) else None
+            if (
+                phase_now in ("transcribe", "subtitles")
+                and isinstance(dl_total, (int, float))
+                and dl_total > 0
+                and isinstance(dl_done, (int, float))
+                and dl_done >= 0
+            ):
+                self.stage_bar.set_value(
+                    max(0.0, min(1.0, dl_done / dl_total)), None
+                )
+            else:
+                # §3c state 1, v0.4.15.3 (F-4): the pulse NAMES the phase —
+                # only the upscale count pass "measures"; every other
+                # unmeasurable phase names ITSELF (a duplicated busy call
+                # is a no-op anyway). v0.4.16: a total-None download beat
+                # stays honest-indeterminate here (the stage label names
+                # the download via run_stage_label).
+                self.stage_bar.set_busy(
+                    True, _PHASE_BUSY_LABELS.get(phase_now, "estimating ...")
+                )
         # Overall queue: resolved jobs + current fraction, over total.
         # v0.4.10 (R2): resolved = reached ANY terminal state (the
         # queue position is honest even when a job cancelled/failed);

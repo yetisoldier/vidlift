@@ -206,6 +206,14 @@ def build_services(
         )
     services = BridgeServices(registry=registry, state_dir=resolved)
     services.executor = JobExecutor(services)
+    # v0.4.16 (model management, ADR-4): the idle-install visibility slot
+    # — the GUI's install worker writes it (only it, today); the status
+    # surfaces soft-read it (getattr). Constructed for EVERY consumer of
+    # build_services (stdio server + GUI client share the factory) so a
+    # foreign BridgeServices fake may simply omit the attribute (N5).
+    from ..transcribe import ModelInstallBoard
+
+    services.model_install_board = ModelInstallBoard()
     return services
 
 

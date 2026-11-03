@@ -35,6 +35,8 @@ __all__ = [
     "MONITOR_PORT_DEFAULT",
     "MONITOR_TOKEN_DEFAULT",
     "MONITOR_ENABLED_DEFAULT",
+    "MONITOR_DISCOVERY_FILENAME",
+    "MONITOR_DISCOVERY_SCHEMA",
     "QSETTINGS_MONITOR_KEYS",
     "TRANSCRIPTION_DEVICE_DEFAULT",
     "TRANSCRIPTION_ENABLED_DEFAULT",
@@ -49,6 +51,28 @@ __all__ = [
 MONITOR_HOST_DEFAULT = "0.0.0.0"  # LAN-visible, same as the sibling
 MONITOR_PORT_DEFAULT = 8765
 MONITOR_ENABLED_DEFAULT = True  # ON by default (design §4.1)
+
+# ---- Monitor discovery card (visibility ADR-2) ------------------------------
+#
+# The GUI writes <state_dir>/monitor.json (atomic temp+replace) every
+# time the monitor's serving state resolves (start success/off, toggle
+# on/off). It carries the EFFECTIVE token and the ACTUAL bound port —
+# the port-fallback walk (monitor.start_server_with_fallback) makes the
+# real port unknowable a priori, and QSettings-overridable tokens make
+# the effective token equally unguessable. A paired watcher (Hermes)
+# pairs ONCE from this card, re-pairs on a deterministic 401, and never
+# needs the token relayed by hand. The card is a provisioning artifact,
+# NOT a status mirror (no cadence, no staleness window — it changes
+# only when the serving state does) and it stays out of monitor.py: it
+# is owned by the process that can read QSettings (the GUI).
+#
+# SECURITY (ADR-2): the card carries the token — a secret. It lives in
+# the user-profile state dir (the SAME trust zone as the QSettings
+# store; not a new exfiltration channel). Never logged, never in window
+# chrome, never committed; the repo's .gitignore must never regressed
+# to track it (state dirs are outside the checkout by construction).
+MONITOR_DISCOVERY_FILENAME = "monitor.json"
+MONITOR_DISCOVERY_SCHEMA = 1  # bump ONLY on a breaking card-shape change
 
 # ---- v0.4.14 (transcription subtitles) ------------------------------------
 #

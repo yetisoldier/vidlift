@@ -1428,3 +1428,48 @@ def test_f13c_cancel_current_tooltip_names_the_truth(window):
         "Stop the running job safely; queued jobs stay queued "
         "(use Cancel Batch to clear the queue)."
     )
+
+
+def test_v0416_tick_reflects_the_cancelled_transition_not_the_click(
+    window, tmp_path, monkeypatch
+):
+    """v0.4.16 (the §4.6 observe-fix): the cooperative close means a
+    cancel click lands 'cancelling' — the registry record stays running
+    until the executor's wind-down transitions it. The tick must render
+    THE TRANSITION, not the click: the row still reads running during
+    the wind-down, and flips to the cancelled cell (and drains) on the
+    tick after the transition lands. (The fixed executor journey that
+    produces the transition is pinned in
+    test_v0416_cancel_propagation.py — this pins the tick's read.)"""
+    plan = _plan_for(tmp_path, "wound-down.avi")
+    window.batch = batch_plan_from([plan])
+    window.render_batch(window.batch)
+    window.start_upscale()
+    job_id = window.job_ids[0]
+    record = window.client.registry.require(job_id)
+    record.state = "running"
+    window._tick_elapsed()  # the claim edge arms Cancel Current
+    assert window._running_job_id == job_id
+
+    def cooperative_cancel(target):
+        # the REAL registry.cancel vocabulary for a running job: the
+        # claim-time flag flips, the state stays running (queue/cancel
+        # semantics, §4.6) — the FakeRegistry's instant-terminal cancel
+        # would mask the in-between truth the real UI renders.
+        return "cancelling"
+
+    monkeypatch.setattr(window.client.registry, "cancel", cooperative_cancel)
+    window.cancel_upscale()
+    assert window.client.cancel_calls == [job_id]
+    # wind-down tick: the row keeps its running truth — a click never
+    # finishes a job; only the transition does
+    window._tick_elapsed()
+    assert window.file_table.item(0, 0).text() == "running"
+    assert window.job_ids == [job_id]
+
+    # the executor's transition lands (the fixed cancel path)
+    record.state = "cancelled"
+    record.finished_at = time.time()
+    window._tick_elapsed()
+    assert window.file_table.item(0, 0).text() == "cancelled"
+    assert window.job_ids == []
