@@ -2449,9 +2449,20 @@ def run_file(
                         )
                     else:
                         log(f"GPU phase lock acquired: {gpu_lock.path}")
+                    # v0.4.15.2: the honest CUDA fallback — the note rides
+                    # the manifest's transcription block exactly like the
+                    # degrade-open note above; run.py owns the slot only.
+                    transcribe_fallback_notes: list[str] = []
+
+                    def _on_cuda_fallback(note) -> None:
+                        nonlocal transcribe_device
+                        transcribe_device = "cpu (cuda unavailable)"
+                        transcribe_fallback_notes.append(note)
+                        log(f"subtitles: {note}")
+
                     try:
                         from .transcribe import (
-                            make_whisper_engine,
+                            make_whisper_engine_with_fallback,
                             resolve_model_dir,
                             resolve_transcription_device,
                         )
@@ -2476,8 +2487,11 @@ def run_file(
                                 lambda model_dir: (
                                     transcribe_engine_factory(model_dir)
                                     if transcribe_engine_factory is not None
-                                    else make_whisper_engine(
-                                        model_dir, device=transcribe_device
+                                    else make_whisper_engine_with_fallback(
+                                        model_dir,
+                                        device=knobs.get("device") or "auto",
+                                        resolved_device=transcribe_device,
+                                        on_fallback=_on_cuda_fallback,
                                     )
                                 )
                             ),
@@ -2523,7 +2537,8 @@ def run_file(
                             [transcribe_engine_note]
                             if transcribe_engine_note
                             else []
-                        ),
+                        )
+                        + transcribe_fallback_notes,
                     }
                     for note in transcribed.notes:
                         log(f"subtitles: {note}")
