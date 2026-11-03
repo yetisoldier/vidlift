@@ -2,6 +2,66 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.15.3] - 2026-11-02
+
+### Fixed
+
+- **Mode B (Add Subtitles) bitmap-subs remux** (F-1, HIGH): the designed
+  Mode B source class — files whose only subtitle tracks are bitmap
+  (PGS/VobSub) — transcribed for minutes-to-hours and then died at the
+  remux: the blanket `-map 0` routed the bitmap track (and mkv
+  attachments) into the mp4, where `-c:s mov_text` forces a bitmap→text
+  transcode ffmpeg categorically refuses. The remux now maps an explicit
+  allowlist (`-map 0:v -map 0:a -map 1`): the output's subtitle track IS
+  the transcription; bitmap tracks, attachments, and data streams stay
+  in the untouched source. Under `--force` source text tracks are no
+  longer duplicated into the output ("transcribe anyway" — the source
+  keeps its original track).
+- **`--replace-source` cross-filesystem data loss** (F-2): the copy onto
+  the source truncated it at open, so a mid-copy failure (ENOSPC, NAS
+  drop) could leave the source holding partial data. The copy is now
+  staged at a temp sibling of the source, SHA-256-verified against the
+  verified output, and atomically renamed into place — a failed copy
+  strands only the temp; the source and the verified output always
+  survive.
+- **Registry lost update between processes** (F-3): `save()` wrote the
+  in-memory view without converging, so a stale-view save (the stdio
+  MCP server's progress mirror, another agent session) wholesale-reverted
+  newer rows — terminal jobs resurrected to `running`, freshly enqueued
+  jobs dropped (the "false active job" wedge at runtime). `save()`,
+  `enqueue()`, and `transition()` now converge on the file's truth
+  before writing, under one lock hold; a save can only ever land on top
+  of converged truth.
+- **Stage bar pinned at a stale 100% through encode/verify** (F-4):
+  progression payloads merge (never replace), so the upscale's final
+  frame counters rode every later phase's snapshot and the GUI rendered
+  them — and the "measuring — counting frames…" busy label — regardless
+  of phase. Frame counters are now honored only in the upscale phase;
+  the busy pulse names the actual phase ("encoding …", "verifying …",
+  …); the overall queue bar renders last-measured truth so it never
+  visibly recedes at a phase change.
+- **`Add Subtitles` output naming on non-4-char extensions** (F-5): the
+  GUI's `path[:-4]` slice mangled `.ts`/`.divx`/`.mpeg` stems (movie.ts
+  → movi.subs.mp4) and silently disabled the collision pre-flight for
+  those files. Every surface now reuses the one naming derivation
+  (`subs_output_path`).
+- **Plan view promised transcription the run wouldn't do** (F-6): the
+  subtitle note re-derived its selection under the locked default
+  instead of the checkbox the plan was built with. The resolved
+  transcription flag now threads into the note (CLI/MCP plan renders
+  included), the GUI passes the checkbox at plan time, and the plan
+  render mirrors a disabled checkbox for still-transcribed plans.
+- **Manifest claimed CUDA transcriptions that never happened** (R1): on
+  a CPU-resolved device whose engine construction needed the honest
+  one-shot CPU retry, the fallback hook rewrote the manifest's device to
+  `cpu (cuda unavailable)`. The device echo is now keyed on the actual
+  resolution — only a real CUDA fallback earns that string.
+- **Mode B results could not state where transcription ran** (D4): the
+  transcription result, subs job result, and the subs executor's result
+  dict now carry a `device` field (resolved by the default factory;
+  `cpu` whenever a fallback fired; empty when a foreign engine factory
+  ran — honest unknown, never a guess).
+
 ## [0.4.15.2] - 2026-11-02
 
 ### Fixed
