@@ -148,3 +148,60 @@ def test_concurrent_save_and_enqueue_never_corrupt(state_dir):
     rec = registry.require(ids[0])
     registry.transition(rec, "cancelled")
     assert _file_rows(state_dir)[ids[0]]["state"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# F-7 (v0.4.15.4): cancel()/cancel_batch() converge before they read
+# ---------------------------------------------------------------------------
+
+
+def test_stale_cancel_converges_foreign_queued_row(state_dir):
+    """Karen's F-7 evidence, promoted: B loaded BEFORE A enqueued; A's
+    queued job is file-visible. B's cancel() must converge and return
+    the honest ``cancelled`` — never the stale ``not-found`` lie — and
+    the file must agree."""
+    a = Registry(state_dir)
+    b = Registry(state_dir)  # B's view: nothing — B predates A's enqueue
+    rec = a.enqueue(kind="run", paths=["/x/movie.avi"], options={})
+    _stale(b)
+    verdict = b.cancel(rec.job_id)
+    assert verdict == "cancelled", (
+        f"the stale view lied for a file-visible job: {verdict!r}"
+    )
+    assert _file_rows(state_dir)[rec.job_id]["state"] == "cancelled"
+
+
+def test_stale_cancel_converges_foreign_running_row(state_dir):
+    """Running-arm parity: A claimed the row (its claim-time CancelFlag
+    lives in A's process-local map); B's cancel converges, SEES the
+    running job, and lands the honest verdict through the foreign-flag
+    last-resort arm (file truth: ``cancelled``) — never ``not-found``.
+    Nothing may escape B's call; the owner-side raced-terminal
+    tolerance is jobs.py's pinned territory, not this file's."""
+    a = Registry(state_dir)
+    rec = a.enqueue(kind="run", paths=["/x/movie.avi"], options={})
+    b = Registry(state_dir)  # B's view: rec queued
+    a.transition(rec, "running")  # the claim: A registers the flag
+    _stale(b)
+    verdict = b.cancel(rec.job_id)  # B holds no CancelFlag for it
+    assert verdict == "cancelled", (
+        f"the stale view lied for a file-visible running job: {verdict!r}"
+    )
+    assert _file_rows(state_dir)[rec.job_id]["state"] == "cancelled"
+
+
+def test_stale_cancel_batch_converges_foreign_rows(state_dir):
+    """cancel_batch parity (F-7): the identical stale-view hole — B's
+    batch over ids B never saw must MARK the file's rows, never lie
+    ``not-found`` per id."""
+    a = Registry(state_dir)
+    ids = [
+        a.enqueue(kind="run", paths=[f"/x/movie-{i}.avi"], options={}).job_id
+        for i in range(2)
+    ]
+    b = Registry(state_dir)  # B predates A's enqueues
+    _stale(b)
+    results = b.cancel_batch(ids)
+    rows = _file_rows(state_dir)
+    assert all(results[job_id] == "cancelled" for job_id in ids), results
+    assert all(rows[job_id]["state"] == "cancelled" for job_id in ids)

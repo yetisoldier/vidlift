@@ -364,6 +364,37 @@ class TestRunnerSeamErrors:
             parse_probe("x.avi", "{oops")
 
 
+# ---------------------------------------------------------------------------
+# F-8 (v0.4.15.4): a missing ffprobe binary is a named ProbeError
+# ---------------------------------------------------------------------------
+
+
+class TestMissingBinaryContract:
+    def test_missing_ffprobe_binary_raises_probe_error(self, tmp_path):
+        """Karen's F-8 evidence, promoted: the default runner's
+        subprocess raises a raw FileNotFoundError for a missing binary;
+        the runner seam here replays exactly that, and probe_file must
+        convert it to its documented contract type, naming the binary —
+        no FileNotFoundError may escape."""
+        path = make_media_file(tmp_path, "movie.avi")
+
+        def missing_binary_runner(binary: str, args: list[str]) -> tuple:
+            raise FileNotFoundError(2, "No such file or directory", binary)
+
+        with pytest.raises(ProbeError, match="ffprobe binary not found") as excinfo:
+            probe_file(path, binary="/nonexistent/ffprobe", runner=missing_binary_runner)
+        assert "/nonexistent/ffprobe" in str(excinfo.value)
+
+    def test_missing_ffprobe_via_real_runner_raises_probe_error(self, tmp_path):
+        """The REAL subprocess layer (no seam): a nonexistent binary
+        raises FileNotFoundError from Popen — probe_file converts it
+        (the production path; on Linux this executes, on Windows the
+        Popen contract is identical)."""
+        path = make_media_file(tmp_path, "movie.avi")
+        with pytest.raises(ProbeError, match="ffprobe binary not found"):
+            probe_file(path, binary=str(tmp_path / "no-such-ffprobe"))
+
+
 class TestClassifyPureFunction:
     def test_classify_builds_report_from_raw_probe(self):
         probe = parse_probe("movie.avi", avi_xvid_payload())

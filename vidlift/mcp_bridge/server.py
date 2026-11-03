@@ -34,6 +34,7 @@ from .jobs import JobExecutor
 from .registry import RESTART_ERROR, STARTUP_SWEEP_ERROR, Registry
 from .schemas import InvalidInput, TOOL_DESCRIPTIONS, TOOL_SCHEMAS, validate_tool_args
 from .tools import BridgeError, BridgeServices, TOOL_HANDLERS
+from .. import __version__
 from ..run import MissingToolError
 
 __all__ = [
@@ -47,7 +48,10 @@ __all__ = [
 ]
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "vidlift", "version": "0.2.0"}
+# v0.4.15.4 (F-9): derived from the package stamp — this literal drifted
+# to 0.2.0 against package 0.4.15.x because nothing gated it; the parity
+# test now pins this derivation class-wide.
+SERVER_INFO = {"name": "vidlift", "version": __version__}
 
 
 class BridgeLog:

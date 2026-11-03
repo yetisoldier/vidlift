@@ -658,7 +658,22 @@ class Registry:
         - running: the executor's cancel flag flips; the job finishes
           as cancelled on its own -> ``cancelling``.
         - terminal or unknown: a reported non-event, never an exception.
+
+        v0.4.15.4 (F-7): converge on the file's truth at entry — a job
+        another PROCESS enqueued/claimed is file-visible but invisible
+        to a stale in-memory view, so the bare read returned a lying
+        ``not-found`` (Karen's 2026-11-03 evidence). Downstream arms
+        need no further change: the queued arm's ``transition()`` and
+        ``save()`` already converge + canonicalize under one lock
+        (v0.4.15.3, F-3); the running arm's flag flip now rides a
+        converged view.
         """
+        # v0.4.15.4 (F-7): converge FIRST (fast-path mtime stat,
+        # self-locking), THEN re-read the record — the re-fetch ordering
+        # matters because a converge may have re-parsed and replaced the
+        # row objects. One extra ``stat`` per cancel: the established
+        # cost model (save/get/enqueue all pay it).
+        self._maybe_reload()
         record = self._jobs.get(job_id)
         if record is None:
             return "not-found"
@@ -711,11 +726,22 @@ class Registry:
         (cancel-queued-but-keep-current): only queued jobs are marked
         and the running job keeps running. NOT surfaced by the GUI in
         v0.4.13.
+
+        v0.4.15.4 (F-7 parity): converge on other writers' truth
+        BEFORE the batch reads (inside the lock hold) — a stale
+        in-memory view marked every file-visible batch row
+        ``not-found`` (the identical hole ``cancel()`` had: same
+        defect class, same one-line fix).
         """
         id_set = list(job_ids)
         results: dict[str, str] = {}
         flags_to_set = []
         with self._lock:
+            # v0.4.15.4 (F-7 parity): the unlocked converge body as the
+            # FIRST statement — the re-stat doubles as the
+            # double-check, exactly the save/enqueue/transition
+            # write-boundary rule (F-3).
+            self._reload_if_changed_unlocked()
             for job_id in id_set:
                 record = self._jobs.get(job_id)
                 if record is None:

@@ -108,3 +108,25 @@ def test_version_info_prodvers_tuple_matches_package_version():
     assert prodvers == expected, (
         f"prodvers {prodvers} drifted from __version__ {vidlift.__version__}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.4.15.4 (F-9): the MCP serverInfo stamp derives from the package
+# ---------------------------------------------------------------------------
+
+
+def test_server_info_version_matches_package_version():
+    """The MCP handshake's ``serverInfo.version`` used to be a
+    hand-stamped literal ("0.2.0" against package 0.4.15.x) — exactly
+    the multi-stamp drift class this gate was built for. SERVER_INFO
+    now derives from __version__; this pin holds the derivation
+    class-wide (a future hand-stamp anywhere in this family fails
+    here). The module import lives inside the test so collection-time
+    module cost stays out of every other stamp check (the file's
+    existing style)."""
+    from vidlift.mcp_bridge.server import SERVER_INFO
+
+    assert SERVER_INFO["version"] == vidlift.__version__, (
+        "the MCP serverInfo version drifted from vidlift.__version__"
+    )
+    assert SERVER_INFO["name"] == "vidlift"

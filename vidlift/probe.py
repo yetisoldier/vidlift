@@ -339,7 +339,14 @@ def probe_file(
     """
     if not os.path.isfile(path):
         raise ProbeError(f"no such file: {path}")
-    code, stdout, stderr = runner(binary, probe_args(path))
+    try:
+        code, stdout, stderr = runner(binary, probe_args(path))
+    except FileNotFoundError as exc:
+        # v0.4.15.4 (F-8): a missing ffprobe binary must surface as
+        # ProbeError — this function's documented contract — not as a
+        # raw FileNotFoundError that tracebacks the probe/plan CLI
+        # (whose per-file `except ProbeError` cannot catch it).
+        raise ProbeError(f"ffprobe binary not found: {binary}") from exc
     if code != 0:
         detail = stderr.strip()[:300] or "no diagnostic output"
         raise ProbeError(f"ffprobe failed on {path}: {detail}")
