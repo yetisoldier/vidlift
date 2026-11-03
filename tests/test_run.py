@@ -1143,10 +1143,122 @@ class TestReplaceSourceV047:
                 run_mod.replace_source_with_output(str(src), str(out))
         finally:
             mp.undo()
-        # the refusal is the contract: source path now holds the copy
-        # (bad data never silently accepted), and the verified output
-        # file was never deleted. Nothing else was touched.
+        # the refusal is the contract (v0.4.15.3 F-2): the SOURCE bytes
+        # are intact (the staged temp absorbed the bad copy — the source
+        # is never opened for write), the verified output was never
+        # deleted, and the staged temp did not outlive the call.
+        assert src.read_bytes() == b"source-bytes", "source intact"
         assert out.read_bytes() == b"output-bytes", "verified output kept"
+        assert not (tmp_path / "movie.avi.replace-tmp").exists(), (
+            "no staged temp left behind"
+        )
+
+    def test_replace_cross_filesystem_midcopy_failure_keeps_source(
+        self, tmp_path
+    ):
+        # Karen's F7 evidence (promotion to a pin): a mid-copy failure
+        # (ENOSPC, NAS drop) must never leave the SOURCE holding partial
+        # copy data. v0.4.15.3 (F-2): the staged temp absorbs the
+        # failure; the source is never opened for write.
+        import types
+
+        import vidlift.run as run_mod
+
+        src = tmp_path / "movie.avi"
+        out = tmp_path / "movie.720p.mp4"
+        src.write_bytes(b"source-original-bytes")
+        out.write_bytes(b"output-verified-bytes")
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)) == os.path.abspath(str(src)) and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        two_fs_stat._armed = True  # the branch-deciding stat diverges
+
+        def partial_copy2(src_f, dst_f, *args, **kwargs):
+            # the truncating open + premature death: the destination
+            # (now the TEMP) holds partial bytes, ENOSPC mid-copy.
+            with open(dst_f, "wb") as handle:
+                handle.write(b"partial")
+            raise OSError(28, "No space left on device")
+
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            mp.setattr(run_mod.shutil, "copy2", partial_copy2)
+            with pytest.raises(RunError, match="cross-filesystem copy"):
+                run_mod.replace_source_with_output(str(src), str(out))
+        finally:
+            mp.undo()
+        assert src.read_bytes() == b"source-original-bytes", (
+            "the source never truncates (Karen's evidence)"
+        )
+        assert out.read_bytes() == b"output-verified-bytes", (
+            "verified output untouched"
+        )
+        assert not (tmp_path / "movie.avi.replace-tmp").exists(), (
+            "the failed stage is cleaned up, never left as debris"
+        )
+
+    def test_replace_cross_filesystem_happy_path(self, tmp_path):
+        # v0.4.15.3 (F-2) success arm: real copy staged at the temp
+        # sibling, hash-verified, renamed over the source atomically,
+        # former output copy removed, temp consumed by the rename.
+        import types
+
+        import vidlift.run as run_mod
+
+        src = tmp_path / "movie.avi"
+        out = tmp_path / "movie.720p.mp4"
+        src.write_bytes(b"source-old-bytes")
+        out.write_bytes(b"output-verified-bytes")
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)) == os.path.abspath(str(src)) and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        two_fs_stat._armed = True  # the branch-deciding stat diverges
+
+        lines: list[str] = []
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            returned = run_mod.replace_source_with_output(
+                str(src), str(out), log_line=lines.append
+            )
+        finally:
+            mp.undo()
+        assert returned == str(src)
+        assert src.read_bytes() == b"output-verified-bytes", (
+            "the proven copy now sits at the source path"
+        )
+        assert not out.exists(), "the former output copy is removed"
+        assert not (tmp_path / "movie.avi.replace-tmp").exists(), (
+            "the stage was consumed by the atomic rename"
+        )
+        assert any("output now at" in line for line in lines)
 
     def test_replace_refused_run_still_keeps_success(self, tmp_path):
         # The refusal path end-to-end: output_dir forced onto another

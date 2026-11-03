@@ -276,8 +276,9 @@ class Registry:
         """D2 (§4): converge on other writers' truth before any read.
 
         One ``stat`` in the common case; a different mtime takes the
-        lock, re-stats INSIDE the lock (another copy may have reloaded
-        us already), re-parses, and merges by job_id:
+        lock and converges via ``_reload_if_changed_unlocked`` (which
+        re-stats INSIDE the lock — another copy may have reloaded us
+        already — then re-parses and merges by job_id):
         - file rows win over in-memory rows for every persisted field;
         - in-memory ``_live`` boxes and ``_cancel_flags`` survive (they
           are process-local by design);
@@ -290,41 +291,53 @@ class Registry:
         in-memory view kept. The hard raise stays at startup ``load()``.
         Test seam: monkeypatch ``_stat_mtime_or_none`` or ``_parse_rows``
         to simulate mtime drift without the filesystem.
+
+        v0.4.15.3 (F-3): the SAME converge body also guards the WRITE
+        boundary (``save``/``enqueue``/``transition`` call the unlocked
+        body directly under their own lock hold) — a stale-view save
+        must never revert another process's newer rows.
         """
         mtime = self._stat_mtime_or_none()
         if mtime == self._loaded_mtime:
             return
         with self._lock:
-            mtime = self._stat_mtime_or_none()
-            if mtime == self._loaded_mtime:
-                return
-            try:
-                rows = self._parse_rows()
-            except Exception as exc:
+            self._reload_if_changed_unlocked()
+
+    def _reload_if_changed_unlocked(self) -> None:
+        """The D2 converge body with ``_lock`` already held (F-3): the
+        re-stat doubles as the double-check — another thread may have
+        reloaded us while we waited for the lock, so a stale parse
+        never runs twice."""
+        mtime = self._stat_mtime_or_none()
+        if mtime == self._loaded_mtime:
+            return
+        try:
+            rows = self._parse_rows()
+        except Exception as exc:
+            self._log_soft(
+                f"registry reload failed; keeping in-memory view: {exc}"
+            )
+            return
+        file_ids = set()
+        for row in rows:
+            record = JobRecord.from_dict(row)
+            file_ids.add(record.job_id)
+            existing = self._jobs.get(record.job_id)
+            if existing is not None and getattr(existing, "_live", None):
+                live = existing._live  # process-local, survives reload
+            else:
+                live = None
+            self._jobs[record.job_id] = record
+            if live:
+                self._jobs[record.job_id]._live = live
+        for job_id in self._jobs:
+            if job_id not in file_ids:
                 self._log_soft(
-                    f"registry reload failed; keeping in-memory view: {exc}"
+                    f"registry reload: job {job_id} is in memory but "
+                    "absent from the file; leaving it alone (this "
+                    "server's in-flight record)"
                 )
-                return
-            file_ids = set()
-            for row in rows:
-                record = JobRecord.from_dict(row)
-                file_ids.add(record.job_id)
-                existing = self._jobs.get(record.job_id)
-                if existing is not None and getattr(existing, "_live", None):
-                    live = existing._live  # process-local, survives reload
-                else:
-                    live = None
-                self._jobs[record.job_id] = record
-                if live:
-                    self._jobs[record.job_id]._live = live
-            for job_id in self._jobs:
-                if job_id not in file_ids:
-                    self._log_soft(
-                        f"registry reload: job {job_id} is in memory but "
-                        "absent from the file; leaving it alone (this "
-                        "server's in-flight record)"
-                    )
-            self._loaded_mtime = mtime
+        self._loaded_mtime = mtime
 
     def _parse_rows(self) -> list[dict]:
         """The file's job rows parsed strictly; raises for the soft-fail
@@ -378,8 +391,16 @@ class Registry:
         v0.4.5 (§4): the post-write mtime becomes ``_loaded_mtime``, so
         a save→read sequence does not trigger an unnecessary reload of
         our own write.
+
+        v0.4.15.3 (F-3): converge on other writers' truth BEFORE
+        writing; a stale-view save must never revert another process's
+        newer rows (the v0.4.5 D2 rule, now applied at the write
+        boundary too — Karen's 2026-11-02 validation: a second
+        process's wholesale save resurrected ``succeeded → running``
+        and dropped freshly enqueued rows).
         """
         with self._lock:
+            self._reload_if_changed_unlocked()
             self._save_unlocked()
 
     def _save_unlocked(self) -> None:
@@ -429,8 +450,13 @@ class Registry:
             options=options,
         )
         with self._lock:
+            # v0.4.15.3 (F-3): converge under the SAME hold as the
+            # insert + save — a fresh insert rides converged truth and
+            # cannot trigger (or race) the "in memory but absent from
+            # file" defensive warning on a stale view.
+            self._reload_if_changed_unlocked()
             self._jobs[record.job_id] = record
-        self.save()
+            self._save_unlocked()
         return record
 
     def get(self, job_id: str) -> JobRecord | None:
@@ -453,15 +479,26 @@ class Registry:
         running, so a cancel can never land in the old claim window
         against "no live owner". Terminal transitions pop the flag
         (the close is what makes it dead).
+
+        v0.4.15.3 (F-3): converge → mutate → persist under ONE hold
+        (mirrors ``claim_next``'s inlined pattern): the caller's
+        pending transition is applied ON TOP of converged truth instead
+        of racing it, so a foreign writer's insert/update cannot be
+        reverted by this save.
         """
         with self._lock:
+            self._reload_if_changed_unlocked()
+            # mutate the CANONICAL record — a converge may have
+            # re-parsed this job's row from another writer's save, and
+            # that re-parsed row is the object the file now knows.
+            record = self._jobs.get(record.job_id, record)
             record.transition(new_state)
             if new_state == "running":
                 from .jobs import CancelFlag  # deferred: jobs imports registry
                 self._cancel_flags[record.job_id] = CancelFlag()
             elif new_state in TERMINAL_STATES:
                 self._cancel_flags.pop(record.job_id, None)
-        self.save()
+            self._save_unlocked()
 
     def get_cancel_flag(self, job_id: str):
         """The claim-time registered CancelFlag for a running job

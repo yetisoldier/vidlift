@@ -1619,9 +1619,16 @@ def replace_source_with_output(
     - never when the output IS the source path (nothing to replace);
     - same filesystem -> one atomic ``os.replace`` (rename(2): either
       the old file is replaced or the call errs);
-    - cross filesystem -> copy first, verify the copy by SHA-256, and
-      only then delete the original output copy -- a verified copy
-      never destroys the only good data;
+    - cross filesystem (v0.4.15.3 F-2) -> stage the copy at a temp
+      SIBLING of the source (same directory, therefore the same
+      filesystem, therefore the final ``os.replace`` is an atomic
+      rename(2)), SHA-256-verify the staged copy against the verified
+      output, and only then rename it over the source -- the source is
+      never opened for write until a proven copy can rename into
+      place, so a mid-copy failure strands only the temp and both
+      original files survive (a verified copy never destroys the only
+      good data); staging needs transient space for one extra full
+      copy beside the source;
     - failures raise :class:`RunError` -- the runner catches it and
       converts to a logged warning so a replace failure can never fail
       a successful upscale.
@@ -1657,19 +1664,45 @@ def replace_source_with_output(
                 f"source ({source}): {exc}"
             ) from exc
     else:
+        # v0.4.15.3 (F-2): stage the copy at a temp SIBLING of the
+        # source (same directory -> same filesystem -> the final
+        # os.replace is an atomic rename(2)); hash-verify the temp
+        # against the verified output BEFORE the source is ever
+        # opened. A mid-copy failure can now strand only the temp —
+        # the source and the verified output both survive, which is
+        # what the docstring always promised.
+        tmp = str(source) + ".replace-tmp"
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)  # stale temp from a killed run
+            except OSError:
+                pass
         try:
-            shutil.copy2(str(output), str(source))
-            if _sha256_file(output) != _sha256_file(source):
+            try:
+                shutil.copy2(str(output), tmp)
+                if _sha256_file(output) != _sha256_file(tmp):
+                    raise RunError(
+                        "replace-source: the staged copy for "
+                        f"{source} does not hash-match the verified "
+                        "output; keeping the verified original and the "
+                        "source untouched"
+                    )
+                os.replace(tmp, str(source))
+            except OSError as exc:
                 raise RunError(
-                    "replace-source: the copied file at "
-                    f"{source} does not hash-match the verified output; "
-                    "keeping the verified original and the source"
-                )
-        except OSError as exc:
-            raise RunError(
-                f"replace-source cross-filesystem copy into {source} "
-                f"failed: {exc}"
-            ) from exc
+                    f"replace-source cross-filesystem copy into {source} "
+                    f"failed: {exc}"
+                ) from exc
+        finally:
+            # The temp must never outlive the call: the success path
+            # consumed it via os.replace (the rename unlinked the name),
+            # every error path strands an unproven copy that is not the
+            # source and not the verified output.
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         # The copy hash-verified: the file at the source path is now the
         # good data, so only the former output copy gets removed.
         try:

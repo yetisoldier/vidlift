@@ -2,8 +2,9 @@
 
 One pass over an EXISTING file at ANY resolution that lacks a usable
 subtitle track: transcribe the source's own audio (the shared core,
-transcribe_source_to_srt), then soft-mux (`-c copy`, mov_text + a
-language tag) into a NEW file beside the source —
+transcribe_source_to_srt), then soft-mux (v0.4.15.3 allowlist map
+`-map 0:v -map 0:a -map 1`, `-c copy`, mov_text + a language tag)
+into a NEW file beside the source —
 ``{stem}.subs.mp4`` — never touching the source (source-blind
 safety). The KEEP ``{stem}.subs.srt`` sidecar is written next to the
 output by the core itself.
@@ -78,7 +79,13 @@ def source_has_usable_subtitles(report) -> bool:
     """Mode B's guard: embedded TEXT subs count as usable; bitmap tracks
     (PGS/VobSub) and sidecars do NOT stop the job — a file with only
     bitmap subs has no legible subs in most players, which is exactly
-    Mode B's reason to exist."""
+    Mode B's reason to exist.
+
+    Contract with ``mplex``: when this returns False (or ``--force``
+    overrides it), the remux allowlist-maps only ``0:v`` + ``0:a`` + the
+    new SRT — bitmap tracks are left behind in the untouched source,
+    never transcoded.
+    """
     return any(s.kind in _USABLE_KINDS for s in report.subtitles)
 
 
@@ -226,12 +233,28 @@ def mplex(
     ffmpeg: str,
     runner,
 ) -> str:
-    """B1 remux: `ffmpeg -i source -i subs -map 0 -map 1 -c copy
-    -c:s mov_text -metadata:s:s:0 language=<lang> -movflags +faststart
-    <output>` — temp-sibling + os.replace atomicity (the
+    """B1 remux: `ffmpeg -i source -i subs -map 0:v -map 0:a -map 1
+    -c copy -c:s mov_text -metadata:s:s:0 language=<lang> -movflags
+    +faststart <output>` — temp-sibling + os.replace atomicity (the
     mux_srt_into_mp4 pattern), but building a NEW file beside the
     source instead of replacing the finished encode in place.
-    Source-blind: the job touches nothing else."""
+
+    The map is an allowlist by contract: the probe→guard gate upstream
+    guarantees ≥1 video stream, ≥1 audio stream, and no *text*
+    subtitle track (unless `--force`), so `0:a` is non-optional. Bitmap
+    subtitles (PGS/VobSub — the files Mode B exists for), attachments,
+    and data streams are deliberately NOT carried: they cannot be
+    transcoded to mov_text and several cannot live in mp4 at all. The
+    output's subtitle track IS the transcription; the untouched source
+    keeps its bitmap tracks.
+
+    Residual boundary: a source whose *video* codec has no mp4 tag
+    (e.g. some VPx/theora builds) still fails the remux honestly with
+    :class:`SubsJobError` — unchanged, out of the v0.4.15.3 fix's
+    scope.
+
+    Source-blind: the job touches nothing else.
+    """
     tmp = output_path + ".muxing.mp4"
     if os.path.exists(tmp):
         try:
@@ -241,7 +264,14 @@ def mplex(
     cmd = [
         ffmpeg, "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
         "-i", source_path, "-i", srt_path,
-        "-map", "0", "-map", "1",
+        # v0.4.15.3 (F-1): allowlist mapping — the old blanket `-map 0`
+        # routed bitmap subtitle tracks (PGS/VobSub) and mkv
+        # attachment/data streams into the mp4, where the blanket
+        # `-c:s mov_text` forces a bitmap→text transcode ffmpeg
+        # categorically refuses. The probe→guard gate already
+        # guarantees a video and an audio stream (see the
+        # source_has_usable_subtitles contract).
+        "-map", "0:v", "-map", "0:a", "-map", "1",
         "-c", "copy", "-c:s", "mov_text",
         "-metadata:s:s:0", f"language={mux_language(language)}",
         "-movflags", "+faststart",

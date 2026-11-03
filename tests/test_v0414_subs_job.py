@@ -312,6 +312,14 @@ def test_b1_success_remux_shape_and_source_blind(tmp_path, no_lock):
     assert "-movflags" in argv and "+faststart" in argv
     assert argv[-1].endswith(".muxing.mp4")  # temp sibling, atomic replace
 
+    # v0.4.15.3 (F-1): the map is exactly the allowlist form — video +
+    # audio + the new SRT; the unqualified `-map 0` (which dragged
+    # bitmap tracks / attachments into the mp4 and died on ffmpeg's
+    # text→bitmap-only rule) is absent.
+    maps = [argv[i + 1] for i, flag in enumerate(argv) if flag == "-map"]
+    assert maps == ["0:v", "0:a", "1"]  # exactly the allowlist, in order
+    assert "0" not in maps  # the unqualified `-map 0` is gone
+
     # audio extract maps the source's a:0 (sync anchor)
     wav_cmds = [c for c in runner.commands if "pcm_s16le" in " ".join(c[1])]
     assert wav_cmds and "-map" in wav_cmds[0][1]
@@ -319,6 +327,54 @@ def test_b1_success_remux_shape_and_source_blind(tmp_path, no_lock):
 
     # the NoLock was claimed + released (Mode A discipline)
     assert no_lock.acquired and no_lock.released
+
+
+@pytest.mark.usefixtures("engine_on")
+def test_bitmap_subs_source_completes_and_allowlist_maps(tmp_path, no_lock):
+    """F-1 regression pin (v0.4.15.3): the file the guard ADMITS — a
+    bitmap-subs (PGS) source with no text track, Mode B's designed use
+    case — completes the whole job, and the mux argv is the allowlist
+    form. The old blanket `-map 0` routed the bitmap track into the
+    mp4 where `-c:s mov_text` forced a bitmap→text transcode ffmpeg
+    categorically refuses — every Mode B run on this class died at the
+    mux AFTER the (minutes-to-hours) transcription."""
+    src = tmp_path / "pgs-movie.mkv"
+    src.write_bytes(b"source-bytes")
+    payload = json.dumps({
+        "streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "h264",
+             "width": 640, "height": 272, "sample_aspect_ratio": "1:1",
+             "field_order": "progressive", "r_frame_rate": "25/1",
+             "avg_frame_rate": "25/1"},
+            {"index": 1, "codec_type": "audio", "codec_name": "mp3",
+             "channels": 2, "tags": {"language": "und"}},
+            {"index": 2, "codec_type": "subtitle",
+             "codec_name": "hdmv_pgs_subtitle",
+             "tags": {"language": "und"}},
+        ],
+        "format": {"format_name": "matroska,webm", "duration": "60.0"},
+    })
+    runner = FakeRunner(payload)
+    result = run_subs_job(
+        str(src),
+        ffmpeg="ffmpeg",
+        probe_runner=runner,
+        runner=runner,
+        engine_factory=lambda p: FakeEngine(p),
+        workdir=str(tmp_path / "wd"),
+    )
+    assert isinstance(result, SubsJobResult)
+    assert result.output_path == str(tmp_path / "pgs-movie.subs.mp4")
+    assert Path(result.output_path).read_bytes() == b"muxed-out"
+    assert src.read_bytes() == b"source-bytes"  # source-blind
+
+    # the mux argv is the allowlist form (see B1 pin above).
+    mux_cmds = [c for c in runner.commands if "-c:s" in c[1]]
+    assert len(mux_cmds) == 1
+    argv = mux_cmds[0][1]
+    maps = [argv[i + 1] for i, flag in enumerate(argv) if flag == "-map"]
+    assert maps == ["0:v", "0:a", "1"]
+    assert "0" not in maps
 
 
 def test_burn_flag_absent(tmp_path):
