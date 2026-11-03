@@ -317,6 +317,11 @@ def _describe_exception(exc: BaseException) -> str:
 
 
 _CUDA_FALLBACK_NOTE_FMT = "cuda unavailable — fell back to cpu ({})"
+# D1 honesty (Karen v0.4.15.2 validation): a cpu RESOLUTION that
+# needed the construction retry never claims a CUDA event — the
+# note names what actually happened on a box that may have no CUDA
+# at all. "{0}" keeps a literal "{...}" in the text safe.
+_CPU_RETRY_NOTE_FMT = "construction failed on cpu ({0}); retry succeeded."
 
 
 def make_whisper_engine_with_fallback(
@@ -411,26 +416,57 @@ def make_whisper_engine_with_fallback(
             # it failed -> raise as today. No note: none happened.
             raise
         try:
+            from .run import EngineCancelled  # lazy: run.py imports us
+
             engine = _build(model_path, device="cpu")
+        except EngineCancelled as cpu_exc:
+            # D2 honesty (Karen validation): a cancel during the cpu
+            # retry is control flow, not a device guess. The CUDA note
+            # stays honest (the CUDA attempt DID fall back), but its
+            # forensics name the cancel, never the cpu path's failure.
+            if on_fallback is not None:
+                on_fallback(
+                    _CUDA_FALLBACK_NOTE_FMT.format(
+                        type(cpu_exc).__name__
+                    )
+                )
+            raise cpu_exc from exc
         except Exception as cpu_exc:  # noqa: BLE001
             # the cpu LAST RESORT failed: its error is the real one.
             raise cpu_exc from exc
-        note = _CUDA_FALLBACK_NOTE_FMT.format(_describe_exception(exc))
+        # D1 honesty (Karen validation): the wording keys on the
+        # RESOLUTION (the truth), not the request (the intent) — a box
+        # with no CUDA never claims "cuda unavailable" in its
+        # forensics. The explicit-pin arm says so only when the
+        # resolution actually was cuda.
+        if resolved == "cuda":
+            note = _CUDA_FALLBACK_NOTE_FMT.format(_describe_exception(exc))
+        else:
+            note = _CPU_RETRY_NOTE_FMT.format(_describe_exception(exc))
         if on_fallback is not None:
             on_fallback(note)
-        if requested == "cuda":
-            print(
-                "WARNING: [vidlift.transcribe] requested --device cuda "
-                f"but CUDA failed ({type(exc).__name__}: {exc}); "
-                "falling back to CPU (int8)",
-                file=sys.stderr,
-                flush=True,
-            )
+        if resolved == "cuda":
+            if requested == "cuda":
+                print(
+                    "WARNING: [vidlift.transcribe] requested --device "
+                    f"cuda but CUDA failed ({type(exc).__name__}: {exc}); "
+                    "falling back to CPU (int8)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    "WARNING: [vidlift.transcribe] CUDA transcription "
+                    f"unavailable ({type(exc).__name__}: {exc}); "
+                    "falling back to CPU (int8)",
+                    file=sys.stderr,
+                    flush=True,
+                )
         else:
             print(
-                "WARNING: [vidlift.transcribe] CUDA transcription "
-                f"unavailable ({type(exc).__name__}: {exc}); "
-                "falling back to CPU (int8)",
+                "WARNING: [vidlift.transcribe] engine construction on "
+                f"cpu failed ({type(exc).__name__}: {exc}); retrying "
+                "once on cpu (int8)",
                 file=sys.stderr,
                 flush=True,
             )
@@ -469,7 +505,7 @@ def make_whisper_engine_with_fallback(
 
 class _FallbackEngine(TranscribeEngine):
     """Tier-2 rider (v0.4.15.2): wraps a CUDA-built engine until its
-    first engine call proves the device (or executes the ONE cpu
+    first DECODE proves the device (or executes the ONE cpu
     rebuild). Construction-side fallbacks wrap too; their note is
     already Spoken for, so a post-fallback decode failure re-raises
     (never a second rescue, never a second note) — the design's
@@ -496,7 +532,23 @@ class _FallbackEngine(TranscribeEngine):
         self._note = note
         self._on_fallback = on_fallback
         self._on_dispose = on_dispose
-        self._first_call_done = False
+        # D3 (Karen validation): the tier-2 gate is the first DECODE
+        # (transcribe_segments) ONLY. Language detection is not a decode
+        # — in the default flow it runs FIRST and must never consume
+        # this gate, or the design's headline case (OOM at the first
+        # decode, exactly where the GUI's upscale may hold VRAM) is
+        # left unguarded. The detect call keeps its own one-shot arm
+        # (a detect-time CUDA failure rebuilds once on cpu, and the
+        # first decode below still rides the fresh decode gate on the
+        # rebuilt cpu engine).
+        self._decode_gate_done = False
+        # the detect arm's own one-shot flag (per-method gates; D3):
+        self._detect_gate_done = False
+        # the note the detect arm's rebuild just earned (spoken to the
+        # caller by _rebuild_cpu); the wrapper adopts it as its own
+        # _note AFTER the rescue so the rebuilt cpu engine has NO
+        # further rescues (the once-per-seam discipline).
+        self._pending_note: str | None = None
         # shape-compatibility: the device the caller is currently riding
         # (updated to "cpu" by the tier-2 rebuild).
         self.device = initial_device
@@ -504,25 +556,32 @@ class _FallbackEngine(TranscribeEngine):
     def detect_language(
         self, audio_path: str, *, offset_seconds: float = 0.0
     ) -> LanguageGuess:
-        """Language detection is usually the FIRST engine use (the
-        core detects before transcribing) — a CUDA OOM can land inside
-        the cuda init faster-whisper runs under it, so it rides the same
-        first-call gate with the same one-rebuild rescue."""
-        if self._first_call_done:
+        """Language detection keeps its own one-shot rescue (the first
+        detect call) but NEVER consumes the decode gate (D3): in the
+        default flow detect runs first, and the first transcribe is
+        still unproven there. The gate here is the detect call itself,
+        not the tier-2 decode seam."""
+        if self._detect_gate_done:
             return self._engine.detect_language(
                 audio_path, offset_seconds=offset_seconds
             )
-        self._first_call_done = True
+        self._detect_gate_done = True
         try:
             return self._engine.detect_language(
                 audio_path, offset_seconds=offset_seconds
             )
         except Exception as exc:  # noqa: BLE001 - the deliberate broad catch
-            if self._note is not None:
+            from .run import EngineCancelled  # lazy: run.py imports us
+
+            # D2 (Karen validation): a cancel is control flow, not a
+            # device guess — EngineCancelled re-raises before any
+            # rebuild/forensics (the gate state does not matter).
+            if isinstance(exc, EngineCancelled) or self._note is not None:
                 # construction already fell back: the honest no-second-
                 # rescue rule -> raise as today.
                 raise
             self._rebuild_cpu(exc)
+            self._note = self._pending_note or self._note
             return self._engine.detect_language(
                 audio_path, offset_seconds=offset_seconds
             )
@@ -534,26 +593,34 @@ class _FallbackEngine(TranscribeEngine):
         language: str,
         on_segment: Callable[[TranscriptSegment], None] | None = None,
     ) -> list[TranscriptSegment]:
-        """First call: faster-whisper's transcribe returns a LAZY
-        generator, so a CUDA OOM surfaces on iteration — the engine's
-        own segment loop (vidlift's WhisperEngine adapter materializes
-        it) makes the failure land inside this call, which is exactly
-        the seam the gate catches. The rebuild re-runs the SAME call
-        once on CPU."""
-        if self._first_call_done:
+        """First DECODE call: faster-whisper's transcribe returns a
+        LAZY generator, so a CUDA OOM surfaces on iteration — the
+        engine's own segment loop (vidlift's WhisperEngine adapter
+        materializes it) makes the failure land inside this call,
+        which is exactly the seam the gate catches. The rebuild
+        re-runs the SAME call once on CPU. Language detection does NOT
+        consume this gate (D3): the default flow detects first, and
+        the first decode is still unproven here."""
+        if self._decode_gate_done:
             return self._engine.transcribe_segments(
                 audio_path, language=language, on_segment=on_segment
             )
-        self._first_call_done = True
+        self._decode_gate_done = True
         try:
             return self._engine.transcribe_segments(
                 audio_path, language=language, on_segment=on_segment
             )
         except Exception as exc:  # noqa: BLE001 - the deliberate broad catch
-            if self._note is not None:
+            from .run import EngineCancelled  # lazy: run.py imports us
+
+            # D2 (Karen validation): a cancel is control flow, not a
+            # device guess — EngineCancelled re-raises before any
+            # rebuild/forensics (the gate state does not matter).
+            if isinstance(exc, EngineCancelled) or self._note is not None:
                 # construction already fell back: raise as today.
                 raise
             self._rebuild_cpu(exc)
+            self._note = self._pending_note or self._note
             return self._engine.transcribe_segments(
                 audio_path, language=language, on_segment=on_segment
             )
@@ -564,6 +631,15 @@ class _FallbackEngine(TranscribeEngine):
         release + the caller's dispose hook, then the rebuild through
         the same ctor seam on device="cpu". The rebuild failing raises
         its real error (the cpu path is the last resort)."""
+        # D2 (Karen validation): EngineCancelled is control flow, not a
+        # device guess — no warning, no note, no rebuild; the callers
+        # never reach this seam with a cancel (they re-raise first), so
+        # this arm is defensive for direct _rebuild_cpu entry.
+        from .run import EngineCancelled  # lazy: run.py imports us
+
+        if isinstance(exc, EngineCancelled):
+            raise
+
         print(
             f"WARNING: [vidlift.transcribe] CUDA transcription failed on "
             f"first decode ({type(exc).__name__}: {exc}); "
@@ -594,6 +670,9 @@ class _FallbackEngine(TranscribeEngine):
             device="cpu",
             cpu_threads=self._cpu_threads,
             vad_on=self._vad_on,
+        )
+        self._pending_note = _CUDA_FALLBACK_NOTE_FMT.format(
+            _describe_exception(exc)
         )
         self.device = "cpu"
 

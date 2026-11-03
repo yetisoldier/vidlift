@@ -568,3 +568,481 @@ class TestProbeUntouched:
         fake_ct2.get_cuda_device_count = lambda: 2
         monkeypatch.setitem(sys.modules, "ctranslate2", fake_ct2)
         assert resolve_transcription_device("auto") == "cuda"
+
+
+# ---- run.py seam honesty (design §4, at the run level) ----------------------
+
+
+class TestRunSeamManifestHonesty:
+    def test_mode_a_manifest_records_fallback_note_and_device(
+        self, tmp_path, monkeypatch
+    ):
+        """The run-level contract: a fallback that fires inside a real
+        run_file() (production default, no injected factory) lands in
+        the finished manifest's transcription block as the note plus
+        the honest device echo, the run still carries its subtitles
+        (the fallback exists so the job survives), and the stderr
+        WARNING line is on the run log (run.py's log() copy of the
+        note). This pins run.py's _on_cuda_fallback closure — the
+        device-echo mirror and the note slot — which the core-level
+        wiring tests cannot see."""
+        import json as _json
+        import subprocess as _sp
+        from pathlib import Path as _Path
+
+        from vidlift.run import ToolBox, run_file
+        import vidlift.transcribe as transcribe_mod
+
+        _engine_on(monkeypatch)
+        src = tmp_path / "subless.mp4"
+        _sp.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=size=128x96:rate=10:duration=3",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-shortest", str(src),
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        built: list[str] = []
+
+        def _ctor(model_path, *, device="auto", cpu_threads=4, vad_on=True):
+            built.append(device)
+            if device == "cuda":
+                raise RuntimeError("Library cublas could not be loaded")
+            return _StubEngine(model_path, device=device)
+
+        monkeypatch.setattr(transcribe_mod, "make_whisper_engine", _ctor)
+        # the run branch re-imports this module attribute at call time
+        monkeypatch.setattr(
+            transcribe_mod, "resolve_transcription_device", lambda pin: "cuda"
+        )
+
+        result = run_file(
+            str(src),
+            engine_request="stub",
+            tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+            output_dir=str(tmp_path / "out"),
+            log_dir=str(tmp_path / "runs"),
+            sample_classify=False,
+            transcription_enabled=None,
+        )
+        state = result.state
+        assert state.ok, f"fallback must ride the run, not fail it: {state.error}"
+        block = state.subtitles["transcription"]
+        assert built == ["cuda", "cpu"]
+        assert block["device"] == "cpu (cuda unavailable)"
+        note = "cuda unavailable — fell back to cpu (RuntimeError)"
+        assert note in block["notes"]
+        assert state.subtitles["status"] == "carried"
+        # the note went through run.py's log() too (the stderr line is
+        # the wrapper's; run.py mirrors the note into the run log)
+        log_lines = state.log.lines if state.log is not None else []
+        assert any(note in line for line in log_lines), (
+            "run.py mirrors the fallback note into the run log"
+        )
+        manifest = _json.loads(_Path(result.manifest_path).read_text())
+        mblock = manifest["run"]["subtitles"]["transcription"]
+        assert mblock["device"] == "cpu (cuda unavailable)"
+        assert note in mblock["notes"]
+
+# ---- Karen v0.4.15.2 defect pins (validation 2026-11-02) --------------------
+#
+# D3 (HIGH): the tier-2 gate was ONE shared _first_call_done flag — the
+# default flow's detect_language call consumed it, so the headline case
+# (OOM at the FIRST DECODE, right after detect) detonated Mode A runs
+# after upscale+verify and crashed Mode B's CLI. The wrapper now gates
+# the first transcribe_segments call ONLY (detect keeps its own arm);
+# these tests pin the default-flow decode-rot rescue and the gate
+# mechanics Karen's e2e.py E3 journey exposed.
+#
+# D2 (MEDIUM): the tier-2 catches treated EngineCancelled as a CUDA
+# failure — fabricated "CUDA ... failed" warning + note + a wasted cpu
+# rebuild on a user cancel. A cancel is control flow, not a device
+# guess: it re-raises before any rebuild/forensics, and the CORE's
+# broad catch set (the (ProbeError, PlanError, VideoToolError, RunError)
+# family Mode A installs around the run) does the disposition — that is
+# the honesty rule the feature is named for.
+#
+# D1 (MEDIUM): the cpu-RESOLUTION tier-1 arm (probe-cpu transient
+# failure, or an explicit cuda pin handed back verbatim by the resolver)
+# claimed "cuda unavailable" on boxes with NO cuda. The wording keys on
+# the RESOLUTION (the truth): the cpu arm names the construction
+# failure it retried; "cuda unavailable" only speaks when the
+# resolution actually was cuda.
+
+
+class _DetectOkDecodeHostile:
+    """The D3 shape (Karen's DecodeHostile probe): construction and
+    detection succeed on cuda; the FIRST transcribe_segments call
+    raises (the OOM-at-decode case the GUI's own upscale can provoke
+    by holding VRAM outside the phase lock)."""
+
+    def __init__(self, model_path:str, *, device:str="auto",
+                 cpu_threads:int=4, vad_on:bool=True) -> None:
+        self.device = device
+        self.model = "MODEL" if device == "cuda" else None
+        self.attempts: list[str] = []
+
+    def detect_language(self, audio_path, *, offset_seconds=0.0):
+        from vidlift.transcribe import LanguageGuess
+
+        return LanguageGuess(code="en", confidence=0.9)
+
+    def transcribe_segments(self, audio_path, *, language, on_segment=None):
+        self.attempts.append(f"{self.device}:{language}")
+        if self.device == "cuda":
+            raise RuntimeError("CUDA OOM in the first decode workspace")
+        return super_transcribe(self, audio_path, language, on_segment)
+
+
+def super_transcribe(engine, audio_path, language, on_segment):
+    from tests._helpers import make_wrapper  # noqa: F401 (shape anchor)
+
+    segs = [
+        TranscriptSegment(
+            start=0.5,
+            end=1.5,
+            text=" Hello there.",
+            words=[WordStamp(0.5, 1.0, "Hello", 0.95),
+                   WordStamp(1.1, 1.5, "there.", 0.95)],
+        ),
+    ]
+    for s in segs:
+        if on_segment is not None:
+            on_segment(s)
+    return segs
+
+
+class TestD3DefaultFlowDecodeRot:
+    def test_decode_rot_after_detect_rescues_once(self, monkeypatch, capsys):
+        """The HEADLINE contract: detect succeeds on cuda, the first
+        decode OOMs -> ONE cpu rebuild + the SAME call retried; the
+        wrapper is honest (note + stderr), later decodes pass bare."""
+        _engine_on(monkeypatch)
+        built: list[str] = []
+        disposed: list[str] = []
+
+        def ctor(model_path, *, device="auto", cpu_threads=4, vad_on=True):
+            built.append(device)
+            if device == "cuda":
+                return _DetectOkDecodeHostile(model_path, device=device)
+            return _StubEngine(model_path, device=device)
+
+        notes: list[str] = []
+        engine = make_wrapper(
+            "m",
+            resolved_device="cuda",
+            on_fallback=notes.append,
+            ctor=ctor,
+            on_dispose=disposed.append,
+        )
+        # the default flow: detect rides FIRST and never consumes the
+        # decode gate
+        guess = engine.detect_language("wav")
+        assert guess.code == "en"
+        assert notes == []
+        assert engine.device == "cuda"
+
+        segs = engine.transcribe_segments("wav", language="en")
+        assert [s.text for s in segs] == [" Hello there."]
+        assert built == ["cuda", "cpu"]
+        assert disposed  # the hostile cuda engine was released
+        assert engine.device == "cpu"
+        assert notes == [
+            "cuda unavailable — fell back to cpu (RuntimeError)"
+        ]
+        err = capsys.readouterr().err
+        assert "WARNING" in err and "first decode" in err
+        assert "falling back to CPU (int8)" in err
+
+    def test_decode_gate_consumed_by_transcribe_not_detect(
+        self, monkeypatch, capsys
+    ):
+        """The gate mechanics (the D3 root cause, pinned): the FIRST
+        detect call does its one rescue WITHOUT touching the decode
+        gate; the first transcribe on the REBUILT cpu engine STILL
+        rides a live decode gate (its call once-fails: rescued), and a
+        SECOND decode failure propagates (the once-per-seam
+        discipline)."""
+        _engine_on(monkeypatch)
+        detect_fails = {"on": True}
+        decode_fails = {"count": 0}
+        built: list[str] = []
+
+        class _Hostile:
+            def __init__(self, model_path, *, device="auto",
+                         cpu_threads=4, vad_on=True) -> None:
+                self.device = device
+                self.model = "MODEL" if device == "cuda" else None
+
+            def detect_language(self, audio_path, *, offset_seconds=0.0):
+                from vidlift.transcribe import LanguageGuess
+
+                if detect_fails["on"] and self.device == "cuda":
+                    detect_fails["on"] = False
+                    raise RuntimeError("CUDA OOM inside detect_language")
+                return LanguageGuess(code="en", confidence=0.9)
+
+            def transcribe_segments(self, audio_path, *, language,
+                                    on_segment=None):
+                if self.device == "cuda":
+                    raise RuntimeError("CUDA OOM at decode")
+                if decode_fails["count"] == 0:
+                    decode_fails["count"] = 1
+                    raise RuntimeError("spurious cpu decode failure")
+                return []
+
+        def ctor(model_path, *, device="auto", cpu_threads=4, vad_on=True):
+            built.append(device)
+            return _Hostile(model_path, device=device)
+
+        notes: list[str] = []
+        engine = make_wrapper(
+            "m", resolved_device="cuda", ctor=ctor,
+            on_fallback=notes.append,
+        )
+        # detect OOM -> rescued onto cpu (detect's own one arm)
+        guess = engine.detect_language("wav")
+        assert guess.code == "en"
+        assert engine.device == "cpu"
+        assert built == ["cuda", "cpu"]
+        # the decode gate is STILL FRESH (D3) — but the tier-2 rescue
+        # is SCOPED to CUDA-built engines (the design's device
+        # decision): the rebuilt cpu engine's first decode failure
+        # propagates bare (a cpu decode fault is a real fault, not an
+        # environment guess; no third build, no CUDA forensics for a
+        # box riding cpu).
+        capsys.readouterr()  # drain the DETECT rescue's honest WARNING
+        with pytest.raises(RuntimeError, match="spurious cpu decode"):
+            engine.transcribe_segments("wav", language="en")
+        assert built == ["cuda", "cpu"]  # no third build ever
+        # the bare propagation itself fabricates NOTHING new:
+        assert capsys.readouterr().err == ""
+
+    def test_detect_oom_then_first_decode_cuda_oom_both_rescued(
+        self, monkeypatch
+    ):
+        """The adversarial extreme Karen's gate analysis implies: BOTH
+        first calls fail on cuda — detect rescued once, and the first
+        decode rescued once ON THE CUDA ENGINE (never twice on the
+        same seam, never a third rebuild)."""
+        _engine_on(monkeypatch)
+        built: list[str] = []
+
+        class _DoubleHostile:
+            def __init__(self, model_path, *, device="auto",
+                         cpu_threads=4, vad_on=True) -> None:
+                self.device = device
+                self.model = "MODEL"
+                self.detect_done = False
+
+            def detect_language(self, audio_path, *, offset_seconds=0.0):
+                from vidlift.transcribe import LanguageGuess
+
+                if self.device == "cuda" and not self.detect_done:
+                    self.detect_done = True
+                    raise RuntimeError("CUDA OOM inside detect_language")
+                return LanguageGuess(code="en", confidence=0.9)
+
+            def transcribe_segments(self, audio_path, *, language,
+                                    on_segment=None):
+                if self.device == "cuda":
+                    raise RuntimeError("CUDA OOM at first decode")
+                return []
+
+        def ctor(model_path, *, device="auto", cpu_threads=4, vad_on=True):
+            built.append(device)
+            return _DoubleHostile(model_path, device=device)
+
+        notes: list[str] = []
+        engine = make_wrapper(
+            "m", resolved_device="cuda", on_fallback=notes.append,
+            ctor=ctor,
+        )
+        assert engine.detect_language("wav").code == "en"
+        assert engine.device == "cpu"  # detect rescue rebuilt on cpu
+        assert engine.transcribe_segments("wav", language="en") == []
+        assert built == ["cuda", "cpu"]  # no third build ever
+
+
+from vidlift.run import EngineCancelled  # the core's control-flow type
+
+
+class _CancelDuringDecode:
+    """Karen's P2 shape: should_cancel() fires inside the core's
+    _on_segment, so EngineCancelled raises from the engine call."""
+
+    def __init__(self, model_path:str, *, device:str="auto",
+                 cpu_threads:int=4, vad_on:bool=True) -> None:
+        self.device = device
+        self.model = "MODEL" if device == "cuda" else None
+
+    def detect_language(self, audio_path, *, offset_seconds=0.0):
+        from vidlift.transcribe import LanguageGuess
+
+        return LanguageGuess(code="en", confidence=0.9)
+
+    def transcribe_segments(self, audio_path, *, language, on_segment=None):
+        seg = TranscriptSegment(0.5, 1.5, " Hello there.", [])
+        if on_segment is not None:
+            on_segment(seg)  # the core's _on_segment raises HERE
+        raise EngineCancelled("cancelled during transcription")
+
+
+class TestD2CancelIsNotADeviceGuess:
+    def test_cancel_during_first_decode_no_rebuild_no_fabrication(
+        self, monkeypatch, capsys
+    ):
+        """Pinned-flow cancel DURING the first decode: EngineCancelled
+        propagates — NO fabricated CUDA warning, NO note, NO cpu
+        rebuild, NO dispose. Cancel forensics name the cancel."""
+        _engine_on(monkeypatch)
+        built: list[str] = []
+        disposed: list[str] = []
+
+        def ctor(model_path, *, device="auto", cpu_threads=4, vad_on=True):
+            built.append(device)
+            return _CancelDuringDecode(model_path, device=device)
+
+        notes: list[str] = []
+        engine = make_wrapper(
+            "m", resolved_device="cuda",
+            on_fallback=notes.append, ctor=ctor,
+            on_dispose=disposed.append,
+        )
+        with pytest.raises(EngineCancelled,
+                           match="cancelled during transcription"):
+            engine.transcribe_segments("wav", language="en")
+        assert built == ["cuda"]  # NO wasted cpu rebuild
+        assert disposed == []  # nothing disposed on a cancel
+        assert notes == []  # NO fabricated note
+        assert engine.device == "cuda"
+        assert capsys.readouterr().err == ""  # NO fabricated WARNING
+
+    def test_cancel_during_detect_no_rebuild_no_fabrication(
+        self, monkeypatch, capsys
+    ):
+        """Same rule at the detect arm: the cancel rides its own gate;
+        no CUDA forensics ever fire for it."""
+        _engine_on(monkeypatch)
+        built: list[str] = []
+
+        class _CancelInDetect:
+            def __init__(self, model_path, *, device="auto",
+                         cpu_threads=4, vad_on=True) -> None:
+                self.device = device
+
+            def detect_language(self, audio_path, *, offset_seconds=0.0):
+                raise EngineCancelled("cancelled during detection")
+
+            def transcribe_segments(self, audio_path, *, language,
+                                    on_segment=None):
+                return []
+
+        def ctor(model_path, *, device="auto", cpu_threads=4, vad_on=True):
+            built.append(device)
+            return _CancelInDetect(model_path, device=device)
+
+        notes: list[str] = []
+        engine = make_wrapper(
+            "m", resolved_device="cuda",
+            on_fallback=notes.append, ctor=ctor,
+        )
+        with pytest.raises(EngineCancelled,
+                           match="cancelled during detection"):
+            engine.detect_language("wav")
+        assert built == ["cuda"]
+        assert notes == []
+        assert capsys.readouterr().err == ""
+
+    def test_cancel_during_tier1_cpu_retry_honest_cancel_note(
+        self, monkeypatch
+    ):
+        """Tier 1's cpu retry cancelled: the run raises EngineCancelled;
+        the CUDA fallback DID happen, so the note is honest — it names
+        the cancel (the real forensics), not a cpu path failure."""
+        _engine_on(monkeypatch)
+        built: list[str] = []
+
+        def ctor(model_path, *, device="auto", cpu_threads=4, vad_on=True):
+            built.append(device)
+            if device == "cuda":
+                raise RuntimeError("Library cublas could not be loaded")
+            raise EngineCancelled("cancel landed during the cpu rebuild")
+
+        notes: list[str] = []
+        with pytest.raises(EngineCancelled,
+                           match="cancel landed during the cpu rebuild"):
+            make_wrapper(
+                "m", resolved_device="cuda",
+                on_fallback=notes.append, ctor=ctor,
+            )
+        assert built == ["cuda", "cpu"]
+        assert notes == [
+            "cuda unavailable — fell back to cpu (EngineCancelled)"
+        ]
+
+
+class TestD1CpuResolutionWording:
+    def test_probe_cpu_retry_note_names_the_cpu_construction_not_cuda(
+        self, monkeypatch, capsys
+    ):
+        """D1 verbatim (Karen's P1): probe-cpu box + transient ctor
+        failure -> the retry succeeds AND the note/stderr name the cpu
+        construction failure — never 'cuda unavailable' on a box that
+        has no CUDA and never attempted it."""
+        _engine_on(monkeypatch)
+        built: list[str] = []
+
+        def ctor(model_path, *, device="auto", cpu_threads=4, vad_on=True):
+            built.append(device)
+            if len(built) == 1:
+                raise RuntimeError("transient cpu ram pressure")
+            return _StubEngine(model_path, device=device)
+
+        notes: list[str] = []
+        engine = make_wrapper(
+            "m", device="auto", resolved_device="cpu",
+            on_fallback=notes.append, ctor=ctor,
+        )
+        assert engine.device == "cpu"
+        assert built == ["cpu", "cpu"]  # the accepted retry semantics
+        assert notes == [
+            "construction failed on cpu (RuntimeError); retry succeeded."
+        ]
+        err = capsys.readouterr().err
+        assert "engine construction on cpu failed" in err
+        assert "retrying once on cpu" in err
+        assert "cuda unavailable" not in err
+        assert "CUDA" not in err
+
+    def test_cuda_pin_on_cuda_less_box_gets_the_same_honest_cpu_wording(
+        self, monkeypatch, capsys
+    ):
+        """The named deviation's flagship rescue (an unmet explicit cuda
+        pin handed back verbatim on a cuda-less box): the retry's
+        forensics name the cpu construction failure — the box never
+        claims a CUDA event it could not even attempt."""
+        _engine_on(monkeypatch)
+        built: list[str] = []
+
+        def ctor(model_path, *, device="auto", cpu_threads=4, vad_on=True):
+            built.append(device)
+            if len(built) == 1:
+                raise RuntimeError("transient constructor rot")
+            return _StubEngine(model_path, device=device)
+
+        notes: list[str] = []
+        engine = make_wrapper(
+            "m", device="cuda", resolved_device="cpu",
+            on_fallback=notes.append, ctor=ctor,
+        )
+        assert engine.device == "cpu"
+        assert built == ["cpu", "cpu"]  # resolver handed the pin back
+        assert notes == [
+            "construction failed on cpu (RuntimeError); retry succeeded."
+        ]
+        assert "cuda unavailable" not in capsys.readouterr().err
