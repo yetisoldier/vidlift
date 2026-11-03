@@ -73,6 +73,7 @@ __all__ = [
     "TranscribeEngine",
     "TranscriptionError",
     "TranscriptionResult",
+    "VadAssetMissingError",
     "WhisperEngine",
     "ModelInstallBoard",
     "align_verify_cues",
@@ -86,6 +87,8 @@ __all__ = [
     "model_install_state",
     "resolve_transcription_device",
     "resolve_model_dir",
+    "selftest_report",
+    "vad_asset_report",
     "segments_to_cues",
     "SINGLE_WORD_HOLD_CAP_MS",
     "HOLD_QUIET_RMS",
@@ -190,8 +193,14 @@ class WhisperEngine(TranscribeEngine):
         vad_on: bool = True,
     ) -> None:
         from faster_whisper import WhisperModel  # deferred: test seam rule
+        from faster_whisper.utils import get_assets_path  # deferred: same seam
 
         self.vad_on = vad_on
+        # v0.4.16.2 (ADR-3): the resolved assets dir at engine-BUILD time is
+        # the known path the decode-time TOCTOU backstop matches against
+        # (a mid-run disappearance — AV quarantine, user deletion — cannot
+        # be re-derived from a failing exception's stack alone).
+        self._vad_assets_dir = str(get_assets_path())
         compute = "int8_float16" if device == "cuda" else "int8"
         self.model = WhisperModel(
             model_path,
@@ -216,42 +225,57 @@ class WhisperEngine(TranscribeEngine):
         language: str,
         on_segment: Callable[[TranscriptSegment], None] | None = None,
     ) -> list[TranscriptSegment]:
-        segments, _info = self.model.transcribe(
-            audio_path,
-            language=language or None,  # None = auto-detect per file
-            vad_filter=self.vad_on,
-            vad_parameters={"min_silence_duration_ms": 300},
-            word_timestamps=True,
-            # Hallucination suppressors (design §Sync quality): faster-
-            # whisper's built-in gates. NOTE: deliberately NO ``task``
-            # parameter — translation is a structural non-goal.
-            no_speech_threshold=0.6,
-            compression_ratio_threshold=2.4,
-            condition_on_previous_text=False,
-        )
-        out: list[TranscriptSegment] = []
-        for seg in segments:
-            words = [
-                WordStamp(
-                    start=(float(w.start) if w.start is not None else None),
-                    end=(float(w.end) if w.end is not None else None),
-                    word=str(w.word),
-                    probability=float(w.probability),
-                )
-                for w in (getattr(seg, "words", None) or [])
-            ]
-            segment = TranscriptSegment(
-                start=float(seg.start),
-                end=float(seg.end),
-                text=str(seg.text).strip(),
-                words=words,
-                no_speech_prob=float(
-                    getattr(seg, "no_speech_prob", 0.0) or 0.0
-                ),
+        try:
+            segments, _info = self.model.transcribe(
+                audio_path,
+                language=language or None,  # None = auto-detect per file
+                vad_filter=self.vad_on,
+                vad_parameters={"min_silence_duration_ms": 300},
+                word_timestamps=True,
+                # Hallucination suppressors (design §Sync quality): faster-
+                # whisper's built-in gates. NOTE: deliberately NO ``task``
+                # parameter — translation is a structural non-goal.
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
+                condition_on_previous_text=False,
             )
-            out.append(segment)
-            if on_segment is not None:
-                on_segment(segment)
+            out: list[TranscriptSegment] = []
+            for seg in segments:
+                words = [
+                    WordStamp(
+                        start=(float(w.start) if w.start is not None else None),
+                        end=(float(w.end) if w.end is not None else None),
+                        word=str(w.word),
+                        probability=float(w.probability),
+                    )
+                    for w in (getattr(seg, "words", None) or [])
+                ]
+                segment = TranscriptSegment(
+                    start=float(seg.start),
+                    end=float(seg.end),
+                    text=str(seg.text).strip(),
+                    words=words,
+                    no_speech_prob=float(
+                        getattr(seg, "no_speech_prob", 0.0) or 0.0
+                    ),
+                )
+                out.append(segment)
+                if on_segment is not None:
+                    on_segment(segment)
+        except Exception as exc:  # noqa: BLE001 - the deliberate broad catch
+            # v0.4.16.2 (ADR-3): the decode-time TOCTOU backstop — the
+            # preflight saw the asset, yet the load died anyway (deleted or
+            # quarantined BETWEEN preflight and decode): re-raise as the
+            # named packaging error instead of a bare onnxruntime stack.
+            # Gated on vad_on (a vad_filter=False engine never opens the
+            # ONNX) and on the predicate naming the known assets dir.
+            if _is_vad_asset_fault(
+                exc, self._vad_assets_dir if self.vad_on else ""
+            ):
+                raise VadAssetMissingError(
+                    _vad_missing_message({"assets_dir": self._vad_assets_dir})
+                ) from exc
+            raise
         return out
 
 
@@ -638,7 +662,15 @@ class _FallbackEngine(TranscribeEngine):
             # D2 (Karen validation): a cancel is control flow, not a
             # device guess — EngineCancelled re-raises before any
             # rebuild/forensics (the gate state does not matter).
-            if isinstance(exc, EngineCancelled) or self._note is not None:
+            # v0.4.16.2 (ADR-7): a TranscriptionError from the engine layer
+            # (e.g. VadAssetMissingError) is an honest refusal, never a
+            # device guess — the factory docstring's stated invariant (see
+            # make_whisper_engine_with_fallback), now enforced in the decode
+            # arms. No CPU rebuild, no mislabeled note.
+            if (
+                isinstance(exc, (EngineCancelled, TranscriptionError))
+                or self._note is not None
+            ):
                 # construction already fell back: the honest no-second-
                 # rescue rule -> raise as today.
                 raise
@@ -678,7 +710,15 @@ class _FallbackEngine(TranscribeEngine):
             # D2 (Karen validation): a cancel is control flow, not a
             # device guess — EngineCancelled re-raises before any
             # rebuild/forensics (the gate state does not matter).
-            if isinstance(exc, EngineCancelled) or self._note is not None:
+            # v0.4.16.2 (ADR-7): a TranscriptionError from the engine layer
+            # (e.g. VadAssetMissingError) is an honest refusal, never a
+            # device guess — the factory docstring's stated invariant (see
+            # make_whisper_engine_with_fallback), now enforced in the decode
+            # arms. No CPU rebuild, no mislabeled note.
+            if (
+                isinstance(exc, (EngineCancelled, TranscriptionError))
+                or self._note is not None
+            ):
                 # construction already fell back: raise as today.
                 raise
             self._rebuild_cpu(exc)
@@ -737,6 +777,271 @@ class _FallbackEngine(TranscribeEngine):
             _describe_exception(exc)
         )
         self.device = "cpu"
+
+
+# ---- v0.4.16.2: the VAD-asset truth surface (arch spec §6.2/M2) -----------------
+#
+# The shipped-installer defect class: faster-whisper resolves its VAD model
+# from its OWN package directory (``faster_whisper.utils.get_assets_path``
+# is literally ``dirname(__file__)/assets`` — no ``_MEIPASS`` branch), so a
+# frozen build that failed to bundle the package data dies at the first VAD
+# load with an onnxruntime NoSuchFile, minutes into a job. This family
+# answers "can this install transcribe" honestly instead:
+#
+# - ``vad_asset_report``: the CHEAP, import-free filesystem truth (one
+#   find_spec + one directory listing; no mutation, no network, no
+#   faster_whisper import — safe at 1 Hz). ``unknown`` on probe fault
+#   (never claim missing on uncertainty — the model_install_state
+#   OSError→"unknown" discipline).
+# - ``selftest_report``: the AUTHORITATIVE capability proof for the frozen
+#   binary (real deferred import; faster-whisper's OWN loader proves the
+#   ONNX loads, not merely exists). Honors the engine-off env guard with
+#   an explicit skip shape.
+# - ``VadAssetMissingError(TranscriptionError)``: the named condition the
+#   preflight/backstop raise; Mode A/B dispositions ride the existing
+#   ``except TranscriptionError`` arms.
+#
+# The deferred-import rule (N3) is the family's shape constraint: the test
+# suite must NEVER import faster_whisper, so the default resolver is
+# find_spec-based and the only real import lives inside ``selftest_report``
+# (deterministically skipped under the suite's engine-off env guard).
+
+VAD_ASSET_PACKAGE = "faster_whisper"
+# The requirement is "a non-empty ONNX set in the package's assets dir",
+# never one hardcoded leaf: faster-whisper version-suffixes the leaf
+# (silero_vad_v6.onnx at 1.2.1) and MAY rename it in a future release
+# (ADR-6: the release path hardcodes no leaf name).
+VAD_ASSET_GLOB = "*.onnx"
+
+
+class VadAssetMissingError(TranscriptionError):
+    """The frozen/dev install lacks faster-whisper's bundled silero VAD
+    payload. A packaging defect, never a device fault; the message names
+    the resolved assets dir + remedy. Subclassing TranscriptionError IS
+    the disposition contract: Mode A fail-opens through the existing arm,
+    Mode B fails the job, and the CUDA fallback wrapper re-raises instead
+    of mislabeling (ADR-7)."""
+
+
+def _default_vad_assets_dir() -> tuple[str | None, str]:
+    """The import-free default resolver (N3): faster-whisper's package
+    dir via ``find_spec`` (works dev AND frozen — PyInstaller's
+    FrozenImporter implements find_spec), falling back to the one-file
+    runtime ``_MEIPASS`` derivation. Returns ``(path_or_None, source)``
+    with source ∈ ``"find-spec" | "meipass" | "unavailable"``. Importing
+    the PACKAGE is never an option here — the suite must never import it."""
+    spec = None
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec(VAD_ASSET_PACKAGE)
+    except Exception:  # noqa: BLE001 - find_spec itself must never fault the report
+        spec = None
+    if spec is not None and spec.submodule_search_locations:
+        return (
+            str(Path(list(spec.submodule_search_locations)[0]) / "assets"),
+            "find-spec",
+        )
+    meipass = getattr(sys, "_MEIPASS", None)  # frozen runtime fallback
+    if meipass:
+        return (str(Path(meipass) / VAD_ASSET_PACKAGE / "assets"), "meipass")
+    return (None, "unavailable")
+
+
+def _faster_whisper_version() -> str | None:
+    """The installed distribution's version via importlib.metadata
+    (metadata only — reads no faster_whisper module, N3-safe). None when
+    the package is absent; swallow-and-None on anything else (the report
+    must never fault on an advisory fact)."""
+    try:
+        import importlib.metadata
+
+        return importlib.metadata.version("faster-whisper")
+    except Exception:  # noqa: BLE001 - PackageNotFoundError and oddities alike
+        return None
+
+
+def vad_asset_report(
+    resolver: Callable[[], tuple[str | None, str]] | None = None,
+) -> dict:
+    """The cheap, import-free VAD-asset truth (the monitor envelope and
+    the core preflight serve this dict; the state key is ``vad_asset``).
+
+    ``resolver() -> (assets_dir_or_None, source)``; inject for tests.
+    States: ``present`` (≥1 ``*.onnx`` under the assets dir) / ``missing``
+    (dir absent, or dir present with zero ``*.onnx``) / ``unknown`` (the
+    dir is unresolvable, or the listing itself faults — NEVER claim
+    missing on a probe failure; the honest-null discipline, mirrored from
+    ``model_install_state``). No mutation, no network, no faster_whisper
+    import: safe at 1 Hz. When the caller injects a resolver,
+    ``resolver_source`` reports ``"injected"``.
+    """
+    if resolver is None:
+        assets_dir, inner_source = _default_vad_assets_dir()
+        resolver_source = inner_source
+    else:
+        assets_dir, inner_source = resolver()
+        resolver_source = "injected"
+    if assets_dir is None:
+        return _vad_report(
+            vad_asset="unknown",
+            assets_dir=None,
+            onnx_files=None,
+            onnx_count=None,
+            resolver_source=resolver_source,
+            # the detail names WHY in the resolver's OWN terms (the
+            # unavailability reason survives the injected labeling).
+            detail=(
+                f"assets dir unresolvable (resolver source: {inner_source})"
+            ),
+        )
+    try:
+        with os.scandir(assets_dir) as entries:
+            names = sorted(
+                entry.name
+                for entry in entries
+                if entry.is_file() and Path(entry.name).match(VAD_ASSET_GLOB)
+            )
+    except FileNotFoundError:
+        # The dir is absent: a KNOWN-empty result set (not unknown — we
+        # know there are zero .onnx files; the dir simply is not there).
+        return _vad_report(
+            "missing", assets_dir, [], 0, resolver_source, "assets dir absent"
+        )
+    except OSError as exc:
+        # NotADirectoryError (the resolver pointed at a file), a
+        # permissions failure, transient EIO: a probe FAULT is not
+        # absence — degrade to unknown with the forensics in ``detail``
+        # (N5: honest-null beats a fabricated "missing").
+        return _vad_report(
+            "unknown",
+            assets_dir,
+            None,
+            None,
+            resolver_source,
+            f"probe failed: {type(exc).__name__}: {exc}",
+        )
+    if not names:
+        return _vad_report(
+            "missing",
+            assets_dir,
+            [],
+            0,
+            resolver_source,
+            "no *.onnx under assets dir",
+        )
+    return _vad_report(
+        "present", assets_dir, names, len(names), resolver_source, None
+    )
+
+
+def _vad_report(
+    vad_asset: str,
+    assets_dir: str | None,
+    onnx_files: list[str] | None,
+    onnx_count: int | None,
+    resolver_source: str | None,
+    detail: str | None,
+) -> dict:
+    """The ONE report shape (the exact key contract — the monitor
+    envelope serves this dict verbatim plus one derived key)."""
+    return {
+        "package": "faster-whisper",
+        "package_version": _faster_whisper_version(),
+        "vad_asset": vad_asset,
+        "assets_dir": assets_dir,
+        "onnx_files": onnx_files,
+        "onnx_count": onnx_count,
+        "resolver_source": resolver_source,
+        "detail": detail,
+        "checked_at": time.time(),
+    }
+
+
+def _vad_missing_message(report: dict) -> str:
+    """The ONE message template (the preflight and the decode backstop
+    share it; surfaces may decorate but never fork the wording). Names
+    the resolved dir, the expectation (the bundled ONNX SET — a
+    version-suffixed leaf is an example, never a hardcoded requirement,
+    ADR-6), and the remedy."""
+    assets_dir = report.get("assets_dir")
+    return (
+        "VAD model asset missing from this install: faster-whisper's "
+        'assets dir "' + (assets_dir if assets_dir else "(unresolved)")
+        + '" holds no *.onnx (the bundled silero VAD model set — e.g. '
+        "silero_vad_v6.onnx for faster-whisper 1.2.x; the leaf name is "
+        "version-suffixed upstream). Remedy: reinstall/repair this "
+        "VidLift install; if this is the frozen Windows build, the "
+        "installer payload is defective — please report it."
+    )
+
+
+def _is_vad_asset_fault(exc: BaseException, assets_dir: str) -> bool:
+    """The version-stable VAD-asset predicate: the exception's message names the
+    resolved assets dir. onnxruntime's NoSuchFile hierarchy varies by version
+    (1.31.x: a direct Exception subclass) — matching the KNOWN path string is
+    honest (a fault naming the assets dir IS an asset fault) and version-proof."""
+    return bool(assets_dir) and assets_dir in str(exc)
+
+
+def selftest_report() -> dict:
+    """The AUTHORITATIVE frozen capability check (CLI ``--selftest`` body).
+
+    The frozen binary answers through faster-whisper's OWN loader: the
+    real deferred import + ``get_assets_path()`` (the package's resolver —
+    ground truth immune to our derivation drifting from upstream's), the
+    ``*.onnx`` listing, a cross-check that ``vad_asset_report`` agrees on
+    the dir, and a minimal load smoke (``get_speech_timestamps`` over 1 s
+    of synthetic silence — proves the ONNX LOADS, not merely exists).
+    Never raises: every failure lands in ``errors[]``. Honors the
+    engine-off env guard with the explicit skip shape — a skip is
+    ``ok: False`` there, never a pass (the CI gate fails loudly on a
+    skipped selftest, by construction impossible on the runner).
+    """
+    if _engine_disabled_by_env():
+        return {
+            "ok": False,
+            "skipped": "engine disabled by env (VIDLIFT_TRANSCRIPTION_ENGINE=0)",
+            "checks": {},
+            "errors": [],
+        }
+    checks, errors = {}, []
+    try:
+        from faster_whisper.utils import get_assets_path  # deferred (N3)
+
+        assets_dir = get_assets_path()
+        checks["faster_whisper_version"] = _faster_whisper_version()
+        checks["assets_dir_resolver"] = assets_dir
+        onnx = sorted(p.name for p in Path(assets_dir).glob(VAD_ASSET_GLOB))
+        checks["onnx_files"] = onnx
+        report = vad_asset_report()
+        checks["report_agrees"] = (
+            report.get("vad_asset") == "present"
+            and report.get("assets_dir") == assets_dir
+        )
+        # load smoke, not just presence: faster-whisper's OWN VAD load path on
+        # 1 s of synthetic silence proves the ONNX loads, not merely exists.
+        # NOTE (verified against the installed 1.2.1 signature): this
+        # function feeds **kwargs straight into VadOptions(**kwargs) — the
+        # WhisperModel.transcribe-style "vad_parameters" wrapper is not
+        # accepted here; the option rides flat or the smoke always errors.
+        import numpy as np
+        from faster_whisper.vad import get_speech_timestamps
+
+        get_speech_timestamps(
+            np.zeros(16000, dtype=np.float32),
+            min_silence_duration_ms=300,
+        )
+        checks["vad_load_smoke"] = "ok"
+    except Exception as exc:  # noqa: BLE001 - the gate's honest failure channel
+        errors.append(f"{type(exc).__name__}: {exc}")
+    ok = (
+        not errors
+        and bool(checks.get("onnx_files"))
+        and checks.get("report_agrees") is True
+        and checks.get("vad_load_smoke") == "ok"
+    )
+    return {"ok": ok, "checks": checks, "errors": errors}
 
 
 # ---- model delivery (first-run download, sha256-pinned) ---------------------
@@ -1987,6 +2292,7 @@ def transcribe_source_to_srt(
     on_download_progress: Callable[[int, int | None], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     download_log: Callable[[str], None] | None = None,
+    vad_report: dict | None = None,
 ) -> "TranscriptionResult":
     """The core: source audio -> normalized SRT beside ``output_path``.
 
@@ -1999,6 +2305,17 @@ def transcribe_source_to_srt(
     path. Raise TranscriptionError on any failure; callers decide the
     disposition (Mode A fail-open, Mode B job failure).
     """
+    # v0.4.16.2 (ADR-3): VAD preflight — refuse BEFORE any ffmpeg/model
+    # work. Skips under the suite-wide engine-off env guard (production
+    # never sets it, tests always do) and for genuine no-VAD runs (a
+    # vad_filter=False engine never touches the asset — true minimal
+    # dependency truth, the existing vad_on seam, N6). "unknown"
+    # proceeds (probe fault is not absence, N5); the decode-time
+    # backstop (WhisperEngine) names a mid-run disappearance.
+    if not _engine_disabled_by_env() and vad_on:
+        report = vad_report if vad_report is not None else vad_asset_report()
+        if report.get("vad_asset") == "missing":
+            raise VadAssetMissingError(_vad_missing_message(report))
     os.makedirs(workdir, exist_ok=True)
     wav_path = os.path.join(workdir, "source-audio-16k.wav")
     extract_cmd = build_audio_extract_command(

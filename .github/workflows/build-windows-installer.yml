@@ -128,6 +128,28 @@ jobs:
           # cost two releases; the repo-side gate
           # (test_workflow_has_no_version_literals) now forbids it.
           if ($ver -ne "vidlift $env:VIDLIFT_VERSION") { throw "CLI smoke failed: got '$ver', expected 'vidlift $env:VIDLIFT_VERSION'" }
+          # VAD packaging gate (ADR-4): the frozen payload must carry faster-whisper's VAD asset
+          # set. Two proofs, cheapest-first: (1) the one-folder GUI tree's
+          # _internal\faster_whisper\assets matches the build venv's faster_whisper\assets
+          # 1:1 by name+size (dynamic derivation from the venv — the leaf name is
+          # version-suffixed upstream, so the gate hardcodes NO leaf); (2) the frozen CLI
+          # reports its own capability through faster-whisper's OWN loader (--selftest).
+          $fwAssets = (& python -c "import faster_whisper, os; print(os.path.join(os.path.dirname(faster_whisper.__file__), 'assets'))").Trim()
+          $distAssets = "dist\VidLift\_internal\faster_whisper\assets"
+          if (-not (Test-Path $distAssets)) { throw "frozen GUI tree missing faster_whisper assets dir: $distAssets" }
+          $expected = Get-ChildItem $fwAssets -File | Sort-Object Name
+          $shipped  = Get-ChildItem $distAssets -File | Sort-Object Name
+          $missing = Compare-Object ($expected.Name) ($shipped.Name) | Where-Object SideIndicator -eq "<="
+          if ($missing) { throw "frozen tree missing asset files: $(($missing | ForEach-Object InputObject) -join ', ')" }
+          foreach ($f in $expected) {
+            $twin = Join-Path $distAssets $f.Name
+            if ((Get-Item $twin).Length -ne $f.Length) { throw "asset size mismatch: $($f.Name)" }
+          }
+          $shippedOnnx = @($shipped | Where-Object Extension -eq ".onnx")
+          if ($shippedOnnx.Count -lt 1) { throw "frozen tree ships no *.onnx under $distAssets" }
+          Write-Output "vad assets shipped: $(($shipped.Name) -join ', ')"
+          & dist\vidlift-cli.exe --selftest | Tee-Object dist\selftest-cli.json
+          if ($LASTEXITCODE -ne 0) { throw "frozen CLI --selftest failed — see dist\selftest-cli.json" }
 
       - name: PE stamp check
         shell: pwsh
@@ -171,6 +193,25 @@ jobs:
           )) {
             if (-not (Test-Path $file)) { throw "Installed payload missing: $file" }
           }
+          # VAD packaging gate (ADR-4): the INSTALLED payload must carry the VAD asset set — the
+          # same dynamic parity rule as the dist-tree gate (the installer, not merely the
+          # build, is what users run). Re-derive the build venv's asset list here: each
+          # pwsh step is its own process, so step-self-contained re-derivation wins over
+          # cross-step variable sharing.
+          $fwAssets = (& python -c "import faster_whisper, os; print(os.path.join(os.path.dirname(faster_whisper.__file__), 'assets'))").Trim()
+          $expected = Get-ChildItem $fwAssets -File | Sort-Object Name
+          $instAssets = "$install\_internal\faster_whisper\assets"
+          if (-not (Test-Path $instAssets)) { throw "Installed payload missing faster_whisper assets dir: $instAssets" }
+          $installed = Get-ChildItem $instAssets -File | Sort-Object Name
+          $missingInst = Compare-Object ($expected.Name) ($installed.Name) | Where-Object SideIndicator -eq "<="
+          if ($missingInst) { throw "installed payload missing asset files: $(($missingInst | ForEach-Object InputObject) -join ', ')" }
+          foreach ($f in $expected) {
+            $twin = Join-Path $instAssets $f.Name
+            if ((Get-Item $twin).Length -ne $f.Length) { throw "installed asset size mismatch: $($f.Name)" }
+          }
+          Write-Output "installed vad assets: $(($installed.Name) -join ', ')"
+          & "$install\vidlift-cli.exe" --selftest | Tee-Object "$install\selftest-cli.json"
+          if ($LASTEXITCODE -ne 0) { throw "installed CLI --selftest failed — see $install\selftest-cli.json" }
           & "$install\vidlift-cli.exe" --version
           if ($LASTEXITCODE -ne 0) { throw "Installed CLI failed" }
           & "$install\tools\ffprobe.exe" -hide_banner -version

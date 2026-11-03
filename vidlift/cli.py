@@ -484,6 +484,20 @@ def _cmd_benchmark(
     return 0
 
 
+def _cmd_selftest() -> int:
+    """v0.4.16.2 (ADR-4): the frozen binary reports its own transcription
+    capability — the release gate's authoritative voice (faster-whisper's
+    OWN loader proves the payload, not our derivation). Lazy import keeps
+    cli.py import-light; the suite drives main() with this seam
+    monkeypatched."""
+    import json
+    from .transcribe import selftest_report
+
+    report = selftest_report()
+    print("vidlift-selftest " + json.dumps(report, sort_keys=True), flush=True)
+    return 0 if report.get("ok") is True else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vidlift",
@@ -493,6 +507,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--version", action="version", version=f"vidlift {__version__}"
+    )
+    # v0.4.16.2 (ADR-4): the frozen binary's self-reporting capability gate —
+    # dispatched FIRST in main(), before any subcommand chain.
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help=(
+            "check this install's transcription capability (engine package "
+            "+ bundled VAD asset); prints 'vidlift-selftest {json}', "
+            "exit 0 pass / 1 fail"
+        ),
     )
     sub = parser.add_subparsers(dest="command")
     probe_parser = sub.add_parser(
@@ -741,6 +766,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # v0.4.16.2 (ADR-4): the selftest flag outranks every subcommand —
+    # an argparse flag (not a subcommand), dispatched first so a frozen
+    # binary that cannot transcribe still answers honestly.
+    if getattr(args, "selftest", False):
+        return _cmd_selftest()
     if args.command == "probe":
         return _cmd_probe(args.files)
     if args.command == "plan":

@@ -140,6 +140,14 @@ def status_payload(view: "StatusView") -> dict:
     (soft-read via getattr — foreign clients/fakes degrade to the disk
     derivation) then the disk predicate. Additive key; ``api_version``
     stays 1; ``/health`` gains nothing.
+
+    v0.4.16.2 (VAD packaging ADR-5): one machine-scoped
+    ``transcription_engine`` block rides the envelope beside it — the
+    faster-whisper install's packaged-VAD truth (``vad_asset``
+    present/missing/unknown) with ``ready_for_transcription``
+    true/false/null — so a watcher answers "can this install transcribe
+    right now" without running a job. Additive key; ``api_version``
+    stays 1; ``/health`` still gains nothing.
     """
     running, queued = view._client.queue_views()
     active_ids = [record.job_id for record in running]
@@ -157,12 +165,41 @@ def status_payload(view: "StatusView") -> dict:
         if dl.get("state") == "downloading":
             in_flight = dl
             break
-    from .transcribe import DEFAULT_MODEL, model_install_state
+    from .transcribe import (
+        DEFAULT_MODEL,
+        model_install_state,
+        vad_asset_report,
+    )
 
     model_block = in_flight or model_install_state(
         DEFAULT_MODEL,
         state_root=getattr(services, "state_dir", None),
         board=board,
+    )
+    # v0.4.16.2 (ADR-5, additive): install-scoped transcription-capability
+    # truth, sibling to the machine transcription_model block. Derived at
+    # read (one find_spec + listdir, µs); a probe fault degrades to the
+    # honest "unknown" shape — the handler's no-500 discipline is doubled
+    # here: the envelope must serve even when reporting the packaging
+    # fault this key exists to expose.
+    try:
+        engine_block = vad_asset_report()
+    except Exception as exc:  # noqa: BLE001 - honesty about the probe itself
+        engine_block = {
+            "package": "faster-whisper",
+            "package_version": None,
+            "vad_asset": "unknown",
+            "assets_dir": None,
+            "onnx_files": None,
+            "onnx_count": None,
+            "resolver_source": None,
+            "detail": f"probe failed: {type(exc).__name__}",
+            "checked_at": time.time(),
+        }
+    engine_block["ready_for_transcription"] = (
+        True
+        if engine_block.get("vad_asset") == "present"
+        else (False if engine_block.get("vad_asset") == "missing" else None)
     )
     return {
         "api_version": API_VERSION,
@@ -175,6 +212,9 @@ def status_payload(view: "StatusView") -> dict:
         # v0.4.16 (after queued_count, per the impl spec's placement): the
         # machine-scoped model truth, so Hermes sees it with an IDLE queue.
         "transcription_model": model_block,
+        # v0.4.16.2 (ADR-5): the machine-scoped VAD-packaging truth,
+        # sibling to the model block (additive; api_version stays 1).
+        "transcription_engine": engine_block,
         "server_time": time.time(),
     }
 
