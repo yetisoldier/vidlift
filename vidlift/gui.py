@@ -1943,6 +1943,11 @@ class MainWindow(QMainWindow):
         state = snapshot.get("state") or "queued"
         stage = run_stage_label(snapshot)
         rendered = f"{stage}" if stage else state
+        # v0.4.17 (fail-path): a terminal stage renders its own state
+        # word (run_stage_label's terminal arm returns the state), so
+        # the "state — stage" tail would stutter ("failed — failed").
+        # A live stage still reads "running — <what is running>".
+        state_part = state if rendered == state else f"{state} — {rendered}"
         eta = snapshot.get("eta_seconds")
         eta_suffix = ""
         if eta is not None:
@@ -1953,8 +1958,18 @@ class MainWindow(QMainWindow):
                 eta_suffix = ""
         lines = [
             "── LIVE ─────────────────────",
-            f"Job: {job_id}   State: {state} — {rendered}{eta_suffix}",
+            f"Job: {job_id}   State: {state_part}{eta_suffix}",
         ]
+        # v0.4.17 (fail-path, the failure-reason surfacing): the
+        # payload's own `error` rides the overlay verbatim — the exact
+        # string the record/registry carries (e.g. a probe
+        # VideoToolError message); never paraphrased, never guessed. A
+        # subs job that fails at probe writes no run log, so THIS line
+        # is where Eric first sees why the .avi died. Honest rule: any
+        # present reason displays; an absent one adds nothing.
+        error = snapshot.get("error")
+        if error:
+            lines.append(f"Error: {error}")
         progress = snapshot.get("progress") or {}
         if isinstance(progress, dict) and progress:
             frames_done = progress.get("frames_done")
@@ -2393,16 +2408,27 @@ class MainWindow(QMainWindow):
             # freeze at "queued" forever (the v0.4.4 validation D1
             # repro: timer dead, rows never update).
             self._batch_finished(terminal_notes)
+            # v0.4.17 (fail-path, Eric's probe-failure repro): the
+            # selected row's details panel must land on the terminal
+            # truth too — the old code skipped the per-tick detail
+            # render on the batch-end tick, claiming the terminal state
+            # was "just written" by _batch_finished, but that path
+            # writes the summary/batch-bar/table only (NEVER the
+            # details panel). A single-job batch that failed at probe
+            # therefore kept the last running live overlay
+            # ("State: running — probe ...") over a finished batch,
+            # with no later tick to repair it (the elapsed timer stops
+            # once job_ids drains). The snapshot read below is the same
+            # registry read the tick already does — a terminal record
+            # re-renders honestly (failed + the payload's error), a
+            # mid-transition read is tolerated by the render's shape.
+            self._render_selected_detail_on_tick()
             return
         # §3.3-f: the detail LIVE-updates per tick for the SELECTED row —
         # riding this same poll (one extra status_snapshot per second, the
         # identical read the tick already does elsewhere — R3: cheap). This
         # covers BOTH follow selections and manual overrides, with no
-        # second timer. Skipped on the batch-end tick (selected row's own
-        # terminal state was just written by _batch_finished's summary
-        # path; the next user click re-renders). A batch-end tick with
-        # selection would also re-snap nothing — BATCH_END writes no
-        # selection (§3.2).
+        # second timer.
         self._render_selected_detail_on_tick()
 
     def _follow_claim_edge(self, running_now: str | None) -> None:
@@ -2440,8 +2466,18 @@ class MainWindow(QMainWindow):
         """§3.3-f: re-render the selected row's detail (plan body + live
         overlay) on poll data. Compare-before-write lives in
         _set_details_text — an unchanged running job costs nothing and
-        never scrolls the panel."""
-        if self.batch is None or not self._batch_row_for_job:
+        never scrolls the panel.
+
+        The "is this a live batch" gate keys on the seeded row map
+        (_batch_row_for_job), NOT on ``self.batch``: since v0.4.14 a
+        subs slate is plan-less (``self.batch is None``) while the map
+        stays live — keying on the batch made the per-tick render
+        Mode-A-only (Mode B got its detail updates only from the claim
+        edge and user selections), so a Mode-B batch never landed its
+        terminal detail truth. The pending-plan state (batch None, map
+        cleared by _render_pending_files) still resolves to "no live
+        slate" through the same key."""
+        if not self._batch_row_for_job:
             return
         rows = self.file_table.selectionModel().selectedRows()
         if not rows:
@@ -3225,8 +3261,35 @@ class MainWindow(QMainWindow):
         self._set_text(self.total_pill, "")
         self._set_text(self.total_remaining, "")
 
+    def _settle_run_bars(self) -> None:
+        """v0.4.17 (fail-path, Eric's probe-failure repro): the batch is
+        over — the bars must stop animating. A busy pulse claims ACTIVE
+        work, and a terminal batch has none: when the final job closed
+        WITHOUT a measured fraction (a probe/prepare failure, a
+        queued-only cancel, a Mode-B probe error) the pre-fix code left
+        both bars in `set_busy(True)` pulse mode forever — the GUI kept
+        animating "running" over a failed batch while the batch bar and
+        the table read honestly. Determinate values hold their
+        last-measured truth untouched (F-4: never recede, never
+        fabricate) — only the pulse and its busy labels end; the next
+        batch start resets the bars anyway (see _begin_job_slate)."""
+        stale_labels = set(_PHASE_BUSY_LABELS.values()) | {
+            "estimating ...",  # _consume_running_snapshot's fallback
+            "starting ...",  # _begin_job_slate / queued
+            "queue active ...",  # _begin_job_slate (overall bar)
+            _BUSY_MEASURING_LABEL,  # also the upscale busy label above
+        }
+        for bar in (self.stage_bar, self.overall_bar):
+            if bar._busy:
+                bar.set_busy(False)
+                if bar.eta_label.text() in stale_labels:
+                    bar.eta_label.setText("")
+
     def _batch_finished(self, notes: list[str]) -> None:
         self._stop_liveness()
+        # v0.4.17 (fail-path): the bars stop animating with the batch
+        # (a finished batch never keeps an "active work" pulse running).
+        self._settle_run_bars()
         # v0.4.12 (item 2): the batch is over — the ETA state and the
         # damped render values reset with it (a new batch must never
         # inherit the previous one's rate history).

@@ -24,3 +24,6 @@ venv/
 # VidLift scratch space
 *.log
 .local/
+
+# Agent working scratch (Bob/Forge/Karen scaffolding, probe fixtures, repo copies)
+.karen/

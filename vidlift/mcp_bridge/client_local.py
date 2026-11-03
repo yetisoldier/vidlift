@@ -253,7 +253,15 @@ class LocalBridgeClient:
 
     def history(self, limit: int = 20) -> list[dict]:
         """Read-through to ``Registry.history()`` in the ``tool_list``
-        history-block shape (same serialization, no fork)."""
+        history-block shape (same serialization, no fork).
+
+        v0.4.17 (fail-path, the failure-reason surfacing): the record's
+        own ``error`` rides every row (additive key, ``api_version``
+        untouched — the additive-keys rule in monitor.py). A failed
+        row's ``engine_note: null`` never named WHY; the reason already
+        persisted on the record (the executor stamps the exception
+        text) just wasn't serialized. The HTTP /history pass-through
+        and the GUI's recent-rows read this shape verbatim."""
         limit = max(1, min(200, int(limit)))
         history = self.registry.history()
         rows: list[dict] = []
@@ -269,6 +277,7 @@ class LocalBridgeClient:
                     if record.engine_simulated is not None
                     else False,
                     "engine_note": record.engine_note,
+                    "error": record.error,
                     "output_path": record.output_path,
                     "manifest_path": record.manifest_path,
                 }

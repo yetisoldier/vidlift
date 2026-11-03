@@ -703,6 +703,14 @@ def tool_list(services: BridgeServices, args: dict) -> dict:
                 "engine_simulated": bool(r.engine_simulated)
                 if r.engine_simulated is not None
                 else False,
+                # v0.4.17 (fail-path, additive — api_version untouched):
+                # the failure reason rides the row verbatim (the record
+                # already persisted it; the serialization dropped it, so
+                # `state: "failed"` carried no WHY — Eric's probe-failure
+                # repro). Honest-null where the record carries no error;
+                # cancelled rows surface their recorded reason too (a
+                # cancel's error text is a fact, not a failure verdict).
+                "error": r.error,
                 "output_path": r.output_path,
                 "manifest_path": r.manifest_path,
             }
