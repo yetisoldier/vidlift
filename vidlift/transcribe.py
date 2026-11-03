@@ -1,4 +1,4 @@
-"""Speech transcription to SRT subtitles for VidLift (v0.4.14).
+"""Speech transcription to SRT subtitles for VidLift (v0.4.15.2).
 
 The v0.4.14 design §"Transcription core": one shared transcription core
 under Modes A (upscale fallback) and B (standalone subs). faster-whisper
@@ -33,6 +33,11 @@ like ``subtitles.sidecar_srt_path``.
 CPU fallback: ``device="cpu"`` with int8 compute (config pin
 ``transcription/device`` values auto|cuda|cpu) runs ~1x realtime —
 acceptable for Mode B batch use and documented, not deeply optimized.
+v0.4.15.2 adds the HONEST CUDA fallback (
+``make_whisper_engine_with_fallback``): a CUDA runtime that proves
+hostile only after the probe (library rot, OOM at construction or on
+the first decode) falls back to that CPU row with a stderr WARNING and
+a manifest note — never silently, never twice mid-run.
 """
 
 from __future__ import annotations
@@ -71,6 +76,7 @@ __all__ = [
     "CUE_LEAD_OUT_MS",
     "detect_language",
     "make_whisper_engine",
+    "make_whisper_engine_with_fallback",
     "model_cache_dir",
     "model_download_url_for",
     "resolve_transcription_device",
@@ -260,6 +266,7 @@ def make_whisper_engine(
     model_path: str,
     *,
     device: str = "auto",
+    cpu_threads: int = 4,
     vad_on: bool = True,
 ) -> TranscribeEngine:
     """The engine factory seam (the ONLY import site of faster_whisper).
@@ -275,12 +282,399 @@ def make_whisper_engine(
             "(VIDLIFT_TRANSCRIPTION_ENGINE=0)"
         )
     try:
-        return WhisperEngine(model_path, device=device, vad_on=vad_on)
+        return WhisperEngine(
+            model_path, device=device, cpu_threads=cpu_threads, vad_on=vad_on
+        )
     except ImportError as exc:
         raise TranscriptionError(
             "faster-whisper is not installed (vidlift's transcription "
             f"engine package): {exc}"
         ) from exc
+
+
+# ---- v0.4.15.2: the honest CUDA fallback factory ------------------------------
+#
+# The probe (resolve_transcription_device) is a CLAIM: "this box has a
+# CUDA device the driver exposes". Three failure classes slip past that
+# claim and only detonate later, inside the GPU phase lock, after expensive
+# phases may already have run: library rot (cuBLAS/cuDNN mismatch,
+# incomplete PyInstaller payload), OOM at construction or on the first
+# decode (VRAM bookkeeping is deliberately not part of the phase lock),
+# and an explicit cuda pin on a box with no usable runtime. The honesty
+# rule: never a dead job when a working CPU path exists — never silently,
+# either. The fallback is ONE-WAY, logged to stderr, and carries the
+# exception type in the manifest note. A mid-run decode failure after
+# successful CUDA decodes propagates: that is a real fault inside a
+# proven-healthy device, not an environment guess at a seam.
+
+
+def _describe_exception(exc: BaseException) -> str:
+    """The manifest-sized forensics: the concrete exception TYPE name.
+    The full message goes to the log line, where there is room for it;
+    the note keeps the type so the cuBLAS-vs-OOM question is answerable
+    from the manifest without code branches."""
+    return type(exc).__name__
+
+
+_CUDA_FALLBACK_NOTE_FMT = "cuda unavailable — fell back to cpu ({})"
+# D1 honesty (Karen v0.4.15.2 validation): a cpu RESOLUTION that
+# needed the construction retry never claims a CUDA event — the
+# note names what actually happened on a box that may have no CUDA
+# at all. "{0}" keeps a literal "{...}" in the text safe.
+_CPU_RETRY_NOTE_FMT = "construction failed on cpu ({0}); retry succeeded."
+
+
+def make_whisper_engine_with_fallback(
+    model_path: str,
+    *,
+    device: str = "auto",
+    resolved_device: str | None = None,
+    cpu_threads: int = 4,
+    vad_on: bool = True,
+    on_fallback: Callable[[str], None] | None = None,
+    on_dispose: Callable[[str], None] | None = None,
+    ctor: Callable[..., TranscribeEngine] | None = None,
+) -> TranscribeEngine:
+    """The v0.4.15.2 resilient engine factory (tier 1 + tier 2).
+
+    Builds the engine through ``ctor`` (default: :func:`make_whisper_engine`,
+    the ONLY faster_whisper import site). Fallback policy (one shot, one
+    way, never silent):
+
+    - Construction on a CUDA resolution fails (broad catch: CTranslate2
+      raises a zoo of RuntimeError/OSError/cuda-specific types) -> exactly
+      one ``device="cpu"`` rebuild from the SAME model path; stderr
+      WARNING + manifest note; the returned engine still carries
+      tier-2 protection for its first decode.
+    - Construction on a ``cpu`` RESOLUTION (probe-cpu, or an explicit
+      cuda pin the resolver had to hand back verbatim — cuda-less box,
+      migration in progress) fails -> the same one ``device="cpu"``
+      retry. The stderr line names ``--device cuda --device`` wording
+      ONLY when the caller actually requested cuda; the auto arm gets
+      the neutral wording.
+    - ``device == "cpu"`` (explicit pin) and construction raises ->
+      raise through as today. Nothing below CPU; a note without a
+      fallback would be dishonest.
+    - The cpu retry failing -> its exception raises (the cpu path is the
+      last resort; its failure is the real error).
+    - Tier 2 (CUDA-built engines only — the design scopes the first-decode
+      rescue to the device decision, and widening without field evidence
+      is guessing): the first ``detect_language`` / ``transcribe_segments``
+      call failing -> the CUDA model is released, one cpu engine is built
+      through the same seam, and the SAME call is re-run once. After the
+      first success, failures propagate unchanged.
+    - :class:`TranscriptionError` and ``ImportError`` from the engine
+      package (the guard, the missing package) are NOT device guesses —
+      they raise through on every arm.
+
+    Note shape (design §4): ``cuda unavailable — fell back to cpu
+    (<exc type>)``; the stderr forensics carry ``<type>: <message>``.
+
+    ``resolved_device`` is the caller's device RESOLUTION for this job
+    (run.py's transcribe_device); when omitted it defaults to
+    ``device`` — callers that already resolved should always pass it.
+    ``on_fallback`` receives the manifest note (the caller owns where it
+    rides, e.g. run.py's transcribe_engine_note); ``on_dispose`` records
+    the engine replacement (the caller's bookkeeping seam).
+    """
+    if _engine_disabled_by_env():
+        raise TranscriptionError(
+            "transcription engine disabled by env "
+            "(VIDLIFT_TRANSCRIPTION_ENGINE=0)"
+        )
+
+    requested = device if device else "auto"
+    resolved = resolved_device if resolved_device else requested
+    build = ctor if ctor is not None else make_whisper_engine
+
+    def _build(
+        model_path_arg: str, *, device: str | None = None, **_ignored
+    ) -> TranscribeEngine:
+        try:
+            return build(
+                model_path_arg,
+                device=(device if device is not None else resolved),
+                cpu_threads=cpu_threads,
+                vad_on=vad_on,
+            )
+        except ImportError as exc:
+            raise TranscriptionError(
+                "faster-whisper is not installed (vidlift's transcription "
+                f"engine package): {exc}"
+            ) from exc
+
+    try:
+        engine = _build(model_path, device=resolved)
+    except TranscriptionError:
+        # honest refusals (the guard, the missing package) name the
+        # condition exactly as make_whisper_engine does — not device
+        # guesses, not rescuable by any device.
+        raise
+    except Exception as exc:  # noqa: BLE001 - the deliberate broad catch
+        if requested == "cpu":
+            # design table row 4: the caller pinned the last resort and
+            # it failed -> raise as today. No note: none happened.
+            raise
+        try:
+            from .run import EngineCancelled  # lazy: run.py imports us
+
+            engine = _build(model_path, device="cpu")
+        except EngineCancelled as cpu_exc:
+            # D2 honesty (Karen validation): a cancel during the cpu
+            # retry is control flow, not a device guess. The CUDA note
+            # stays honest (the CUDA attempt DID fall back), but its
+            # forensics name the cancel, never the cpu path's failure.
+            if on_fallback is not None:
+                on_fallback(
+                    _CUDA_FALLBACK_NOTE_FMT.format(
+                        type(cpu_exc).__name__
+                    )
+                )
+            raise cpu_exc from exc
+        except Exception as cpu_exc:  # noqa: BLE001
+            # the cpu LAST RESORT failed: its error is the real one.
+            raise cpu_exc from exc
+        # D1 honesty (Karen validation): the wording keys on the
+        # RESOLUTION (the truth), not the request (the intent) — a box
+        # with no CUDA never claims "cuda unavailable" in its
+        # forensics. The explicit-pin arm says so only when the
+        # resolution actually was cuda.
+        if resolved == "cuda":
+            note = _CUDA_FALLBACK_NOTE_FMT.format(_describe_exception(exc))
+        else:
+            note = _CPU_RETRY_NOTE_FMT.format(_describe_exception(exc))
+        if on_fallback is not None:
+            on_fallback(note)
+        if resolved == "cuda":
+            if requested == "cuda":
+                print(
+                    "WARNING: [vidlift.transcribe] requested --device "
+                    f"cuda but CUDA failed ({type(exc).__name__}: {exc}); "
+                    "falling back to CPU (int8)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    "WARNING: [vidlift.transcribe] CUDA transcription "
+                    f"unavailable ({type(exc).__name__}: {exc}); "
+                    "falling back to CPU (int8)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            print(
+                "WARNING: [vidlift.transcribe] engine construction on "
+                f"cpu failed ({type(exc).__name__}: {exc}); retrying "
+                "once on cpu (int8)",
+                file=sys.stderr,
+                flush=True,
+            )
+        if resolved != "cuda":
+            # a cpu resolution that needed the retry stays a plain cpu
+            # engine (the design scopes tier 2 to CUDA-built engines).
+            return engine
+        return _FallbackEngine(
+            engine,
+            model_path=model_path,
+            initial_device="cpu",
+            ctor=_build,
+            cpu_threads=cpu_threads,
+            vad_on=vad_on,
+            note=note,
+            on_fallback=on_fallback,
+            on_dispose=on_dispose,
+        )
+
+    if resolved == "cuda":
+        # the healthy CUDA construction: hand back the tier-2-observed
+        # wrapper (the first decode is still unproven).
+        return _FallbackEngine(
+            engine,
+            model_path=model_path,
+            initial_device="cuda",
+            ctor=_build,
+            cpu_threads=cpu_threads,
+            vad_on=vad_on,
+            note=None,
+            on_fallback=on_fallback,
+            on_dispose=on_dispose,
+        )
+    return engine
+
+
+class _FallbackEngine(TranscribeEngine):
+    """Tier-2 rider (v0.4.15.2): wraps a CUDA-built engine until its
+    first DECODE proves the device (or executes the ONE cpu
+    rebuild). Construction-side fallbacks wrap too; their note is
+    already Spoken for, so a post-fallback decode failure re-raises
+    (never a second rescue, never a second note) — the design's
+    once-per-seam discipline."""
+
+    def __init__(
+        self,
+        engine: TranscribeEngine,
+        *,
+        model_path: str,
+        initial_device: str,
+        ctor: Callable[[str], TranscribeEngine],
+        cpu_threads: int = 4,
+        vad_on: bool = True,
+        note: str | None = None,
+        on_fallback: Callable[[str], None] | None = None,
+        on_dispose: Callable[[str], None] | None = None,
+    ) -> None:
+        self._engine = engine
+        self._model_path = model_path
+        self._ctor = ctor
+        self._cpu_threads = cpu_threads
+        self._vad_on = vad_on
+        self._note = note
+        self._on_fallback = on_fallback
+        self._on_dispose = on_dispose
+        # D3 (Karen validation): the tier-2 gate is the first DECODE
+        # (transcribe_segments) ONLY. Language detection is not a decode
+        # — in the default flow it runs FIRST and must never consume
+        # this gate, or the design's headline case (OOM at the first
+        # decode, exactly where the GUI's upscale may hold VRAM) is
+        # left unguarded. The detect call keeps its own one-shot arm
+        # (a detect-time CUDA failure rebuilds once on cpu, and the
+        # first decode below still rides the fresh decode gate on the
+        # rebuilt cpu engine).
+        self._decode_gate_done = False
+        # the detect arm's own one-shot flag (per-method gates; D3):
+        self._detect_gate_done = False
+        # the note the detect arm's rebuild just earned (spoken to the
+        # caller by _rebuild_cpu); the wrapper adopts it as its own
+        # _note AFTER the rescue so the rebuilt cpu engine has NO
+        # further rescues (the once-per-seam discipline).
+        self._pending_note: str | None = None
+        # shape-compatibility: the device the caller is currently riding
+        # (updated to "cpu" by the tier-2 rebuild).
+        self.device = initial_device
+
+    def detect_language(
+        self, audio_path: str, *, offset_seconds: float = 0.0
+    ) -> LanguageGuess:
+        """Language detection keeps its own one-shot rescue (the first
+        detect call) but NEVER consumes the decode gate (D3): in the
+        default flow detect runs first, and the first transcribe is
+        still unproven there. The gate here is the detect call itself,
+        not the tier-2 decode seam."""
+        if self._detect_gate_done:
+            return self._engine.detect_language(
+                audio_path, offset_seconds=offset_seconds
+            )
+        self._detect_gate_done = True
+        try:
+            return self._engine.detect_language(
+                audio_path, offset_seconds=offset_seconds
+            )
+        except Exception as exc:  # noqa: BLE001 - the deliberate broad catch
+            from .run import EngineCancelled  # lazy: run.py imports us
+
+            # D2 (Karen validation): a cancel is control flow, not a
+            # device guess — EngineCancelled re-raises before any
+            # rebuild/forensics (the gate state does not matter).
+            if isinstance(exc, EngineCancelled) or self._note is not None:
+                # construction already fell back: the honest no-second-
+                # rescue rule -> raise as today.
+                raise
+            self._rebuild_cpu(exc)
+            self._note = self._pending_note or self._note
+            return self._engine.detect_language(
+                audio_path, offset_seconds=offset_seconds
+            )
+
+    def transcribe_segments(
+        self,
+        audio_path: str,
+        *,
+        language: str,
+        on_segment: Callable[[TranscriptSegment], None] | None = None,
+    ) -> list[TranscriptSegment]:
+        """First DECODE call: faster-whisper's transcribe returns a
+        LAZY generator, so a CUDA OOM surfaces on iteration — the
+        engine's own segment loop (vidlift's WhisperEngine adapter
+        materializes it) makes the failure land inside this call,
+        which is exactly the seam the gate catches. The rebuild
+        re-runs the SAME call once on CPU. Language detection does NOT
+        consume this gate (D3): the default flow detects first, and
+        the first decode is still unproven here."""
+        if self._decode_gate_done:
+            return self._engine.transcribe_segments(
+                audio_path, language=language, on_segment=on_segment
+            )
+        self._decode_gate_done = True
+        try:
+            return self._engine.transcribe_segments(
+                audio_path, language=language, on_segment=on_segment
+            )
+        except Exception as exc:  # noqa: BLE001 - the deliberate broad catch
+            from .run import EngineCancelled  # lazy: run.py imports us
+
+            # D2 (Karen validation): a cancel is control flow, not a
+            # device guess — EngineCancelled re-raises before any
+            # rebuild/forensics (the gate state does not matter).
+            if isinstance(exc, EngineCancelled) or self._note is not None:
+                # construction already fell back: raise as today.
+                raise
+            self._rebuild_cpu(exc)
+            self._note = self._pending_note or self._note
+            return self._engine.transcribe_segments(
+                audio_path, language=language, on_segment=on_segment
+            )
+
+    def _rebuild_cpu(self, exc: Exception) -> None:
+        """The ONE cpu rebuild: stderr WARNING (the honest log line with
+        <type>: <message> forensics), the note callback, the CUDA model
+        release + the caller's dispose hook, then the rebuild through
+        the same ctor seam on device="cpu". The rebuild failing raises
+        its real error (the cpu path is the last resort)."""
+        # D2 (Karen validation): EngineCancelled is control flow, not a
+        # device guess — no warning, no note, no rebuild; the callers
+        # never reach this seam with a cancel (they re-raise first), so
+        # this arm is defensive for direct _rebuild_cpu entry.
+        from .run import EngineCancelled  # lazy: run.py imports us
+
+        if isinstance(exc, EngineCancelled):
+            raise
+
+        print(
+            f"WARNING: [vidlift.transcribe] CUDA transcription failed on "
+            f"first decode ({type(exc).__name__}: {exc}); "
+            "falling back to CPU (int8)",
+            file=sys.stderr,
+            flush=True,
+        )
+        if self._on_fallback is not None:
+            self._on_fallback(
+                _CUDA_FALLBACK_NOTE_FMT.format(_describe_exception(exc))
+            )
+        replaced = self._engine
+        try:
+            if getattr(replaced, "model", None) is not None:
+                # release the CTranslate2 model reference (its VRAM)
+                replaced.model = None
+        except Exception:  # noqa: BLE001 - disposal is best-effort
+            pass
+        if self._on_dispose is not None:
+            try:
+                self._on_dispose(
+                    f"disposed {type(replaced).__name__} ({self.device})"
+                )
+            except Exception:  # noqa: BLE001 - the hook never blocks
+                pass
+        self._engine = self._ctor(
+            self._model_path,
+            device="cpu",
+            cpu_threads=self._cpu_threads,
+            vad_on=self._vad_on,
+        )
+        self._pending_note = _CUDA_FALLBACK_NOTE_FMT.format(
+            _describe_exception(exc)
+        )
+        self.device = "cpu"
 
 
 # ---- model delivery (first-run download, sha256-pinned) ---------------------
@@ -1182,17 +1576,44 @@ def transcribe_source_to_srt(
         # -- engine resolution (seam-first: the factory receives the
         # resolved model dir; a missing engine package raises
         # TranscriptionError BEFORE any long work happens) ----
+        engine_kwargs: dict | None = None
+        fallback_notes: list[str] = []
         if engine_factory is None:
-            def engine_factory(model_path: str) -> TranscribeEngine:
-                return make_whisper_engine(
-                    model_path, device=device_pin, vad_on=vad_on
-                )
+            # v0.4.15.2 (design §1): the default production factory is
+            # the honest fallback wrapper — the device decision resolves
+            # HERE (the caller's honest log line names the resolution
+            # via its own transcribe_device; Mode B callers can pass
+            # their own factory to keep the old verbatim behavior), and
+            # the engine build falls back to CPU exactly once when the
+            # CUDA runtime proves hostile (library rot, OOM at
+            # construction, first-decode failure — the stderr WARNING
+            # and the manifest note name it).
+            resolved = resolve_transcription_device(device_pin)
+
+            def _default_on_fallback(note: str) -> None:
+                # the note rides the core's result notes (Mode B honesty;
+                # Mode A's run-side note slot is separate) + stderr is
+                # already handled inside the wrapper factory chain.
+                fallback_notes.append(note)
+
+            engine_factory = make_whisper_engine_with_fallback
+            engine_kwargs = dict(
+                device=device_pin,
+                resolved_device=resolved,
+                cpu_threads=4,
+                vad_on=vad_on,
+                on_fallback=_default_on_fallback,
+            )
         on_step and on_step("transcribe-resolve")
         model_dir = resolve_model_dir(
             model_pin,
             state_root=state_root,
         )
-        engine = engine_factory(model_dir)
+        engine = (
+            engine_factory(model_dir, **engine_kwargs)
+            if engine_kwargs is not None
+            else engine_factory(model_dir)
+        )
         if on_download_progress is not None and download_log is not None:
             download_log(
                 f"transcription model resolved: {model_dir}"
@@ -1254,7 +1675,7 @@ def transcribe_source_to_srt(
             cue_count=len(cues),
             language=language,
             language_confidence=lang_confidence,
-            notes=list(warnings) + list(result_notes),
+            notes=list(warnings) + list(result_notes) + list(fallback_notes),
             model=model_dir,
         )
     finally:

@@ -2,6 +2,26 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.15.2] - 2026-11-02
+
+### Fixed
+
+- **Transcription: automatic CPU fallback when CUDA fails** (v0.4.15.2
+  design): the device probe is an honest CLAIM ("the driver exposes a
+  CUDA device"), but library rot, VRAM OOM at construction or on the
+  first decode, and an explicit `--device cuda` pin on a cuda-less box
+  slipped past it and detonated the transcription with a raw CTranslate2
+  traceback after the expensive phases had already run. The engine now
+  falls back to the documented CPU path (int8, ~1x realtime) EXACTLY
+  ONCE in those cases — with a stderr `WARNING:` line carrying the
+  exception, and the manifest's transcription block recording
+  `cuda unavailable — fell back to cpu (<exception type>)` plus an
+  honest `device: cpu (cuda unavailable)`. Explicit `--device cpu`
+  pins still fail loudly on their own failure (nothing below CPU);
+  explicit cuda pins fall back like auto (the job the user asked for
+  is a subtitle, and the honest note names the pin's failure). No new
+  device values: `auto` already meant "cuda when it works".
+
 ## [0.4.15.1] - 2026-11-02
 
 ### Fixed
