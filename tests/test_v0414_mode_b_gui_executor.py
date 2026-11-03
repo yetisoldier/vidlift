@@ -90,6 +90,9 @@ def _fake_subs_result(path, **kwargs):
         language="en",
         language_confidence=0.95,
         model="medium",
+        # v0.4.15.3 (D4): the device rides the result ("" = the honest
+        # unknown under a foreign engine factory).
+        device=kwargs.get("device", ""),
         notes=[],
     )
 
@@ -161,6 +164,34 @@ def test_executor_publishes_segment_progress(tmp_path, monkeypatch):
     assert "transcribing segment 6" in (seen_progress[-1].get("step") or "")
     # the mirror persistence: the record's snapshot (or live box during
     # the run) carried the same dict
+
+
+@pytest.mark.usefixtures("engine_on", "no_lock")
+@pytest.mark.parametrize(
+    "device, expected", [("", ""), ("cpu", "cpu")], ids=["unknown", "cpu"]
+)
+def test_executor_result_dict_carries_transcription_device(
+    tmp_path, monkeypatch, device, expected
+):
+    """D4 (v0.4.15.3): Mode B history can state WHERE the transcription
+    ran — the executor's result dict carries the `device` key mirroring
+    the core's fact; the foreign-factory unknown stays "" (never a
+    fabricated guess)."""
+    src = tmp_path / f"device-{expected or 'unknown'}.avi"
+    src.write_bytes(b"source-bytes")
+    monkeypatch.setattr(
+        "vidlift.subs_job.run_subs_job",
+        lambda path, **kw: _fake_subs_result(path, device=device),
+    )
+    registry = _reg(tmp_path)
+    services = _Services(registry, tmp_path)
+    record = registry.enqueue(kind="subs", paths=[str(src)], options={})
+    executor = JobExecutor(services)
+    registry.claim_next()
+    executor._run_job(record)
+    final = registry.require(record.job_id)
+    assert final.state == "succeeded", final.error
+    assert final.result["device"] == expected
 
 
 @pytest.mark.usefixtures("engine_on", "no_lock")

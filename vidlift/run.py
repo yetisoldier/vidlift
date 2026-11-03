@@ -2485,11 +2485,21 @@ def run_file(
                     # v0.4.15.2: the honest CUDA fallback — the note rides
                     # the manifest's transcription block exactly like the
                     # degrade-open note above; run.py owns the slot only.
+                    # v0.4.15.3 (R1): the device echo keys on the ACTUAL
+                    # resolution (see _on_cuda_fallback below).
                     transcribe_fallback_notes: list[str] = []
 
                     def _on_cuda_fallback(note) -> None:
                         nonlocal transcribe_device
-                        transcribe_device = "cpu (cuda unavailable)"
+                        # v0.4.15.3 (R1): key the device echo on the
+                        # ACTUAL resolution. A cuda/auto→cuda resolution
+                        # that fell back earns "cpu (cuda unavailable)";
+                        # a cpu resolution retrying on cpu (the
+                        # CUDA-less box's transient ctor retry) keeps
+                        # plain "cpu" — the manifest must never claim a
+                        # CUDA event that never happened.
+                        if transcribe_device != "cpu":
+                            transcribe_device = "cpu (cuda unavailable)"
                         transcribe_fallback_notes.append(note)
                         log(f"subtitles: {note}")
 

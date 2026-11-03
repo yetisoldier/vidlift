@@ -416,6 +416,9 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
             "language": result.language,
             "cue_count": result.cue_count,
             "model": result.model,
+            # v0.4.15.3 (D4): where the transcription RAN ("" = honest
+            # unknown under a foreign engine factory).
+            "device": result.device,
             "notes": list(result.notes),
         },
     )

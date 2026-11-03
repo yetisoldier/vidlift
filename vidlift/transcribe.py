@@ -1578,6 +1578,10 @@ def transcribe_source_to_srt(
         # TranscriptionError BEFORE any long work happens) ----
         engine_kwargs: dict | None = None
         fallback_notes: list[str] = []
+        # v0.4.15.3 (D4): the device the CORE ran — an honest fact the
+        # result carries; "" when a foreign factory ran (the core never
+        # saw the device decision).
+        device_field = ""
         if engine_factory is None:
             # v0.4.15.2 (design §1): the default production factory is
             # the honest fallback wrapper — the device decision resolves
@@ -1589,6 +1593,7 @@ def transcribe_source_to_srt(
             # construction, first-decode failure — the stderr WARNING
             # and the manifest note name it).
             resolved = resolve_transcription_device(device_pin)
+            device_field = resolved
 
             def _default_on_fallback(note: str) -> None:
                 # the note rides the core's result notes (Mode B honesty;
@@ -1677,6 +1682,15 @@ def transcribe_source_to_srt(
             language_confidence=lang_confidence,
             notes=list(warnings) + list(result_notes) + list(fallback_notes),
             model=model_dir,
+            # v0.4.15.3 (D4): the fallback wrapper ALWAYS lands on CPU,
+            # so any fallback note means "cpu" regardless of what
+            # resolved; an injected foreign factory reports "" — honest
+            # unknown, never a guess.
+            device=(
+                "cpu"
+                if (engine_kwargs is not None and fallback_notes)
+                else device_field
+            ),
         )
     finally:
         # the 16 kHz scratch wav is pure scratch the moment the engine
@@ -1690,7 +1704,13 @@ def transcribe_source_to_srt(
 
 @dataclass
 class TranscriptionResult:
-    """What the core reports (the plan/manifest ``transcription`` block)."""
+    """What the core reports (the plan/manifest ``transcription`` block).
+
+    v0.4.15.3 (D4): ``device`` states where the transcription actually
+    ran ("cuda"/"cpu" from the core's own resolution; "cpu" whenever a
+    fallback note fired — the wrapper always lands on CPU); "" for an
+    injected foreign factory (honest unknown, never a fabrication).
+    """
 
     srt_path: str
     cue_count: int
@@ -1698,3 +1718,4 @@ class TranscriptionResult:
     language_confidence: float | None
     notes: list[str] = field(default_factory=list)
     model: str = ""
+    device: str = ""

@@ -301,6 +301,10 @@ def test_b1_success_remux_shape_and_source_blind(tmp_path, no_lock):
     assert result.cue_count == 2
     assert result.language == "en"
     assert src.read_bytes() == b"source-bytes"  # source-blind
+    # v0.4.15.3 (D4): an injected foreign factory reports the honest
+    # unknown — the core never saw the device decision, and "" is not
+    # a fabricated guess.
+    assert result.device == ""
 
     # the remux command: copy codecs, mov_text, tag, faststart, new file
     mux_cmds = [c for c in runner.commands if "-c:s" in c[1]]
@@ -375,6 +379,75 @@ def test_bitmap_subs_source_completes_and_allowlist_maps(tmp_path, no_lock):
     maps = [argv[i + 1] for i, flag in enumerate(argv) if flag == "-map"]
     assert maps == ["0:v", "0:a", "1"]
     assert "0" not in maps
+
+
+# --------------------------------------------- D4 (v0.4.15.3): device fact
+@pytest.mark.usefixtures("engine_on", "no_lock")
+def test_default_factory_cpu_pin_reports_device_cpu(tmp_path, monkeypatch):
+    """D4: the core that ran the engine is the honest source of the
+    device fact. Default-factory path (make_whisper_engine monkeypatched,
+    model state seeded — the cuda suite's _engine_on pattern) with an
+    explicit cpu pin and NO fallback -> result.device == "cpu"."""
+    import vidlift.transcribe as transcribe_mod
+
+    src = tmp_path / "cpu-pin.avi"
+    src.write_bytes(b"source-bytes")
+    _seed_model_state(tmp_path / "state")
+    monkeypatch.setattr(
+        transcribe_mod,
+        "make_whisper_engine",
+        lambda model_path, **_kw: FakeEngine(model_path),
+    )
+    runner = FakeRunner(_probe_payload())
+    result = run_subs_job(
+        str(src),
+        ffmpeg="ffmpeg",
+        probe_runner=runner,
+        runner=runner,
+        device_pin="cpu",
+        state_root=str(tmp_path / "state"),
+        workdir=str(tmp_path / "wd"),
+    )
+    assert isinstance(result, SubsJobResult)
+    assert result.device == "cpu"
+
+
+@pytest.mark.usefixtures("engine_on", "no_lock")
+def test_default_factory_cuda_fallback_reports_device_cpu(tmp_path, monkeypatch):
+    """D4: any fallback note means "cpu" — the fallback wrapper ALWAYS
+    lands on CPU, regardless of what resolved. Simulated cuda→cpu
+    (resolver monkeypatched to a cuda resolution, ctor fails exactly
+    once on cuda) -> result.device == "cpu" and the honest note rides."""
+    import vidlift.transcribe as transcribe_mod
+
+    src = tmp_path / "cuda-fallback.avi"
+    src.write_bytes(b"source-bytes")
+    _seed_model_state(tmp_path / "state")
+    built: list[str] = []
+
+    def _cuda_then_cpu_ctor(model_path, *, device="auto", **_kw):
+        built.append(device)
+        if device == "cuda":
+            raise RuntimeError("Library cublas could not be loaded")
+        return FakeEngine(model_path)
+
+    monkeypatch.setattr(transcribe_mod, "make_whisper_engine", _cuda_then_cpu_ctor)
+    monkeypatch.setattr(
+        transcribe_mod, "resolve_transcription_device", lambda pin: "cuda"
+    )
+    runner = FakeRunner(_probe_payload())
+    result = run_subs_job(
+        str(src),
+        ffmpeg="ffmpeg",
+        probe_runner=runner,
+        runner=runner,
+        device_pin="auto",
+        state_root=str(tmp_path / "state"),
+        workdir=str(tmp_path / "wd"),
+    )
+    assert built == ["cuda", "cpu"]
+    assert result.device == "cpu"
+    assert any("cuda unavailable" in note for note in result.notes)
 
 
 def test_burn_flag_absent(tmp_path):

@@ -44,7 +44,11 @@ class SubsJobError(RuntimeError):
 
 @dataclass
 class SubsJobResult:
-    """What one subs job produced (mirrors TranscriptionResult + mux)."""
+    """What one subs job produced (mirrors TranscriptionResult + mux).
+
+    v0.4.15.3 (D4): ``device`` mirrors the transcription's device fact
+    ("" when a foreign factory ran — honest unknown).
+    """
 
     source_path: str
     output_path: str
@@ -53,6 +57,7 @@ class SubsJobResult:
     language: str
     language_confidence: float | None
     model: str
+    device: str = ""
     notes: list[str] = field(default_factory=list)
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -212,6 +217,7 @@ def run_subs_job(
         language=transcribed.language,
         language_confidence=transcribed.language_confidence,
         model=transcribed.model,
+        device=transcribed.device,
         notes=list(transcribed.notes),
         started_at=started,
         finished_at=time.time(),

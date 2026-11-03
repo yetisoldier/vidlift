@@ -648,6 +648,82 @@ class TestRunSeamManifestHonesty:
         assert mblock["device"] == "cpu (cuda unavailable)"
         assert note in mblock["notes"]
 
+    def test_mode_a_manifest_device_stays_cpu_on_cpu_resolution_retry(
+        self, tmp_path, monkeypatch
+    ):
+        """R1 (v0.4.15.3, Karen's residual): the fallback device echo
+        keys on the ACTUAL resolution. Clones the cuda-resolution
+        manifest test above with the resolution monkeypatched to "cpu"
+        and a ctor that fails exactly once on cpu (Karen's FailOnceCtor
+        evidence, promoted): the transient ctor retry rides the run,
+        the honest cpu-retry note lands — and the manifest's device
+        stays plain "cpu": a CUDA-less box must never claim a CUDA
+        event that never happened."""
+        import json as _json
+        import subprocess as _sp
+        from pathlib import Path as _Path
+
+        from vidlift.run import ToolBox, run_file
+        import vidlift.transcribe as transcribe_mod
+
+        _engine_on(monkeypatch)
+        src = tmp_path / "subless-cpu.mp4"
+        _sp.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=size=128x96:rate=10:duration=3",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-shortest", str(src),
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        attempts: list[str] = []
+
+        def _fail_once_ctor(model_path, *, device="auto", cpu_threads=4,
+                            vad_on=True):
+            attempts.append(device)
+            if len(attempts) == 1:
+                raise RuntimeError("transient ctor failure on cpu")
+            return _StubEngine(model_path, device=device)
+
+        monkeypatch.setattr(transcribe_mod, "make_whisper_engine", _fail_once_ctor)
+        monkeypatch.setattr(
+            transcribe_mod, "resolve_transcription_device", lambda pin: "cpu"
+        )
+
+        result = run_file(
+            str(src),
+            engine_request="stub",
+            tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+            output_dir=str(tmp_path / "out"),
+            log_dir=str(tmp_path / "runs"),
+            sample_classify=False,
+            transcription_enabled=None,
+        )
+        state = result.state
+        assert state.ok, f"a cpu-resolution retry rides the run: {state.error}"
+        block = state.subtitles["transcription"]
+        assert attempts == ["cpu", "cpu"]  # one retry, both on cpu
+        assert block["device"] == "cpu", (
+            "a cpu resolution must keep the plain 'cpu' device — never "
+            "'cpu (cuda unavailable)'"
+        )
+        note = "construction failed on cpu (RuntimeError); retry succeeded."
+        assert note in block["notes"]
+        assert state.subtitles["status"] == "carried"
+        log_lines = state.log.lines if state.log is not None else []
+        assert any(note in line for line in log_lines), (
+            "run.py mirrors the cpu-retry note into the run log"
+        )
+        manifest = _json.loads(_Path(result.manifest_path).read_text())
+        mblock = manifest["run"]["subtitles"]["transcription"]
+        assert mblock["device"] == "cpu"
+        assert note in mblock["notes"]
+        # no manifest string may claim CUDA involvement on a cpu resolution
+        assert "cuda" not in mblock["device"]
+
 # ---- Karen v0.4.15.2 defect pins (validation 2026-11-02) --------------------
 #
 # D3 (HIGH): the tier-2 gate was ONE shared _first_call_done flag — the
