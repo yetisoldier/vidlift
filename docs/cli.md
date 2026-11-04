@@ -81,7 +81,7 @@ Engine behavior:
 
 Exit codes:
 
-- **0:** output completed and verified
+- **0:** output completed and verified (or all files were skipped/blocked)
 - **1:** media, pipeline, or verification failure
 - **2:** missing required external tool
 
@@ -97,12 +97,20 @@ beside the source as `{stem}.subs.mp4` (plus a `{stem}.subs.srt` sidecar). No
 upscale and no re-encode — the video and audio streams are copied. The source
 file is never modified by default.
 
+v0.4.19: Files that already carry usable subtitles or have existing outputs are
+skipped at the pre-flight stage and do not count as failures. An all-done
+batch exits with code 0.
+
 Options:
 
 - **--lang ISO:** pin the transcription language (ISO 639-1, e.g. `ko`); default auto-detect
 - **--model TAG:** whisper model tag or path (default `medium`; first use downloads it)
-- **--device auto|cuda|cpu:** transcription device (default `auto`)
-- **--force:** transcribe even when a usable text subtitle track already exists
+- **--device auto|cuda|cpu:** transcription device (default `auto`). The
+  resolved device (e.g., `GPU (CUDA)`, `CPU`, or `CPU (GPU unavailable)`) is
+  reported in the run's status and manifest.
+- **--force:** transcribe even when a usable text subtitle track already exists.
+  Note: `--force` does NOT bypass the check for existing output files; if the
+  output already exists, the job is still blocked.
 - **--suppress-srt:** after the subtitle track is muxed into the MP4, delete the redundant
   `.srt` sidecar (on a mux failure the sidecar is kept as the fallback; default: keep the sidecar)
 - **--replace-source:** after a verified pass, delete the source video and rename

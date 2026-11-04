@@ -91,7 +91,11 @@ and estimated size.
 
 Select **Start Upscale** to process every ready item serially. The progress bar
 shows the completed count and current file. Select **Cancel Current** to stop
-the active file safely; files not yet started remain untouched.
+the active file safely; files not yet started remain untouched. Cancellation is
+now observed during pre-transcription steps (model resolution, download, load,
+and language detection) in both modes. Note: a process blocked inside a hung
+native call still requires quitting the app, and waiting on the GPU phase lock
+is not cancellable.
 
 ## 3. Run one file from PowerShell
 

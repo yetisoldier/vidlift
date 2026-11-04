@@ -35,7 +35,8 @@ required.
 | **Smart Geometry** | Auto-probes source to choose the safest deinterlacing and scaling. |
 | **AI-Powered** | Uses Real-ESRGAN ncnn/Vulkan for high-fidelity 720p results. |
 | **Subtitle Recovery** | Integrated OCR for bitmap subtitles (VobSub/PGS). |
-| **Verification** | Every file is verified after encode to ensure no corruption. |
+- **Verification** | Every file is verified after encode to ensure no corruption. |
+| **Device Tracking** | Live CPU/GPU indicator shows the active transcription device during runs. |
 
 ## 🚀 Quick Start
 **You'll need:** Windows 11, Vulkan-capable GPU $\cdot$ **Time:** ~2 minutes
@@ -67,7 +68,10 @@ subtitles, and estimated size.
 
 Select **Start Upscale** to process every ready file serially. VidLift shows the
 current file and completed count while keeping the window responsive. Select
-**Cancel Current** to stop safely.
+**Cancel Current** to stop safely. Cancellation is now observed during pre-transcription
+steps (model resolution, download, load, and language detection) in both modes.
+Note: a process blocked inside a hung native call still requires quitting the app,
+and waiting on the GPU phase lock is not cancellable.
 
 ## Run an upscale
 
@@ -124,8 +128,18 @@ curl "http://ninjabase2:8765/history?token=<token>"        # finished jobs, newe
     `faster-whisper` model (installed, downloading with progress, or
     unknown), allowing watchers to see machine-wide model truth even
     with an idle queue.
+- **Discovery & Model Visibility:** The `/status` envelope now includes:
+  - A **discovery card** (`monitor.json`) that allows remote agents to
+    automatically find the current effective monitor token and port.
+  - A **transcription model block** showing the status of the
+    `faster-whisper` model (installed, downloading with progress, or
+    unknown), allowing watchers to see machine-wide model truth even
+    with an idle queue.
   - A **transcription engine block** reporting the readiness of the
     transcription assets and package version.
+  - **Device Indicator:** The status payload now includes the resolved
+    transcription device (e.g., `GPU (CUDA)`, `CPU`, or `CPU (GPU unavailable)`)
+    and the requested device, serving live facts while a job is running.
  
 ## 🎙️ Transcription Model Management
  
@@ -217,6 +231,14 @@ In the main window, you can toggle **Enable subtitle OCR**. When enabled, VidLif
 | App crashes on start | Missing Vulkan runtime | Install the latest Vulkan SDK or GPU driver. |
 | Output size is too large | High bitrate setting | Check the "Plan" screen; try a different engine if available. |
 | A run appears stuck on "running" after it failed | Stale UI state (pre-v0.4.16.1) | Update to v0.4.16.1; failures now settle correctly on all surfaces and report the reason. |
+| Transcription fails immediately on a fresh install | Missing VAD assets (v0.4.16.1) | Update to v0.4.16.2. If the issue persists, run `vidlift-cli --selftest` to verify the install. |
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| GPU probe failed or driver outdated | Outdated GPU driver | Update your NVIDIA/AMD drivers to the latest version. |
+| App crashes on start | Missing Vulkan runtime | Install the latest Vulkan SDK or GPU driver. |
+| Output size is too large | High bitrate setting | Check the "Plan" screen; try a different engine if available. |
+| A run appears stuck on "running" after it failed | Stale UI state (pre-v0.4.16.1) | Update to v0.4.16.1; failures now settle correctly on all surfaces and report the reason. |
+| "Cancel Current" does nothing during model load | Hung native call | If the app is blocked inside a native CUDA/model call, it cannot be interrupted; quit the app and restart. |
 | Transcription fails immediately on a fresh install | Missing VAD assets (v0.4.16.1) | Update to v0.4.16.2. If the issue persists, run `vidlift-cli --selftest` to verify the install. |
 | "Resume retained work" is missing or unclickable | Layout overlap (pre-v0.4.17) | Update to v0.4.17.0; a layout overlap that hid the checkbox has been fixed. |
 

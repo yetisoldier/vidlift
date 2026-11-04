@@ -41,12 +41,16 @@ The settings surface is divided into two titled groups: **Upscale** and **Add su
 - **Start Upscale:** enqueue every ready item as a tracked job.
 - **Cancel Current:** stop the running job safely through the same
   cancel path an MCP agent uses; it can take a few seconds while the
-  engine exits cleanly.
+  engine exits cleanly. Cancellation is now observed during pre-transcription
+  steps (model resolution, download, load, and language detection) in both modes.
+  Note: a process blocked inside a hung native call still requires quitting the app,
+  and waiting on the GPU phase lock is not cancellable.
 
 **Add subtitles (no upscale) Group**
 - **Add Subtitles…:** Add videos to be processed for subtitles only (no AI upscale).
 - **Replace original on success (deletes source):** After a successful subtitles pass, delete the original file and rename the output to the original name with an `.mp4` extension (e.g. `movie.avi` → `movie.mp4`). If a file of that name already exists, both files are kept.
 - **Scope:** This mode adds subtitles from the file's own audio — video streams are copied without re-encoding or upscaling.
+- **Pre-flight Skip:** To prevent unnecessary runs, VidLift now checks files at the pick stage. Files that already carry a usable text subtitle track are marked as `skip — already has subtitles` and are not enqueued. Files whose output already exists are marked as `blocked — subtitles output already exists` and are not enqueued. These static rows are rendered in the table for visibility but do not become active jobs.
 
 Files can also be dragged into the window.
 
@@ -78,13 +82,18 @@ After **Start Upscale** a run card appears with:
 
 - the current **stage label** naming what is actually running (probe,
   prepare, `upscaling — frames X/Y`, encode, verify full decode,
-  subtitles), driven by the runner's own phase and step facts;
+  subtitles), driven by the runner's own phase and step facts. For transcription-family
+  phases, the label now appends the resolved device (e.g., ` — GPU (CUDA)` or
+  ` — CPU (GPU unavailable)`) once known;
 - an animated activity-dots indicator plus the elapsed timer, so a
   legitimate 0% window (GPU probe, first chunk) never reads as frozen;
 - a **Current file** bar with a measured ETA when the benchmark cache
   has a constant for this geometry bucket (duplicate progress lines
   never blank the ETA; no measured constant means "estimating", never
   a fake percentage);
+- a **Device indicator** in the live detail overlay showing the current
+  transcription device (e.g., `GPU (CUDA)`, `CPU`, or `CPU (GPU unavailable)`).
+  Before resolution, it shows `auto — resolving…` or `auto (requested)`.
 - an **Overall queue** bar across every enqueued job;
 - a read-only **log tail** rendered from the runner's own log; the
   full log stays in `.vidlift-runs` beside each source file;
