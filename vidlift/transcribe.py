@@ -880,8 +880,26 @@ def vad_asset_report(
         assets_dir, inner_source = _default_vad_assets_dir()
         resolver_source = inner_source
     else:
-        assets_dir, inner_source = resolver()
         resolver_source = "injected"
+        # The DEFAULT resolver converts its own faults into the unknown
+        # shape (find_spec is exception-guarded; the scandir below maps
+        # OSError -> unknown). An INJECTED resolver gets the same
+        # OSError -> unknown discipline: a seam fault is a probe FAULT,
+        # not absence, and must never escape the report (never-raises
+        # starts here, not only at the monitor envelope's try/except).
+        # Deliberately scoped to OSError — any other raise from the seam
+        # stays loud (swallowing a genuine test-bug would be dishonest).
+        try:
+            assets_dir, inner_source = resolver()
+        except OSError as exc:
+            return _vad_report(
+                "unknown",
+                None,
+                None,
+                None,
+                resolver_source,
+                f"probe failed: {type(exc).__name__}: {exc}",
+            )
     if assets_dir is None:
         return _vad_report(
             vad_asset="unknown",
@@ -996,23 +1014,36 @@ def selftest_report() -> dict:
     Never raises: every failure lands in ``errors[]``. Honors the
     engine-off env guard with the explicit skip shape — a skip is
     ``ok: False`` there, never a pass (the CI gate fails loudly on a
-    skipped selftest, by construction impossible on the runner).
+    skipped selftest, by construction impossible on the runner). The
+    guard call sits INSIDE the try: the never-raises envelope covers
+    even a faulting guard (a guard fault lands in ``errors[]``, it
+    never escapes to traceback ``_cmd_selftest``).
     """
-    if _engine_disabled_by_env():
-        return {
-            "ok": False,
-            "skipped": "engine disabled by env (VIDLIFT_TRANSCRIPTION_ENGINE=0)",
-            "checks": {},
-            "errors": [],
-        }
     checks, errors = {}, []
     try:
+        if _engine_disabled_by_env():
+            return {
+                "ok": False,
+                "skipped": "engine disabled by env "
+                "(VIDLIFT_TRANSCRIPTION_ENGINE=0)",
+                "checks": {},
+                "errors": [],
+            }
         from faster_whisper.utils import get_assets_path  # deferred (N3)
 
         assets_dir = get_assets_path()
         checks["faster_whisper_version"] = _faster_whisper_version()
         checks["assets_dir_resolver"] = assets_dir
-        onnx = sorted(p.name for p in Path(assets_dir).glob(VAD_ASSET_GLOB))
+        # F-4 symmetry: filter REGULAR files. Path.glob does not filter
+        # directories, and this listing must not disagree with
+        # vad_asset_report's scandir+is_file() discipline when a directory
+        # is named like the asset (the load smoke already catches that
+        # decoy — this is listing symmetry, not a safety gap).
+        onnx = sorted(
+            p.name
+            for p in Path(assets_dir).glob(VAD_ASSET_GLOB)
+            if p.is_file()
+        )
         checks["onnx_files"] = onnx
         report = vad_asset_report()
         checks["report_agrees"] = (

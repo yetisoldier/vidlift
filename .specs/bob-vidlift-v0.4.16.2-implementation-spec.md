@@ -419,6 +419,13 @@ Two insertions. **Version-literal hygiene is a suite-enforced contract**
 text must contain NO dotted 4-part version and NO `VidLift`-named version shape —
 none of the below does (the asset set is globbed, never named).
 
+<!-- CORRECTION (v0.4.16.2 fix pass, Karen D-1): the two `Get-ChildItem ... -File`
+derivations below are WRONG and were the release blocker. faster-whisper 1.2.1 ships a
+0-byte `assets/__init__.py`, but `collect_data_files` only ships the `.onnx`, so `-File`
+alone puts `__init__.py` into `$expected` and the gate fails a HEALTHY build.
+Derive BOTH sides as `-Filter *.onnx` (ONNX-only, like-for-like). The authoritative,
+corrected gate text is in `.specs/forge-vidlift-v0.4.16.2-fix-task.md`. -->
+
 ### 5.1 Insertion A — end of "Build GUI and CLI executables" step (after the
 existing CLI version smoke `if ($ver -ne …)` block, ~line 130):
 
@@ -432,8 +439,8 @@ existing CLI version smoke `if ($ver -ne …)` block, ~line 130):
 $fwAssets = (& python -c "import faster_whisper, os; print(os.path.join(os.path.dirname(faster_whisper.__file__), 'assets'))").Trim()
 $distAssets = "dist\VidLift\_internal\faster_whisper\assets"
 if (-not (Test-Path $distAssets)) { throw "frozen GUI tree missing faster_whisper assets dir: $distAssets" }
-$expected = Get-ChildItem $fwAssets -File | Sort-Object Name
-$shipped  = Get-ChildItem $distAssets -File | Sort-Object Name
+$expected = Get-ChildItem $fwAssets -File -Filter *.onnx | Sort-Object Name
+$shipped  = Get-ChildItem $distAssets -File -Filter *.onnx | Sort-Object Name
 $missing = Compare-Object ($expected.Name) ($shipped.Name) | Where-Object SideIndicator -eq "<="
 if ($missing) { throw "frozen tree missing asset files: $(($missing | ForEach-Object InputObject) -join ', ')" }
 foreach ($f in $expected) {
@@ -456,7 +463,7 @@ if ($LASTEXITCODE -ne 0) { throw "frozen CLI --selftest failed — see dist\self
 # build, is what users run).
 $instAssets = "$install\_internal\faster_whisper\assets"
 if (-not (Test-Path $instAssets)) { throw "Installed payload missing faster_whisper assets dir: $instAssets" }
-$installed = Get-ChildItem $instAssets -File | Sort-Object Name
+$installed = Get-ChildItem $instAssets -File -Filter *.onnx | Sort-Object Name
 $missingInst = Compare-Object ($expected.Name) ($installed.Name) | Where-Object SideIndicator -eq "<="
 if ($missingInst) { throw "installed payload missing asset files: $(($missingInst | ForEach-Object InputObject) -join ', ')" }
 foreach ($f in $expected) {

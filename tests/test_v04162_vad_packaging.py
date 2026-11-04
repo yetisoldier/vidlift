@@ -24,6 +24,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+import types
 import wave
 from pathlib import Path
 
@@ -205,6 +206,39 @@ def test_report_unknown_when_listing_faults(tmp_path):
     assert (report["detail"] or "").startswith("probe failed:")
 
 
+def test_report_unknown_when_injected_resolver_raises():
+    """F-3 hardening: an INJECTED resolver that raises OSError gets the
+    same OSError->unknown discipline the default resolver's scandir
+    already has — a seam fault is a probe FAULT, not absence, and never
+    escapes the report (the never-raises contract starts in the checker,
+    not only at the monitor envelope's try/except). assets_dir stays
+    None: the resolver faulted before returning anything to name."""
+    def _boom():
+        raise OSError("resolver I/O fault")
+
+    report = vad_asset_report(_boom)
+    assert report["vad_asset"] == "unknown"
+    assert report["assets_dir"] is None
+    assert report["onnx_files"] is None
+    assert report["onnx_count"] is None
+    assert report["resolver_source"] == "injected"
+    assert (report["detail"] or "").startswith("probe failed:")
+    assert "OSError" in (report["detail"] or "")
+    assert "resolver I/O fault" in (report["detail"] or "")
+
+
+def test_report_injected_resolver_non_oserror_stays_loud():
+    """The seam discipline is deliberately scoped to OSError (the
+    default resolver's own fault class): any OTHER raise from an
+    injected resolver stays loud — a future widening would swallow
+    genuine test-seam bugs as silent unknowns. Pinned, not incidental."""
+    def _boom():
+        raise ValueError("seam bug")
+
+    with pytest.raises(ValueError):
+        vad_asset_report(_boom)
+
+
 @_fw_installed
 def test_default_resolver_shape_dev_box():
     """On a properly provisioned dev/CI box the DEFAULT resolver (no
@@ -231,6 +265,97 @@ def test_selftest_report_skip_shape_under_env_guard():
     assert report["checks"] == {}
     assert report["errors"] == []
     assert "faster_whisper" not in sys.modules
+
+
+def test_selftest_report_never_raises_on_raising_guard(monkeypatch):
+    """F-2 hardening: the engine-off guard call sits INSIDE the
+    never-raises try — a guard that faults lands in ``errors[]`` as the
+    honest ok:False shape instead of escaping (which would make
+    ``_cmd_selftest`` traceback instead of printing JSON + exit 1). No
+    realistic trigger exists (the guard is an env read); the CONTRACT
+    is the point, and it now holds for a faulting guard too."""
+    def _faulting_guard():
+        raise RuntimeError("guard exploded")
+
+    monkeypatch.setattr(transcribe_mod, "_engine_disabled_by_env",
+                        _faulting_guard)
+    report = selftest_report()  # must not raise
+    assert report["ok"] is False
+    assert report["checks"] == {}
+    assert "RuntimeError: guard exploded" in report["errors"]
+    # the normal guarded/skip path is untouched by the restructure (its
+    # own test above pins that); the import never reached faster_whisper:
+    assert "faster_whisper" not in sys.modules
+
+
+def test_cli_selftest_faulting_guard_prints_json_exits_1(monkeypatch, capsys):
+    """F-2's user-visible face: with the guard RAISING, ``--selftest``
+    still prints the JSON report line and exits 1 — never a traceback.
+    (This is the CI gate's failure channel; a traceback would leave the
+    gate without its artifact.)"""
+    def _faulting_guard():
+        raise RuntimeError("guard exploded")
+
+    monkeypatch.setattr(transcribe_mod, "_engine_disabled_by_env",
+                        _faulting_guard)
+    exit_code = cli.main(["--selftest"])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.out.startswith("vidlift-selftest ")
+    payload = json.loads(captured.out[len("vidlift-selftest ") :])
+    assert payload["ok"] is False
+    assert "RuntimeError: guard exploded" in payload["errors"]
+    assert "Traceback" not in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.usefixtures("transcription_engine_on")
+def test_selftest_onnx_listing_is_file_filtered(
+    monkeypatch, tmp_path
+):
+    """F-4 symmetry: selftest's ``checks["onnx_files"]`` lists only
+    REGULAR ``*.onnx`` files — a directory named ``*.onnx`` never
+    appears — matching ``vad_asset_report``'s scandir+``is_file()``
+    discipline (whose file-only equivalent is pinned by
+    ``test_report_present_lists_only_onnx_files``). Proved through the
+    injected seam: fake ``faster_whisper`` modules seeded in sys.modules
+    via monkeypatch (auto-restored — the REAL package is never imported,
+    N3 holds) and a controlled assets dir carrying one regular file and
+    one decoy DIRECTORY. The load smoke is a passing fake so the listing
+    is what's under test (the smoke already prevented a dishonest ok
+    for the dir case — this is symmetry, not a safety gap)."""
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "bundled-vad.onnx").write_bytes(b"\x00")
+    (assets / "decoy-dir.onnx").mkdir()  # directory with a .onnx name
+    (assets / "readme.txt").write_text("not a model", encoding="utf-8")
+
+    fake_pkg = types.ModuleType("faster_whisper")
+    fake_pkg.__path__ = []  # a package with nothing to search on disk
+    fake_utils = types.ModuleType("faster_whisper.utils")
+    fake_utils.get_assets_path = lambda: str(assets)
+    fake_vad = types.ModuleType("faster_whisper.vad")
+    fake_vad.get_speech_timestamps = lambda audio, **kwargs: []
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_pkg)
+    monkeypatch.setitem(sys.modules, "faster_whisper.utils", fake_utils)
+    monkeypatch.setitem(sys.modules, "faster_whisper.vad", fake_vad)
+    # the selftest cross-checks the DEFAULT resolver's report against the
+    # frozen-loader dir — point BOTH at the controlled assets dir:
+    monkeypatch.setattr(
+        transcribe_mod, "_default_vad_assets_dir",
+        lambda: (str(assets), "find-spec"),
+    )
+
+    report = selftest_report()
+    checks = report["checks"]
+    # THE F-4 POINT: the decoy DIRECTORY is not listed; the regular file is:
+    assert checks["onnx_files"] == ["bundled-vad.onnx"]
+    # with the smoke faked-ok and the cross-check agreeing, the whole
+    # honest pass shape holds end to end:
+    assert checks["vad_load_smoke"] == "ok"
+    assert checks["report_agrees"] is True
+    assert report["ok"] is True
+    assert report["errors"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -843,11 +968,12 @@ def _validate_block() -> str:
 
 def test_workflow_dist_tree_vad_gate():
     """Insertion A: after the build, CI must prove the frozen GUI tree
-    carries the asset dir (name+size parity against the build venv via
-    Compare-Object — dynamic, no hardcoded leaf) AND run the frozen
-    CLI's --selftest (the binary's own loader is the authority). This
-    test would have caught the v0.4.16.1 shipping defect because the
-    workflow had NO assertion about the frozen Python payload at all."""
+    carries the asset dir (name+size parity over the ``*.onnx`` set
+    against the build venv via Compare-Object — dynamic, no hardcoded
+    leaf) AND run the frozen CLI's --selftest (the binary's own loader
+    is the authority). This test would have caught the v0.4.16.1
+    shipping defect because the workflow had NO assertion about the
+    frozen Python payload at all."""
     block = _build_block()
     assert r"dist\VidLift\_internal\faster_whisper\assets" in block
     assert r"faster_whisper\assets" in block
@@ -857,11 +983,23 @@ def test_workflow_dist_tree_vad_gate():
     assert "--selftest" in block
     assert r"dist\selftest-cli.json" in block
     assert "vad assets shipped:" in block  # the grep-able success line
+    # D-1 fix (v0.4.16.2 fix pass), pinned so the shape cannot revert:
+    # BOTH comparison sides are scoped to -Filter *.onnx. The venv's
+    # assets dir also carries a 0-byte __init__.py, but collect_data_files
+    # never bundles it (PyInstaller excludes .py from data collection) —
+    # an unfiltered comparison demanded a file the payload can never have
+    # and failed a HEALTHY build. (No version stamps here per the
+    # no-version-literals gate.)
+    assert "$expected = Get-ChildItem $fwAssets -File -Filter *.onnx" in block
+    assert "Get-ChildItem $distAssets -File -Filter *.onnx" in block
+    # no UNFILTERED derivation left on either side (the D-1 shape, absent):
+    assert "$fwAssets -File | Sort-Object" not in block
+    assert "$distAssets -File | Sort-Object" not in block
 
 
 def test_workflow_installed_vad_gate():
     """Insertion B: the INSTALLED payload (what users actually run) is
-    gated identically — assets-dir parity plus the installed CLI's
+    gated identically — *.onnx-set parity plus the installed CLI's
     --selftest — and the step is self-contained (each pwsh step is its
     own process, so the venv asset list is re-derived there)."""
     block = _validate_block()
@@ -873,7 +1011,12 @@ def test_workflow_installed_vad_gate():
     assert "installed vad assets:" in block
     # self-contained re-derivation (steps share no pwsh variables):
     assert "$fwAssets = (& python" in block
-    assert "$expected = Get-ChildItem $fwAssets" in block
+    # D-1 fix (same pin as the dist-tree gate): both sides ONNX-only.
+    assert "$expected = Get-ChildItem $fwAssets -File -Filter *.onnx" in block
+    assert "Get-ChildItem $instAssets -File -Filter *.onnx" in block
+    # no UNFILTERED derivation left on either side (the D-1 shape, absent):
+    assert "$fwAssets -File | Sort-Object" not in block
+    assert "$instAssets -File | Sort-Object" not in block
 
 
 def test_workflow_names_no_version_suffixed_leaf():

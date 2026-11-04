@@ -131,14 +131,19 @@ jobs:
           # VAD packaging gate (ADR-4): the frozen payload must carry faster-whisper's VAD asset
           # set. Two proofs, cheapest-first: (1) the one-folder GUI tree's
           # _internal\faster_whisper\assets matches the build venv's faster_whisper\assets
-          # 1:1 by name+size (dynamic derivation from the venv — the leaf name is
-          # version-suffixed upstream, so the gate hardcodes NO leaf); (2) the frozen CLI
-          # reports its own capability through faster-whisper's OWN loader (--selftest).
+          # 1:1 by name+size over the *.onnx set (dynamic derivation from the venv — the
+          # leaf name is version-suffixed upstream, so the gate hardcodes NO leaf); (2) the
+          # frozen CLI reports its own capability through faster-whisper's OWN loader
+          # (--selftest). BOTH comparison sides below are scoped to -Filter *.onnx: the
+          # venv's assets dir also carries a 0-byte __init__.py — a Python module, which
+          # collect_data_files never bundles (PyInstaller excludes .py from data
+          # collection) — so an unfiltered comparison demands a file the payload
+          # can never have and fails a HEALTHY build (the D-1 gate false-positive).
           $fwAssets = (& python -c "import faster_whisper, os; print(os.path.join(os.path.dirname(faster_whisper.__file__), 'assets'))").Trim()
           $distAssets = "dist\VidLift\_internal\faster_whisper\assets"
           if (-not (Test-Path $distAssets)) { throw "frozen GUI tree missing faster_whisper assets dir: $distAssets" }
-          $expected = Get-ChildItem $fwAssets -File | Sort-Object Name
-          $shipped  = Get-ChildItem $distAssets -File | Sort-Object Name
+          $expected = Get-ChildItem $fwAssets -File -Filter *.onnx | Sort-Object Name
+          $shipped  = Get-ChildItem $distAssets -File -Filter *.onnx | Sort-Object Name
           $missing = Compare-Object ($expected.Name) ($shipped.Name) | Where-Object SideIndicator -eq "<="
           if ($missing) { throw "frozen tree missing asset files: $(($missing | ForEach-Object InputObject) -join ', ')" }
           foreach ($f in $expected) {
@@ -197,12 +202,15 @@ jobs:
           # same dynamic parity rule as the dist-tree gate (the installer, not merely the
           # build, is what users run). Re-derive the build venv's asset list here: each
           # pwsh step is its own process, so step-self-contained re-derivation wins over
-          # cross-step variable sharing.
+          # cross-step variable sharing. The *.onnx scoping on BOTH sides mirrors the
+          # dist-tree gate: the venv assets dir also carries a 0-byte __init__.py — a
+          # Python module, which collect_data_files never bundles — so an unfiltered
+          # comparison fails a HEALTHY payload (the D-1 gate false-positive).
           $fwAssets = (& python -c "import faster_whisper, os; print(os.path.join(os.path.dirname(faster_whisper.__file__), 'assets'))").Trim()
-          $expected = Get-ChildItem $fwAssets -File | Sort-Object Name
+          $expected = Get-ChildItem $fwAssets -File -Filter *.onnx | Sort-Object Name
           $instAssets = "$install\_internal\faster_whisper\assets"
           if (-not (Test-Path $instAssets)) { throw "Installed payload missing faster_whisper assets dir: $instAssets" }
-          $installed = Get-ChildItem $instAssets -File | Sort-Object Name
+          $installed = Get-ChildItem $instAssets -File -Filter *.onnx | Sort-Object Name
           $missingInst = Compare-Object ($expected.Name) ($installed.Name) | Where-Object SideIndicator -eq "<="
           if ($missingInst) { throw "installed payload missing asset files: $(($missingInst | ForEach-Object InputObject) -join ', ')" }
           foreach ($f in $expected) {
