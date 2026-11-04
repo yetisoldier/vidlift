@@ -2,6 +2,37 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.19.0] - 2026-11-04
+
+### Fixed
+- Cancel is now observed during the pre-transcription steps (model
+  resolution incl. first-run download, engine load, language
+  detection) in BOTH modes — a job parked at `transcribe-language` no
+  longer ignores Cancel Current/Cancel Batch. (Boundary, honest: a
+  process blocked INSIDE a hung native detect/model-load call still
+  needs an app quit; every Python-level window is now observed.)
+
+### Added
+- Plan-time "already done" verdicts for Mode B: sources that already
+  carry a usable text subtitle track render "skip — already has
+  subtitles" and are never enqueued (a would-overwrite still shows
+  "blocked — subtitles output already exists (will not be
+  overwritten)"); GUI, CLI, and MCP surfaces share one verdict helper;
+  --force remains the override (subtitle check only). The recursive
+  collector additionally never re-ingests VidLift's own *.subs.mp4
+  outputs (both modes + folder drop).
+- CPU/GPU device indicator: the in-progress job shows the resolved
+  transcription device — "GPU (CUDA)", "CPU", or an honest "CPU (GPU
+  unavailable)" when auto fell back — plus "auto — resolving…" /
+  "auto (requested)" before the decision exists (stage label suffix +
+  the detail overlay's Device line; the /status payload's additive
+  transcription echo now serves live facts, api_version still 1).
+
+### Changed
+- CLI `vidlift subs`: already-subtitled / output-exists files are
+  reported as skip/blocked and no longer count as failures (exit 0 for
+  an all-done batch).
+
 ## [0.4.18.0] - 2026-11-04
 
 ### Added
