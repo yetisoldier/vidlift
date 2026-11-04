@@ -230,6 +230,23 @@ already failed during an early phase such as `probe` or `transcribe`. Those
 surfaces now settle on `failed`, and the reason is reported in the details
 panel, the overlay, and the job history.
 
+### Transcription fails immediately on fresh install
+
+If you are using v0.4.16.1, transcription will fail because the required Silero VAD model was not bundled. Update to v0.4.16.2 to resolve this.
+
+In v0.4.16.2+, VidLift performs a pre-flight check for these assets. If they are missing, the job will refuse to start and provide a clear error message naming the missing file and the required remedy.
+
+#### Verify installation health
+
+You can confirm your installation is healthy and capable of transcribing by running the self-test command in PowerShell:
+
+~~~powershell
+$vidlift = "$env:LOCALAPPDATA\Programs\VidLift\vidlift-cli.exe"
+& $vidlift --selftest
+~~~
+
+The command prints a JSON capability report. If the install is healthy, the command exits with code 0. If it fails, the report will indicate which asset or dependency is missing.
+
 ### Subtitles are missing
 
 Bitmap subtitle OCR is best effort. Inspect the manifest's **subtitles** block

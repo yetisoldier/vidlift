@@ -123,6 +123,8 @@ curl "http://ninjabase2:8765/history?token=<token>"        # finished jobs, newe
     `faster-whisper` model (installed, downloading with progress, or
     unknown), allowing watchers to see machine-wide model truth even
     with an idle queue.
+  - A **transcription engine block** reporting the readiness of the
+    transcription assets and package version.
  
 ## 🎙️ Transcription Model Management
  
@@ -212,8 +214,20 @@ In the main window, you can toggle **Enable subtitle OCR**. When enabled, VidLif
 | App crashes on start | Missing Vulkan runtime | Install the latest Vulkan SDK or GPU driver. |
 | Output size is too large | High bitrate setting | Check the "Plan" screen; try a different engine if available. |
 | A run appears stuck on "running" after it failed | Stale UI state (pre-v0.4.16.1) | Update to v0.4.16.1; failures now settle correctly on all surfaces and report the reason. |
+| Transcription fails immediately on a fresh install | Missing VAD assets (v0.4.16.1) | Update to v0.4.16.2. If the issue persists, run `vidlift-cli --selftest` to verify the install. |
+
+### Transcription Asset Failure
+If you are using v0.4.16.1, transcription will fail because the required Silero VAD model was not bundled. Update to v0.4.16.2 to resolve this.
+
+For users on v0.4.16.2+, if transcription fails with a "missing asset" error, you can verify your installation health using the CLI:
+~~~powershell
+$vidlift = "$env:LOCALAPPDATA\Programs\VidLift\vidlift-cli.exe"
+& $vidlift --selftest
+~~~
+A successful check will return a JSON report and exit with code 0. If it fails, please report the issue with the JSON output.
 
 Full guide → [docs/usage.md#troubleshooting](docs/usage.md#troubleshooting)
+
 
 ## Current limitations
 

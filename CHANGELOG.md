@@ -5,46 +5,13 @@ All notable changes to VidLift. Dates are America/Chicago.
 ## [0.4.16.2] - 2026-11-03
 
 ### Fixed
+- **Transcription works on fresh Windows installs**: Fixed a packaging defect in v0.4.16.1 where the Silero VAD model was not bundled. Transcription jobs no longer fail with `NO_SUCHFILE` errors on first run.
+- **Clearer transcription failures**: Added a pre-flight check that detects missing VAD assets immediately, providing a clear error message and remedy instead of failing mid-job.
+- **Release-gate hardening**: CI now automatically verifies that the VAD asset set is present and correctly named in the bundled payload to prevent future regressions.
 
-- **The Windows installer can transcribe again** (v0.4.16.1 packaging
-  defect, P0): the frozen build never bundled faster-whisper's packaged
-  `assets/` payload — both PyInstaller specs carried `datas=[]` — so
-  every transcription job died at the first VAD load with
-  `NO_SUCHFILE … _internal\faster_whisper\assets\silero_vad_v6.onnx`,
-  minutes into the job (on CUDA boxes: plus a wasted CPU rebuild and a
-  dishonest "cuda unavailable" note). Five layered, additive moves
-  (arch: `.specs/bob-vidlift-v0.4.16.2-architecture-spec.md`, ADR-1..7):
-  1. **Bundle (the actual fix)**: both specs collect
-     `collect_data_files("faster_whisper")` — whole-package, rename- and
-     relocation-immune against upstream asset changes.
-  2. **One honest checker family** in `transcribe.py`:
-     `vad_asset_report()` (import-free `find_spec`+listdir truth;
-     present/missing/unknown, honest-null on probe fault),
-     `selftest_report()` (the frozen binary proves the payload through
-     faster-whisper's OWN loader, incl. a real ONNX load smoke), and
-     `VadAssetMissingError(TranscriptionError)`.
-  3. **Runtime honesty**: a VAD preflight at the top of
-     `transcribe_source_to_srt` refuses (with the resolved dir + remedy)
-     BEFORE any ffmpeg/model work; a decode-time TOCTOU backstop in
-     `WhisperEngine` names a mid-run disappearance; the `_FallbackEngine`
-     decode arms re-raise `TranscriptionError` instead of mislabeling an
-     honest refusal as a CUDA device fault. Mode A fail-open and Mode B
-     job-failure dispositions ride the existing arms (no caller edits).
-  4. **Release gates (this class can never ship silently again)**: the
-     frozen CLI gains `--selftest` (prints `vidlift-selftest {json}`,
-     exit 0 pass / 1 fail — a skip is a failure by construction); the
-     build workflow gates BOTH the dist tree AND the installed payload on
-     a name+size parity check of
-     `_internal\faster_whisper\assets` against the build venv (dynamic —
-     no hardcoded leaf — plus the shipped `*.onnx` non-emptiness assert).
-  5. **Detectability**: additive machine-scoped `transcription_engine`
-     block (with `ready_for_transcription` true/false/null) on the
-     monitor `GET /status` envelope — "can this install transcribe" is
-     answerable with an idle queue.
-
-  `api_version` stays 1; no new endpoints, no new MCP tools, no new
-  dependencies; the deferred-import test seam survives (the suite still
-  never imports `faster_whisper`).
+### Added
+- **Installation health check**: Added `vidlift-cli --selftest`. This command prints a JSON capability report and exits with a success/fail code, allowing users and CI to verify a healthy install before starting a job.
+- **Enhanced monitor status**: The `GET /status` API now includes a `transcription_engine` block reporting the readiness of the transcription assets and package version. This is additive and does not affect older clients.
 
 ## [0.4.16.1] - 2026-11-03
 
