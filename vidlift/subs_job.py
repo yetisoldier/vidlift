@@ -9,6 +9,11 @@ into a NEW file beside the source —
 safety). The KEEP ``{stem}.subs.srt`` sidecar is written next to the
 output by the core itself.
 
+v0.4.17 (opt-in): ``replace_source`` makes the ONE post-success
+exception to source-blindness — after a verified remux, the source is
+deleted and the output lands at ``{stem}.mp4`` (see
+:func:`replace_subs_output`). The default stays source-blind.
+
 The pipeline has no upscale, no mezzanine, no plan object: it is
 probe → guard → transcribe (GPU-phase lock claim) → remux. The MCP
 registry's ``subs`` job kind and the CLI ``vidlift subs`` subcommand
@@ -24,8 +29,10 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .probe import classify, probe_file
 from .subtitles import SubtitleOcrError, mux_language
@@ -35,7 +42,14 @@ from .transcribe import (
     transcribe_source_to_srt,
 )
 
-__all__ = ["SubsJobError", "SubsJobResult", "subs_output_path", "run_subs_job"]
+__all__ = [
+    "SubsJobError",
+    "SubsJobResult",
+    "subs_output_path",
+    "subs_replace_target",  # v0.4.17
+    "replace_subs_output",  # v0.4.17
+    "run_subs_job",
+]
 
 
 class SubsJobError(RuntimeError):
@@ -77,6 +91,19 @@ def subs_output_path(source_path: str) -> str:
     return os.path.join(os.path.dirname(source_path), f"{stem}.subs.mp4")
 
 
+def subs_replace_target(source_path: str) -> str:
+    """The v0.4.17 replace-source target name: ``{stem}.mp4`` beside the
+    source — ALWAYS ``.mp4`` regardless of the source container
+    (``.avi``, ``.mkv``, ``.ts``, …): mp4 is where mov_text lives, and
+    the old extension is NEVER carried over (D6). The byte-identical
+    stem-strip regex as :func:`subs_output_path` keeps one naming
+    derivation for display, pre-flight, and the run guard (the
+    v0.4.15.3 F-5 lesson)."""
+    base = os.path.basename(source_path)
+    stem = re.sub(r"\.[^.]+$", "", base)
+    return os.path.join(os.path.dirname(source_path), f"{stem}.mp4")
+
+
 _USABLE_KINDS = {"text"}
 
 
@@ -106,6 +133,10 @@ def run_subs_job(
     device_pin: str = "auto",
     language_pin: str = "",
     force: bool = False,
+    # v0.4.17 (opt-in replace-source): keyword-only, inserted after
+    # `force` — ordering inside a kw-only block is source-compatible for
+    # every caller (all seven call sites pass keywords).
+    replace_source: bool = False,
     workdir: str | None = None,
     state_root: str | os.PathLike | None = None,
     on_step=None,
@@ -119,9 +150,12 @@ def run_subs_job(
     off the roadmap — the v0.4.15 strip removed the vestigial
     ``burn`` flag and its named not-implemented stub).
 
-    Never overwrites the source: the output is ``{stem}.subs.mp4`` and
-    a pre-existing output FAILS the job (not-ready, the caller
-    decides; run-side guard mirrors the plan-time collision gate).
+    Never overwrites the source (unless the opt-in ``replace_source``
+    post-success path ships — then, v0.4.17, the source is deleted and
+    the output lands at ``{stem}.mp4``; see :func:`replace_subs_output`):
+    the output is ``{stem}.subs.mp4`` and a pre-existing output FAILS
+    the job (not-ready, the caller decides; run-side guard mirrors the
+    plan-time collision gate).
     """
 
     def _step(name: str) -> None:
@@ -206,16 +240,43 @@ def run_subs_job(
         runner=runner if runner is not None else _default_runner,
     )
 
+    final_output = output_path
+    final_srt = transcribed.srt_path
+    notes = list(transcribed.notes)
+    if replace_source:
+        # v0.4.17: cancellation never replaces — after the remux lands,
+        # before any mutation (transcribe.py's should_cancel contract).
+        if should_cancel is not None and should_cancel():
+            from .run import EngineCancelled  # lazy: circular import
+
+            raise EngineCancelled("cancelled after remux, before replace")
+        _step("replace-source")
+        try:
+            final_output, maybe_srt = replace_subs_output(
+                source_path,
+                output_path,
+                srt_path=transcribed.srt_path,
+                log_line=notes.append,  # helper narration -> result notes
+            )
+            if maybe_srt is not None:
+                final_srt = maybe_srt
+        except (SubsJobError, OSError) as exc:
+            # Mode A discipline: a replace failure is a warning that keeps
+            # the verified success; both files stay on disk.
+            notes.append(
+                f"WARNING replace-source failed; keeping both files: {exc}"
+            )
+
     return SubsJobResult(
         source_path=source_path,
-        output_path=output_path,
-        srt_path=transcribed.srt_path,
+        output_path=final_output,
+        srt_path=final_srt,
         cue_count=transcribed.cue_count,
         language=transcribed.language,
         language_confidence=transcribed.language_confidence,
         model=transcribed.model,
         device=transcribed.device,
-        notes=list(transcribed.notes),
+        notes=notes,
         started_at=started,
         finished_at=time.time(),
     )
@@ -300,3 +361,160 @@ def mplex(
             f"subs remux could not finalize the output: {exc}"
         ) from exc
     return output_path
+
+
+def replace_subs_output(
+    source_path: str,
+    output_path: str,
+    *,
+    srt_path: str | None = None,
+    log_line=None,
+) -> tuple[str, str | None]:
+    """Mode B replace (v0.4.17, opt-in): delete the source and land the
+    verified subs output at the source's stem with an .mp4 extension.
+
+    Discipline (mirrors run.replace_source_with_output's invariants, with
+    rename-to-stem-.mp4 semantics):
+    - rename-before-delete: the output moves onto {stem}.mp4 FIRST
+      (atomic os.replace), the source is deleted SECOND; every failure
+      mode keeps BOTH files (spec §2 deviation 1);
+    - collision guard: a pre-existing {stem}.mp4 that is NOT the source
+      (normcase/abspath identity) refuses the whole replace — an
+      unrelated file is never overwritten;
+    - source-is-.mp4 (target == source path): safe and intended — the
+      single os.replace IS the delete-and-move;
+    - cross-device (unreachable by construction — output and target share
+      the source's directory — but defended): stage at a temp SIBLING of
+      the target, shutil.copy2, SHA-256-verify against the verified
+      output (from .run import _sha256_file — lazy, the _default_runner
+      pattern), then os.replace; the temp never outlives the call;
+    - sidecar: {stem}.subs.srt is renamed to {stem}.srt when (and only
+      when) no unrelated {stem}.srt exists; on refusal or OSError the
+      sidecar keeps its .subs.srt name — best-effort, never blocks the
+      mp4 outcome;
+    - raises SubsJobError on refusal/failure; the job-level caller keeps
+      the verified success either way.
+
+    Returns (final_output_path, final_srt_path_or_None): the second
+    element is the sidecar's HONEST post-attempt location — the renamed
+    path, the original path when the rename was refused/failed, or None
+    when no sidecar exists. result.srt_path must never lie.
+    """
+    source = Path(source_path)
+    output = Path(output_path)
+    target = Path(subs_replace_target(source_path))
+    target_srt = target.with_suffix(".srt")
+
+    def _log(message: str) -> None:
+        # The narration channel; None stays inert (the job-level caller
+        # always passes a collector, the bare library call stays safe).
+        if log_line is not None:
+            log_line(message)
+
+    # 1. guards (no mutation before this line)
+    if not output.is_file():
+        raise SubsJobError(
+            f"replace-source refused: verified output is missing: {output}"
+        )
+    if not source.is_file():
+        raise SubsJobError(
+            f"replace-source refused: source is gone: {source}"
+        )
+    same_path = os.path.normcase(os.path.abspath(str(source))) == (
+        os.path.normcase(os.path.abspath(str(target)))
+    )
+    if not same_path and target.exists():
+        raise SubsJobError(
+            f"replace-source refused: {target.name} already exists as a "
+            "different file; keeping both files"
+        )
+    # 2. land the output at the target (atomic)
+    if os.stat(str(source)).st_dev == os.stat(str(output)).st_dev:
+        try:
+            os.replace(str(output), str(target))
+        except OSError as exc:
+            raise SubsJobError(
+                f"replace-source failed to move the output to {target}: {exc}"
+            ) from exc
+    else:
+        # Defensive arm (v0.4.15.3 F-2 discipline, D3): unreachable by
+        # construction today (output and target share the source's
+        # directory), specced so the helper never silently relies on
+        # caller geometry. Stage at a temp SIBLING of the target (same
+        # directory -> same filesystem -> the final os.replace is an
+        # atomic rename(2)); hash-verify the staged copy against the
+        # verified output BEFORE anything else moves.
+        tmp = str(target) + ".replace-tmp"
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)  # stale temp from a killed process
+            except OSError:
+                pass
+        try:
+            try:
+                shutil.copy2(str(output), tmp)
+                from .run import _sha256_file  # lazy: circular import
+
+                if _sha256_file(str(output)) != _sha256_file(tmp):
+                    raise SubsJobError(
+                        "replace-source: the staged copy for "
+                        f"{target} does not hash-match the verified "
+                        "output; keeping everything (source, verified "
+                        "output) untouched"
+                    )
+                os.replace(tmp, str(target))
+            except OSError as exc:
+                raise SubsJobError(
+                    f"replace-source cross-device copy into {target} "
+                    f"failed: {exc}"
+                ) from exc
+        finally:
+            # The temp must never outlive the call (the run.py:1774-1783
+            # pattern): the success path consumed it via os.replace;
+            # every error path strands only an unproven copy.
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        # The copy hash-verified: the file at the target is now the good
+        # data, so only the former output copy gets removed.
+        try:
+            output.unlink()
+        except OSError as exc:
+            _log(
+                f"WARNING replace-source: the verified output copy at "
+                f"{output} could not be removed: {exc}"
+            )
+    # 3. delete the source copy (skipped when same_path — the rename
+    #    consumed the name)
+    if not same_path:
+        try:
+            os.remove(str(source))
+        except OSError as exc:
+            _log(
+                f"WARNING replace-source: output shipped to {target} "
+                f"but the source copy could not be removed: {exc}"
+            )
+    # 4. sidecar (best-effort, guarded — D1)
+    final_srt: str | None = None
+    if srt_path is not None and os.path.isfile(srt_path):
+        if os.path.normcase(os.path.abspath(srt_path)) == os.path.normcase(
+            os.path.abspath(str(target_srt))
+        ):
+            final_srt = srt_path  # already matches (defensive)
+        elif target_srt.exists():
+            _log(
+                f"WARNING replace-source: {target_srt.name} already "
+                "exists; sidecar kept as " + os.path.basename(srt_path)
+            )
+            final_srt = srt_path
+        else:
+            try:
+                os.replace(srt_path, str(target_srt))
+                final_srt = str(target_srt)
+            except OSError as exc:
+                _log(f"WARNING replace-source: sidecar kept at {srt_path}: {exc}")
+                final_srt = srt_path
+    _log(f"replace-source: output now at {target}")
+    return str(target), final_srt

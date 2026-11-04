@@ -736,13 +736,16 @@ def tool_manifest(services: BridgeServices, args: dict) -> dict:
 def tool_transcribe(services: BridgeServices, args: dict) -> dict:
     """transcribe (v0.4.14 Mode B): enqueue subs jobs, return at once.
 
-    args: paths[] required; lang, model, device, force (booleans/
-    strings, all optional). Cancel covers subs jobs via the existing
-    tool_cancel (registry transitions are job-kind-blind)."""
+    args: paths[] required; lang, model, device, force, replace_source
+    (booleans/strings, all optional). Cancel covers subs jobs via the
+    existing tool_cancel (registry transitions are job-kind-blind)."""
     lang = args.get("lang") or ""
     model = args.get("model") or None
     device = args.get("device") or "auto"
     force = bool(args.get("force", False))
+    # v0.4.17 (opt-in replace-source): absent -> False (the
+    # absent-defaults rule; pre-0.4.17 callers are behavior-identical).
+    replace_source = bool(args.get("replace_source", False))
     jobs: list[dict] = []
     for path in args["paths"]:
         if not os.path.isfile(path):
@@ -759,6 +762,7 @@ def tool_transcribe(services: BridgeServices, args: dict) -> dict:
                 "model": model,
                 "device": str(device),
                 "force": force,
+                "replace_source": replace_source,
             },
         )
         services.executor.notify_new_work()

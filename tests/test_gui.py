@@ -169,12 +169,18 @@ class FakeClient:
             ids.append(record.job_id)
         return ids
 
-    def enqueue_subs(self, paths):
+    def enqueue_subs(self, paths, *, replace_source=False):
         """The Mode B surface (v0.4.14): one subs job per picked file,
-        the pick order preserved."""
+        the pick order preserved. v0.4.17: the GUI threads the
+        replace-source checkbox state; the kwarg is accepted with the
+        False default and written verbatim into the record options."""
         ids = []
         for path in paths:
-            record = self.registry.enqueue(kind="subs", paths=[path], options={})
+            record = self.registry.enqueue(
+                kind="subs",
+                paths=[path],
+                options={"replace_source": bool(replace_source)},
+            )
             self.executor.notify_new_work()
             ids.append(record.job_id)
         return ids
@@ -1346,7 +1352,7 @@ def test_f13b_enqueue_subs_oserror_dialogs_instead_of_escaping(
         staticmethod(lambda *a, **k: ([str(tmp_path / "episode.mkv")], "")),
     )
 
-    def exploding_enqueue_subs(paths):
+    def exploding_enqueue_subs(paths, **_kwargs):
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(window.client, "enqueue_subs", exploding_enqueue_subs)

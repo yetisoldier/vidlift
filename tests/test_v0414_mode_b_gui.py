@@ -104,6 +104,7 @@ class _ScriptedClient:
         self.submitted: list[str] = []
         self.counter = 0
         self.subs_kinds: dict[str, str] = {}
+        self.last_subs_replace_source: bool = False  # v0.4.17
 
     # -- scripting helpers --
     def make_job(self, file_path, script: list[dict], kind="run") -> str:
@@ -147,11 +148,18 @@ class _ScriptedClient:
         self.last_enqueued_kinds = ["run"] * len(chosen)
         return list(chosen)
 
-    def enqueue_subs(self, paths):
-        """The Mode B surface: kind-checked ids in pick order."""
+    def enqueue_subs(self, paths, *, replace_source=False):
+        """The Mode B surface: kind-checked ids in pick order.
+
+        v0.4.17: the GUI passes the replace-source checkbox state as a
+        keyword (the spec's item 11 call shape) — the double accepts and
+        records it (last_subs_replace_source) so the File B tests can
+        assert ON/OFF thread through; a defaulted kwarg keeps every
+        scripted caller (incl. the v0.4.15.1 guard suite) green."""
         for path in paths:
             if not Path(path).is_file():
                 raise FileNotFoundError(f"no such file on this machine: {path}")
+        self.last_subs_replace_source = bool(replace_source)
         self.armed = True
         fresh = [jid for jid in self.job_order if jid not in self.submitted]
         chosen = fresh[: len(paths)]
@@ -867,3 +875,202 @@ def test_subs_active_batch_blocks_second_flow(qapp, monkeypatch, tmp_path):
     win.add_subs_button.click()
     assert win.job_ids == ["VJ1"]  # unchanged — the click was refused
     next(gen, None)
+
+
+# ------------------------------------------ v0.4.17: replace-source checkbox
+def _grid_of(win):
+    """The controls grid that owns the Mode B action row."""
+    return win.add_subs_button.parentWidget().layout()
+
+
+def _grid_position(win, widget) -> tuple[int, int]:
+    layout = _grid_of(win)
+    for index in range(layout.count()):
+        if layout.itemAt(index).widget() is widget:
+            row, column, _row_span, _col_span = layout.getItemPosition(index)
+            return row, column
+    raise AssertionError("widget not found in the controls grid")
+
+
+def test_subs_replace_checkbox_exists_beside_button_default_off_tooltip(
+    qapp, monkeypatch, tmp_path
+):
+    """v0.4.17 item 25: the checkbox lives at grid (2, 8) — immediately
+    right of 'Add Subtitles…' at (2, 7) — default OFF, with the .mp4
+    naming rule (D6), the keep-both promise, and the scope
+    disambiguation in its tooltip."""
+    client = _ScriptedClient()
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    # placement: co-located, right of the Mode B button
+    assert _grid_position(win, win.add_subs_button) == (2, 7)
+    assert _grid_position(win, win.subs_replace_source) == (2, 8)
+    # default OFF (fresh QSettings, the absent-defaults rule)
+    assert win.subs_replace_source.isChecked() is False
+    # labels: the mode named, the irrecoverability named
+    assert win.subs_replace_source.text() == (
+        "Replace original after adding subtitles (deletes the source)"
+    )
+    tooltip = win.subs_replace_source.toolTip().lower()
+    assert "35 hours.avi" in tooltip and "35 hours.mp4" in tooltip
+    assert ".mp4" in tooltip
+    assert "both files are kept" in tooltip  # the D2/D5 keep-both promise
+    assert "sidecar" in tooltip  # the D1 rename-to-match note
+    # the button tooltip no longer claims an absolute "never modified"
+    assert "can replace it" in win.add_subs_button.toolTip().lower()
+    assert "scope" not in tooltip  # sanity: the scope sentence is real
+    assert "upscale panel has its own replace option" in tooltip
+    next(gen, None)
+
+
+def test_subs_replace_checkbox_persists_and_restores(qapp, monkeypatch, tmp_path):
+    """v0.4.17 item 26: toggling persists QSettings key
+    'subs_replace_source'; a fresh window restores it — both directions
+    (ON persisted → restored ON; OFF persisted → restored OFF)."""
+    import PyQt6.QtCore as QtCore
+
+    settings_path = str(tmp_path / "settings.ini")
+
+    def _read():
+        _w = QtCore.QSettings(settings_path, QtCore.QSettings.Format.IniFormat)
+        _w.sync()
+        return _w
+
+    client = _ScriptedClient()
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.subs_replace_source.setChecked(True)
+    assert _read().value("subs_replace_source", False, type=bool) is True
+
+    # a fresh window restores the persisted state
+    client2 = _ScriptedClient()
+    _alive.append(MainWindow(client=client2))
+    win2 = _alive[-1]
+    assert win2.subs_replace_source.isChecked() is True
+
+    # and the OFF direction persists + restores too
+    win2.subs_replace_source.setChecked(False)
+    assert _read().value("subs_replace_source", False, type=bool) is False
+    client3 = _ScriptedClient()
+    _alive.append(MainWindow(client=client3))
+    win3 = _alive[-1]
+    assert win3.subs_replace_source.isChecked() is False
+    next(gen, None)
+
+
+def test_subs_replace_key_isolated_from_mode_a_key(qapp, monkeypatch, tmp_path):
+    """v0.4.17 item 26 (key isolation): the Mode B toggle never writes
+    Mode A's 'replace_source' key, and Mode A's toggle never writes the
+    Mode B key ('subs_replace_source'). Each direction runs against its
+    own clean QSettings file so the absence assertion is decisive."""
+    import PyQt6.QtCore as QtCore
+
+    def _file_isolated_settings(name):
+        path = str(tmp_path / f"settings-{name}.ini")
+
+        def _settings(self):
+            return QtCore.QSettings(path, QtCore.QSettings.Format.IniFormat)
+
+        def _read():
+            _w = QtCore.QSettings(path, QtCore.QSettings.Format.IniFormat)
+            _w.sync()
+            return _w
+
+        return _settings, _read
+
+    # direction 1 (Mode B toggle → Mode A key untouched)
+    write_b, read_b = _file_isolated_settings("b-writes")
+    monkeypatch.setattr(MainWindow, "_settings", write_b)
+    _alive.append(MainWindow(client=_ScriptedClient()))
+    win_b = _alive[-1]
+    win_b.subs_replace_source.setChecked(True)
+    stored_b = read_b()
+    assert stored_b.value("subs_replace_source", False, type=bool) is True
+    assert stored_b.contains("replace_source") is False
+
+    # direction 2 (Mode A toggle → Mode B key untouched)
+    write_a, read_a = _file_isolated_settings("a-writes")
+    monkeypatch.setattr(MainWindow, "_settings", write_a)
+    _alive.append(MainWindow(client=_ScriptedClient()))
+    win_a = _alive[-1]
+    win_a.replace_source.setChecked(True)
+    stored_a = read_a()
+    assert stored_a.value("replace_source", False, type=bool) is True
+    assert stored_a.contains("subs_replace_source") is False
+
+
+def test_subs_pick_flow_threads_checkbox_state_into_enqueue(
+    qapp, monkeypatch, tmp_path
+):
+    """v0.4.17 item 27: pick with the checkbox ON → enqueue_subs
+    receives replace_source=True; OFF → False (the scripted-client
+    harness records the exact state submitted)."""
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"x")
+
+    import vidlift.gui as gui_mod
+
+    monkeypatch.setattr(
+        gui_mod.QFileDialog,
+        "getOpenFileNames",
+        staticmethod(lambda *a, **k: ([str(media)], "")),
+    )
+
+    # ON: the state being enqueued is True
+    client = _ScriptedClient()
+    client.make_job(str(media), [{"state": "queued"}], kind="subs")
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.subs_replace_source.setChecked(True)
+    win.add_subs_button.click()
+    assert client.last_subs_replace_source is True
+    # park the shared settings file OFF again for the second phase
+    win.subs_replace_source.setChecked(False)
+    next(gen, None)
+
+    # OFF: the state being enqueued is False
+    client2 = _ScriptedClient()
+    client2.make_job(str(media), [{"state": "queued"}], kind="subs")
+    gen2 = _window(qapp, monkeypatch, tmp_path, client2)
+    win2 = next(gen2)
+    assert win2.subs_replace_source.isChecked() is False
+    win2.add_subs_button.click()
+    assert client2.last_subs_replace_source is False
+    next(gen2, None)
+
+
+def test_subs_file_rows_column3_tracks_submitted_state(
+    qapp, monkeypatch, tmp_path
+):
+    """v0.4.17 item 28: column 3 reads 'replace original → .mp4' when
+    ON and 'keep original' when OFF (the row is rendered at enqueue
+    time from the exact state being enqueued)."""
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"x")
+    client = _ScriptedClient()
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    off_rows = win._subs_file_rows([str(media)])
+    assert off_rows[0][3] == "keep original"
+    win.subs_replace_source.setChecked(True)
+    on_rows = win._subs_file_rows([str(media)])
+    assert on_rows[0][3] == "replace original → .mp4"
+    next(gen, None)
+
+
+def test_mode_a_replace_option_never_cross_wires_mode_b(
+    qapp, monkeypatch, tmp_path
+):
+    """v0.4.17 item 29 (the Eric-confusion regression fence): the
+    upscale start path still reads ONLY Mode A's own replace_source
+    checkbox, and the Mode B enqueue reads only the Mode B checkbox."""
+    import inspect
+
+    start_src = inspect.getsource(MainWindow.start_upscale)
+    assert '"replace_source": self.replace_source.isChecked()' in start_src
+    assert "subs_replace_source" not in start_src
+    subs_src = inspect.getsource(MainWindow.choose_subs_files)
+    assert "replace_source=self.subs_replace_source.isChecked()" in subs_src
+    # and the Mode B path never reads Mode A's checkbox
+    assert "self.replace_source.isChecked()" not in subs_src
+    assert "replace_source=self.subs_replace_source.isChecked()" in subs_src

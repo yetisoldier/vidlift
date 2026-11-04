@@ -742,15 +742,43 @@ class MainWindow(QMainWindow):
         # the exact v0.4.13 paths.
         self.add_subs_button = QPushButton("Add Subtitles…")
         self.add_subs_button.setEnabled(True)
+        # v0.4.17: the "never modified" sentence names the per-run opt-in
+        # checkbox co-located beside this button (the Eric-confusion fix:
+        # the scope of the replace control is visually unambiguous).
         self.add_subs_button.setToolTip(
             "Add subtitles by transcribing each file's own audio — without "
             "re-encoding the video.\n\n"
             "The output lands beside each source as <name>.subs.mp4 plus a "
-            ".srt sidecar; the source is never modified. Existing videos at "
+            ".srt sidecar; the source is kept (a per-run opt-in can replace "
+            "it — see the checkbox beside this button). Existing videos at "
             "any resolution are welcome. First use downloads a ~1.5 GB model "
             "once."
         )
         self.add_subs_button.clicked.connect(self.choose_subs_files)
+        # v0.4.17 (opt-in Mode B replace-source, D4-1): the checkbox sits
+        # at grid (2, 8) immediately right of "Add Subtitles…" (2, 7) —
+        # co-located so the scope is visually unambiguous — QSettings-
+        # persisted under its own key ("subs_replace_source", no collision
+        # with Mode A's "replace_source"), default OFF, persisted from its
+        # toggled signal exactly like _replace_source_changed.
+        self.subs_replace_source = QCheckBox(
+            "Replace original after adding subtitles (deletes the source)"
+        )
+        self.subs_replace_source.setChecked(
+            self._settings().value("subs_replace_source", False, type=bool)
+        )
+        self.subs_replace_source.setToolTip(
+            "After a successful subtitles pass, delete the original file "
+            "and rename the output to the original name with an .mp4 "
+            "extension (e.g. …35 Hours.avi → …35 Hours.mp4).\n\n"
+            "The .srt sidecar is renamed to match. If a file of that name "
+            "already exists, or the replace cannot be done, both files are "
+            "kept and the job still succeeds. Applies to Add Subtitles "
+            "only — the upscale panel has its own replace option."
+        )
+        self.subs_replace_source.toggled.connect(
+            self._subs_replace_source_changed
+        )
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
@@ -1184,6 +1212,14 @@ class MainWindow(QMainWindow):
         the stored value changes here."""
         self._settings().setValue("replace_source", bool(checked))
 
+    def _subs_replace_source_changed(self, checked: bool) -> None:
+        """v0.4.17: persist the Mode B replace-source preference
+        (QSettings house rule, verbatim _replace_source_changed
+        pattern); only the stored value changes here. The key
+        ("subs_replace_source") is Mode B's own — Mode A's
+        ("replace_source") key is never touched by it."""
+        self._settings().setValue("subs_replace_source", bool(checked))
+
     def _resume_claim_changed(self, checked: bool) -> None:
         """Persist the resume-claim preference (v0.4.9 §1.4, QSettings
         house rule); only the stored value changes."""
@@ -1326,6 +1362,10 @@ class MainWindow(QMainWindow):
         # cells). Row 2 reads as the options/actions row tail, directly
         # below the Cancel cluster's column.
         grid.addWidget(self.add_subs_button, 2, 7)
+        # v0.4.17 (Mode B replace-source): the checkbox lands at (2, 8) —
+        # the Mode B action row's last free cell, immediately right of
+        # the Add Subtitles button; scope co-location (D4-1).
+        grid.addWidget(self.subs_replace_source, 2, 8)
         # v0.4.15 (opt-in denoise): the three-state combo rides a new
         # options row (rows 0-2 are full) directly under the profile
         # combo, keeping the options/actions rows reading top-down as
@@ -1527,7 +1567,14 @@ class MainWindow(QMainWindow):
                     status,
                     path,
                     "transcribe",
-                    "keep original",
+                    # v0.4.17: column 3 renders the EXACT state being
+                    # enqueued (the checkbox read is the submitted
+                    # option) — the display cannot diverge.
+                    (
+                        "replace original → .mp4"
+                        if self.subs_replace_source.isChecked()
+                        else "keep original"
+                    ),
                     out_path,
                     "",
                     "transcribed from the file's own audio",
@@ -1633,7 +1680,14 @@ class MainWindow(QMainWindow):
         if self.job_ids:
             pending_ids = list(self.job_ids)
         try:
-            fresh_ids = self.client.enqueue_subs(paths)
+            # v0.4.17: the checkbox state IS the submitted option — it
+            # rides the enqueue surface (client_local → registry
+            # options) so the executor's absent-defaults read lands on
+            # exactly what this pick asked for.
+            fresh_ids = self.client.enqueue_subs(
+                paths,
+                replace_source=self.subs_replace_source.isChecked(),
+            )
         except (
             BatchTooLarge,
             FileNotFoundError,

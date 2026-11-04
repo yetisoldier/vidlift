@@ -129,6 +129,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "model": {"type": "string"},
             "device": {"type": "string", "enum": ["auto", "cuda", "cpu"]},
             "force": {"type": "boolean"},
+            # v0.4.17 (opt-in Mode B replace-source): absent -> False (the
+            # absent-defaults rule); when True, a verified success deletes
+            # the source and renames the output to {stem}.mp4 (never the
+            # old extension) with a keep-both guard on collision.
+            "replace_source": {"type": "boolean"},
         },
         "required": ["paths"],
     },
@@ -181,8 +186,12 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "Standalone subtitles (v0.4.14 Mode B): transcribe the file's own "
         "audio (faster-whisper, medium by default; first use downloads the "
         "model) and soft-mux mov_text subtitles into a NEW {stem}.subs.mp4 "
-        "beside the source — never overwriting it. Enqueues subs jobs; "
-        "cancel works on them; status/manifest read them like any job."
+        "beside the source — never overwriting it (unless the optional "
+        "`replace_source` flag is set — then on success the source is "
+        "deleted and the output takes the source's name with an .mp4 "
+        "extension, with a keep-both guard on collision). Enqueues subs "
+        "jobs; cancel works on them; status/manifest read them like any "
+        "job."
     ),
     "status": (
         "The full runner observability contract for one job: state, phase, "

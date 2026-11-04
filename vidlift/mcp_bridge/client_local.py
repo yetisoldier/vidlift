@@ -159,12 +159,20 @@ class LocalBridgeClient:
     # enqueue surface, never a fork; the GUI's file-picker validation
     # mirrors enqueue_run's (a missing file raises, the picker never
     # shows fabricated rows).
-    def enqueue_subs(self, paths: list[str]) -> list[str]:
+    def enqueue_subs(
+        self, paths: list[str], *, replace_source: bool = False
+    ) -> list[str]:
         """Validate paths, enqueue one ``subs`` job per path in
         submission order, wake the executor, and return the job_ids in
         that order so GUI rows map 1:1. Options follow tool_transcribe's
-        absent-defaults rule (the GUI picker exposes no overrides —
-        auto everything; --force stays a CLI/MCP concern)."""
+        absent-defaults rule.
+
+        v0.4.17: ``replace_source`` (default False — the source-blind
+        v0.4.14 behavior) rides into the registry record's options so
+        ``_execute_subs_job``'s absent-defaults read picks it up; the GUI
+        checkbox feeds it explicitly, and calls without the kwarg are
+        behavior-identical to v0.4.16 (options keep carrying the False
+        default, never a fabricated ON)."""
         clean: list[str] = []
         for path in paths:
             path_str = str(path)
@@ -186,7 +194,8 @@ class LocalBridgeClient:
                 kind="subs",
                 paths=[path],
                 options={"language": "", "model": None, "device": "auto",
-                         "force": False},
+                         "force": False,
+                         "replace_source": bool(replace_source)},
             )
             self.services.executor.notify_new_work()
             job_ids.append(record.job_id)

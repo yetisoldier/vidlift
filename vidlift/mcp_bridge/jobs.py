@@ -467,6 +467,11 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
             device_pin=options.get("device", "auto"),
             language_pin=options.get("language", ""),
             force=bool(options.get("force", False)),
+            # v0.4.17 (opt-in Mode B replace-source): the absent-defaults
+            # rule again — no options["replace_source"] (pre-0.4.17
+            # records and callers) reads as False, so the source-blind
+            # v0.4.14..0.4.16 behavior is untouched for them.
+            replace_source=bool(options.get("replace_source", False)),
             workdir=options.get("workdir"),
             state_root=services.state_dir,
             on_progress=on_segments,

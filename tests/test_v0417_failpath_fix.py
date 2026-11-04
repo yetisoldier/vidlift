@@ -307,7 +307,9 @@ class _ScriptedClient:
         calls; the scripted ids are kind-blind)."""
         return self._submit(paths, "run")
 
-    def enqueue_subs(self, paths):
+    def enqueue_subs(self, paths, *, replace_source=False):
+        # v0.4.17: the GUI threads the replace-source state; the default
+        # keeps this scripted surface's existing shape intact.
         return self._submit(paths, "subs")
 
     def status_snapshot(self, job_id):

@@ -2,6 +2,36 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.17.0] - 2026-11-04
+
+### Added
+
+- **Mode B opt-in "replace original on success"**: the Add Subtitles flow can now
+  delete the source video after a verified subtitles pass and rename the output to
+  the source's name with an `.mp4` extension
+  (e.g. `35 Hours.avi` → `35 Hours.mp4`). Default remains OFF — without the flag,
+  the source is never touched and the output stays `{stem}.subs.mp4`.
+  - **GUI**: a new checkbox beside the "Add Subtitles…" button (persisted, default
+    off). Its tooltip states the naming rule and the keep-both guarantee.
+  - **CLI**: `vidlift subs --replace-source`.
+  - **MCP**: the `transcribe` tool accepts an optional `replace_source` boolean
+    (`api_version` unchanged; absent means off for older callers and recorded jobs).
+- **Sidecar rename-to-match**: on a successful replace, `{stem}.subs.srt` is renamed
+  to `{stem}.srt` so the delivered pair is `{stem}.mp4` + `{stem}.srt` (player
+  auto-load convention). If a different file already occupies `{stem}.srt`, the
+  sidecar keeps its `.subs.srt` name and a warning is written to the job notes —
+  the sidecar never blocks or destroys the media replace.
+- **Collision keep-both guard**: when `{stem}.mp4` already exists as a *different*
+  file beside the source, the whole replace is refused before anything is touched —
+  the source, the verified output, and the unrelated file all survive, the warning
+  names the refusal, and the job still succeeds. When the source itself is an
+  `.mp4`, the rename is a single atomic move (safest case).
+
+### Notes
+
+- The unrelated sidecar-vs-burned `.srt` output-choice toggle Eric raised is a
+  tracked follow-up and is **not** part of this release.
+
 ## [0.4.16.2] - 2026-11-03
 
 ### Fixed

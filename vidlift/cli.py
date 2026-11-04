@@ -376,6 +376,10 @@ def _cmd_subs(
     force: bool,
     ffmpeg: str | None,
     ffprobe: str | None,
+    # v0.4.17 (opt-in replace-source): the kw-only param rides the
+    # argparse flag; exit codes unchanged — a refused/failed replace is
+    # a warning note inside a succeeded job (keep-both discipline).
+    replace_source: bool = False,
 ) -> int:
     """Mode B: transcribe + soft-mux; exit 0 ok, 1 job failure, 2 tool."""
     from .subs_job import SubsJobError, run_subs_job
@@ -398,6 +402,7 @@ def _cmd_subs(
                 device_pin=device,
                 language_pin=lang,
                 force=force,
+                replace_source=replace_source,
             )
         except SubsJobError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -683,6 +688,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="transcribe even when a usable text subtitle track exists"
     )
+    # v0.4.17 (opt-in Mode B replace-source): the Mode A --replace-source
+    # pattern (cli.py's run-parser wording) with the Mode B naming rule
+    # spelled out — the target is always {stem}.mp4.
+    subs_parser.add_argument(
+        "--replace-source",
+        action="store_true",
+        help=(
+            "after a verified subtitles pass, delete the source video and "
+            "rename the output to the source's name with an .mp4 extension "
+            "(e.g. …35 Hours.avi → …35 Hours.mp4); if a file of that name "
+            "already exists, both files are kept (default: off)"
+        ),
+    )
     subs_parser.add_argument("--ffmpeg", help="explicit ffmpeg path")
     subs_parser.add_argument("--ffprobe", help="explicit ffprobe path")
     benchmark_parser = sub.add_parser(
@@ -808,6 +826,7 @@ def main(argv: list[str] | None = None) -> int:
             force=args.force,
             ffmpeg=args.ffmpeg,
             ffprobe=args.ffprobe,
+            replace_source=args.replace_source,
         )
     if args.command == "runs":
         # v0.4.9 (design §1.6): the prune surface over the scratch GC.
