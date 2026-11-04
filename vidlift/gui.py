@@ -343,6 +343,72 @@ def _stage_label_text(stage: str) -> str:
     return stage.split(" (", 1)[0]
 
 
+def _device_display(snapshot: dict | None) -> str | None:
+    """v0.4.19 (WS3): the ONE device-wording rule. Reads the additive
+    ``transcription`` echo (``device`` / ``device_requested``) that rides
+    every status payload, and renders the honest state:
+
+      device "cuda"                     -> "GPU (CUDA)"
+      device "cpu" + requested "cpu"    -> "CPU"
+      device "cpu" + requested unknown  -> "CPU"        (legacy records)
+      device "cpu" + requested auto/cuda-> "CPU (GPU unavailable)"
+      device "cpu (cuda unavailable)"   -> "CPU (GPU unavailable)"
+      other truthy device               -> verbatim (never massaged)
+      device null + requested, queued   -> "<requested> (requested)"
+      device null + requested, running  -> "<requested> — resolving…"
+      both null                         -> None (no display at all)
+
+    Honest-null discipline: an absent fact renders NOTHING (older
+    bridges, non-transcribing jobs, run jobs before the plan resolves)
+    — never a fabricated "CPU" before the fallback actually happened.
+    """
+    if not snapshot:
+        return None
+    tr = snapshot.get("transcription") or {}
+    device = tr.get("device")
+    requested = tr.get("device_requested")
+    if device:
+        if device == "cuda":
+            return "GPU (CUDA)"
+        if device == "cpu (cuda unavailable)":
+            return "CPU (GPU unavailable)"
+        if device == "cpu":
+            return (
+                "CPU"
+                if (requested == "cpu" or not requested)
+                else "CPU (GPU unavailable)"
+            )
+        return str(device)
+    if requested:
+        if snapshot.get("state") == "queued":
+            return f"{requested} (requested)"
+        return f"{requested} — resolving…"
+    return None
+
+
+def _with_device_suffix(label: str, snapshot: dict) -> str:
+    """v0.4.19 (WS3): the transcription-family stage labels (Mode B
+    ``transcribe``/``subs-mux``, Mode A ``subtitles``) carry the
+    RESOLVED device once known — the at-a-glance answer. Pre-resolution
+    and requested-only states never ride the stage label (no ETA/busy
+    key churn on the resolve edge for them; the detail overlay carries
+    the resolving wording).
+    """
+    if (snapshot or {}).get("current_phase") not in (
+        "transcribe",
+        "subtitles",
+        "subs-mux",
+    ):
+        return label
+    tr = (snapshot or {}).get("transcription") or {}
+    if not tr.get("device"):
+        return label
+    display = _device_display(snapshot)
+    if display is None:
+        return label
+    return f"{label} — {display}"
+
+
 def run_stage_label(snapshot: dict | None) -> str:
     """Stage/step classification from the bridge status payload (the
     sibling's _run_stage classifier, ported to dict facts). Names WHAT
@@ -392,14 +458,16 @@ def run_stage_label(snapshot: dict | None) -> str:
         if isinstance(done, (int, float)) and done >= 0:
             if isinstance(total, (int, float)) and total > 0:
                 pct = min(100.0, done * 100.0 / total)
-                return (
+                return _with_device_suffix(
                     f"downloading transcription model — "
                     f"{format_bytes(int(done))} / {format_bytes(int(total))} "
-                    f"({pct:.0f}%)"
+                    f"({pct:.0f}%)",
+                    snapshot,
                 )
-            return (
+            return _with_device_suffix(
                 f"downloading transcription model — "
-                f"{format_bytes(int(done))} (total size unknown)"
+                f"{format_bytes(int(done))} (total size unknown)",
+                snapshot,
             )
     if phase == "probe":
         base = "probe — reading source metadata"
@@ -463,13 +531,15 @@ def run_stage_label(snapshot: dict | None) -> str:
     # §3b: the phase_note suffix — a short human string the engine sets
     # on entering a sub-stage with no measurable denominator.
     note = progress_state.get("phase_note")
+    label: str
     if note:
         if isinstance(note, str) and note.startswith(base):
             # the note already carries the base render (the engine's
             # chunk notes embed the chunk label); render it once.
-            return note
-        return f"{base} ({note})"
-    if step and not (
+            label = note
+        else:
+            label = f"{base} ({note})"
+    elif step and not (
         isinstance(step, str)
         and (
             step.startswith("subtitle")
@@ -480,8 +550,12 @@ def run_stage_label(snapshot: dict | None) -> str:
             or (isinstance(step, str) and step in base)
         )
     ):
-        return f"{base} ({step})"
-    return base
+        label = f"{base} ({step})"
+    else:
+        label = base
+    # v0.4.19 (WS3): the resolved-device suffix for the transcription
+    # family (suffix helper owns the phase/fact gates).
+    return _with_device_suffix(label, snapshot)
 
 
 class MainWindow(QMainWindow):
@@ -2246,6 +2320,12 @@ class MainWindow(QMainWindow):
             "── LIVE ─────────────────────",
             f"Job: {job_id}   State: {state_part}{eta_suffix}",
         ]
+        # v0.4.19 (WS3): the device fact line — the resolved GPU/CPU
+        # truth, the requested pin while resolving/queued, absent when
+        # neither fact exists (older bridges, non-transcribing jobs).
+        device_display = _device_display(snapshot)
+        if device_display is not None:
+            lines.append(f"Device: {device_display}")
         # v0.4.17 (fail-path, the failure-reason surfacing): the
         # payload's own `error` rides the overlay verbatim — the exact
         # string the record/registry carries (e.g. a probe

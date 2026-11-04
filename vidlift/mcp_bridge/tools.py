@@ -455,15 +455,45 @@ def _transcription_echo(record, state, manifest) -> dict:
     this additive reader tolerant of foreign state shapes the payload
     already serves verbatim — a new REQUIRED state attribute would be
     a contract break, not a pass-through.
+
+    v0.4.19 (WS3): the LIVE-first arm — from v0.4.19 the runner
+    publishes the resolved device (+ requested pin) into
+    ``state.progress`` the moment the decision exists
+    (``transcription_device`` / ``transcription_device_requested``), so
+    a RUNNING job answers the honest device from resolution onward
+    instead of staying null until the phase/record closes. Same-process
+    reads use the state_box RunState; cross-process reads use the
+    persisted mirror, trusted only while the record is running (the
+    D-12 dead-writer rule, mirrored from _transcription_model_echo).
+    Older records/runners simply lack the keys — every v0.4.15.3..18
+    behavior below is byte-identical for them.
     """
     echo: dict = {"device": None, "device_requested": None}
+    # v0.4.19 (WS3): live fact read (same-process state, else the
+    # running-only mirror).
+    live_progress: dict = {}
+    if state is not None:
+        live_progress = getattr(state, "progress", None) or {}
+    else:
+        snapshot = getattr(record, "progress_snapshot", None) or {}
+        if getattr(record, "state", None) == "running" and snapshot:
+            live_progress = snapshot.get("progress") or {}
+    live_device = live_progress.get("transcription_device") or None
+    live_requested = (
+        live_progress.get("transcription_device_requested") or None
+    )
     if record.kind == "subs":
         requested = (record.options or {}).get("device")
-        echo["device_requested"] = requested if requested else None
+        echo["device_requested"] = live_requested or (
+            requested if requested else None
+        )
         result = record.result or {}
-        echo["device"] = result.get("device") or None  # "" = D4 honest unknown
+        # live beats result; result's "" stays the D4 honest unknown
+        echo["device"] = live_device or result.get("device") or None
         return echo
-    # run-kind jobs (Mode A)
+    # run-kind jobs (Mode A): live first, then the phase/manifest echo
+    echo["device"] = live_device
+    echo["device_requested"] = live_requested
     subs_block = getattr(state, "subtitles", None) if state is not None else None
     block = None
     if isinstance(subs_block, dict):
@@ -474,7 +504,7 @@ def _transcription_echo(record, state, manifest) -> dict:
         block = manifest["run"]["subtitles"]
     if block:
         tr = block.get("transcription") or {}
-        echo["device"] = tr.get("device") or None
+        echo["device"] = echo["device"] or tr.get("device") or None
     return echo
 
 

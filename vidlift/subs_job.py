@@ -172,6 +172,9 @@ def run_subs_job(
     should_cancel=None,
     download_log=None,
     gpu_lock_factory=None,
+    # v0.4.19 (WS3): forwarded verbatim to the core; absent = the
+    # pre-0.4.19 silent-resolution behavior for direct/library callers.
+    on_device=None,
 ) -> SubsJobResult:
     """One standalone subs job (B1 soft-mux; burn-in is permanently
     off the roadmap — the v0.4.15 strip removed the vestigial
@@ -265,6 +268,7 @@ def run_subs_job(
             on_download_progress=on_download_progress,
             should_cancel=should_cancel,
             download_log=download_log,
+            on_device=on_device,
         )
     finally:
         if lock_acquired:

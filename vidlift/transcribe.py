@@ -2357,6 +2357,12 @@ def transcribe_source_to_srt(
     should_cancel: Callable[[], bool] | None = None,
     download_log: Callable[[str], None] | None = None,
     vad_report: dict | None = None,
+    # v0.4.19 (WS3): resolved-device publication — (device, requested)
+    # fires when the CORE resolves (default factory path; a foreign
+    # factory keeps the D4 honest-unknown rule — the core never saw the
+    # decision) and again as ("cpu", requested) if the fallback wrapper
+    # rescues. Absent = zero behavior change.
+    on_device: Callable[[str, str], None] | None = None,
 ) -> "TranscriptionResult":
     """The core: source audio -> normalized SRT beside ``output_path``.
 
@@ -2378,6 +2384,13 @@ def transcribe_source_to_srt(
     hung native detect/load call remains uninterruptible (no
     Python-level poll can break a native call) — the documented
     boundary (spec §1 WS1-D5).
+
+    v0.4.19 (WS3): ``on_device(device, requested)`` publishes the
+    device decision the moment the core resolves it (and
+    ``("cpu", requested)`` when the fallback wrapper rescues) — absent
+    (None) keeps the pre-0.4.19 silent-resolution behavior for direct
+    callers. Never fires under a foreign engine factory (the D4
+    honest-unknown rule: the core never saw that decision).
     """
     # v0.4.16.2 (ADR-3): VAD preflight — refuse BEFORE any ffmpeg/model
     # work. Skips under the suite-wide engine-off env guard (production
@@ -2423,12 +2436,22 @@ def transcribe_source_to_srt(
             # and the manifest note name it).
             resolved = resolve_transcription_device(device_pin)
             device_field = resolved
+            # v0.4.19 (WS3): publish the resolution the moment the
+            # decision exists — the pre-transcription phase's device is
+            # no longer invisible (the contention-was-silent class).
+            if on_device is not None:
+                on_device(resolved, device_pin)
 
             def _default_on_fallback(note: str) -> None:
                 # the note rides the core's result notes (Mode B honesty;
                 # Mode A's run-side note slot is separate) + stderr is
                 # already handled inside the wrapper factory chain.
                 fallback_notes.append(note)
+                # v0.4.19 (WS3): the fallback wrapper ALWAYS lands on CPU
+                # (the result-device rule at the TranscriptionResult
+                # tail) — the note's existence settles the honest device.
+                if on_device is not None:
+                    on_device("cpu", device_pin)
 
             engine_factory = make_whisper_engine_with_fallback
             engine_kwargs = dict(

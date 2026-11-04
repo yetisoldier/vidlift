@@ -453,6 +453,20 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
         state.progress = progress
         state.touch()
 
+    # v0.4.19 (WS3): the live device publication — the resolved device
+    # and the requested pin land in the SAME progress dict the GUI's
+    # 1 Hz tick, the MCP status tool, the HTTP /status envelope, and
+    # the cross-process mirror already serve verbatim;
+    # _transcription_echo reads these keys live-first for subs records
+    # (no new payload keys; api_version stays 1).
+    def on_device(device: str, requested: str) -> None:
+        progress = dict(state.progress or {})
+        progress["transcription_device"] = device
+        progress["transcription_device_requested"] = requested
+        state.progress = progress
+        state.touch()
+        record.touch()
+
     try:
         from ..run import find_tools
         tools = find_tools(
@@ -491,6 +505,7 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
             # it was merely unpopulated by every caller until now.
             on_download_progress=on_download_progress,
             should_cancel=cancel,
+            on_device=on_device,
         )
     except EngineCancelled as exc:
         return JobOutcome(ok=False, cancelled=True, error=str(exc))

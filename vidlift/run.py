@@ -2649,6 +2649,12 @@ def run_file(
                         # CUDA event that never happened.
                         if transcribe_device != "cpu":
                             transcribe_device = "cpu (cuda unavailable)"
+                        # v0.4.19 (WS3): the fallback settles the honest
+                        # device mid-flight on the SAME live keys.
+                        progress = dict(state.progress or {})
+                        progress["transcription_device"] = transcribe_device
+                        state.progress = progress
+                        state.touch()
                         transcribe_fallback_notes.append(note)
                         log(f"subtitles: {note}")
 
@@ -2663,6 +2669,19 @@ def run_file(
                         transcribe_device = resolve_transcription_device(
                             knobs.get("device") or "auto"
                         )
+                        # v0.4.19 (WS3): publish the resolution to the
+                        # live surface IMMEDIATELY (pre-download,
+                        # pre-construction) — the status echo reads
+                        # these progress keys live-first, so the UI
+                        # answers "which device" from the moment the
+                        # decision exists, not just post-run.
+                        progress = dict(state.progress or {})
+                        progress["transcription_device"] = transcribe_device
+                        progress["transcription_device_requested"] = (
+                            knobs.get("device") or "auto"
+                        )
+                        state.progress = progress
+                        state.touch()
                         # v0.4.16 (model management, ADR-3): Mode A's
                         # publisher — download bytes ride the SAME
                         # progress dict the GUI tick / /status / mirror

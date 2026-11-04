@@ -46,6 +46,20 @@ def engine_on(monkeypatch):
     monkeypatch.delenv("VIDLIFT_TRANSCRIPTION_ENGINE", raising=False)
 
 
+@pytest.fixture
+def qapp():
+    """The house QApplication fixture (the test_v0414_mode_b_gui
+    pattern) — only W3's GUI-overlap test uses it."""
+    import os
+
+    pytest.importorskip("PyQt6")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
 class _CountingEngine(FakeEngine):
     """FakeEngine with call counters + an optional mid-detect flag flip
     (the counter seam the WS1 tests observe; the golden behavior is the
@@ -641,3 +655,311 @@ def test_t10_mapping_pins_engine_cancelled_becomes_cancelled_outcome(
     outcome2 = _execute_run_job(record2, services, CancelFlag())
     assert outcome2.cancelled is True and outcome2.ok is False
     assert "cancelled during transcription" in (outcome2.error or "")
+
+
+# ------------------------------------------------------------------ W3
+def test_t19_core_seam_publishes_resolution_and_fallback(
+    tmp_path, engine_on, monkeypatch
+):
+    """The on_device seam: the core publishes (resolved, requested) the
+    moment ITS resolution exists (default-factory path), and the
+    wrapper-invoking fallback publishes ("cpu", requested); a FOREIGN
+    factory publishes NOTHING (the D4 honest-unknown pin)."""
+    import vidlift.transcribe as transcribe_mod
+    from vidlift.transcribe import transcribe_source_to_srt
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        transcribe_mod,
+        "resolve_transcription_device",
+        lambda requested: "cuda",
+    )
+
+    class _FallbackFiringEngine(FakeEngine):
+        def __init__(self, model_path, **engine_kwargs):
+            super().__init__(model_path)
+            self._on_fallback = engine_kwargs.get("on_fallback")
+
+        def detect_language(self, wav_path, *, offset_seconds=0.0):
+            if self._on_fallback is not None:
+                self._on_fallback(
+                    "CUDA runtime proved hostile; rebuilt on CPU (boom)"
+                )
+            return super().detect_language(
+                wav_path, offset_seconds=offset_seconds
+            )
+
+    monkeypatch.setattr(
+        transcribe_mod, "make_whisper_engine_with_fallback",
+        lambda model_dir, **engine_kwargs: _FallbackFiringEngine(
+            model_dir, **engine_kwargs
+        ),
+    )
+    # (a) default factory path: two publications, in order
+    result = transcribe_source_to_srt(
+        **_core(
+            tmp_path,
+            engine_factory=None,
+            on_device=lambda device, requested: calls.append(
+                (device, requested)
+            ),
+        )
+    )
+    assert calls == [("cuda", "auto"), ("cpu", "auto")]
+    # the result-device rule at the tail: ANY fallback note lands "cpu"
+    # — the publication agrees with the recorded truth
+    assert result.device == "cpu"
+
+    # (b) foreign factory: the core never saw the decision — no calls
+    calls.clear()
+    transcribe_source_to_srt(
+        **_core(tmp_path, on_device=lambda d, r: calls.append((d, r)))
+    )
+    assert calls == []  # D4: no fabricated device under a foreign factory
+
+
+def test_t20_transcription_echo_live_first_arms(tmp_path):
+    """_transcription_echo's NEW arms only (v0.4.16's T1-T6 stay pinned
+    in their own file, untouched): subs live-progress wins over result/
+    options; run-kind live keys served; run-kind live-absent keeps the
+    v0.4.16 subtitles-block arm; the cross-process mirror is trusted
+    ONLY while the record is running (the D-12 dead-writer rule)."""
+    from vidlift.mcp_bridge import BridgeServices
+    from vidlift.mcp_bridge.registry import Registry
+    from vidlift.mcp_bridge.tools import _transcription_echo
+    from vidlift.run import RunState
+
+    registry = Registry(tmp_path / "state")
+    services = BridgeServices(registry=registry, state_dir=tmp_path / "state")
+
+    # (a) subs RUNNING with live progress keys -> live wins
+    rec = registry.enqueue(kind="subs", paths=["/m/a.avi"],
+                           options={"device": "cpu"})
+    registry.transition(rec, "running")
+    rec.result = {"device": "cuda"}  # would win pre-0.4.19 — live beats it
+    live = RunState(file_path="/m/a.avi")
+    live.progress = {"transcription_device": "cpu",
+                     "transcription_device_requested": "auto"}
+    rec.set_live("state_box", {"state": live})
+    echo = _transcription_echo(rec, live, None)
+    assert echo == {"device": "cpu", "device_requested": "auto"}
+
+    # (b) subs TERMINAL, no live -> the v0.4.15.3 result/options arm
+    rec.result = {"device": "cuda"}
+    rec.set_live("state_box", {})
+    registry.transition(rec, "succeeded")
+    echo = _transcription_echo(rec, None, None)
+    assert echo == {"device": "cuda", "device_requested": "cpu"}
+
+    # (c) run-kind live keys -> served verbatim
+    rec_run = registry.enqueue(kind="run", paths=["/m/b.avi"], options={})
+    registry.transition(rec_run, "running")
+    live_run = RunState(file_path="/m/b.avi")
+    live_run.progress = {"transcription_device": "cuda",
+                         "transcription_device_requested": "cuda"}
+    rec_run.set_live("state_box", {"state": live_run})
+    echo = _transcription_echo(rec_run, live_run, None)
+    assert echo == {"device": "cuda", "device_requested": "cuda"}
+
+    # (d) run-kind live-absent + state.subtitles -> the v0.4.16 arm
+    live_run.progress = {}
+    live_run.subtitles = {
+        "status": "carried",
+        "transcription": {"device": "cpu (cuda unavailable)"},
+    }
+    echo = _transcription_echo(rec_run, live_run, None)
+    assert echo == {"device": "cpu (cuda unavailable)",
+                    "device_requested": None}
+
+    # (e) cross-process: mirror trusted only while RUNNING (D-12)
+    rec_mirror = registry.enqueue(kind="subs", paths=["/m/c.avi"],
+                                  options={"device": "auto"})
+    registry.transition(rec_mirror, "running")
+    rec_mirror.progress_snapshot = {
+        "progress": {"transcription_device": "cuda"},
+        "current_phase": "transcribe",
+        "last_activity_at": 1.0,
+    }
+    echo = _transcription_echo(rec_mirror, None, None)  # running (fresh)
+    assert echo == {"device": "cuda", "device_requested": "auto"}
+    registry.transition(rec_mirror, "succeeded")
+    echo = _transcription_echo(rec_mirror, None, None)  # terminal: dead writer
+    assert echo == {"device": None, "device_requested": "auto"}
+
+
+def test_t21_device_display_pure_matrix():
+    """_device_display: every S-10 wording mapping, both-null -> None,
+    and a foreign device string rendered verbatim (never massaged)."""
+    pytest.importorskip("PyQt6")
+    from vidlift.gui import _device_display
+
+    assert _device_display(None) is None
+    assert _device_display({}) is None
+    assert _device_display(
+        {"state": "running", "transcription": {"device": "cuda"}}
+    ) == "GPU (CUDA)"
+    assert _device_display(
+        {"state": "running",
+         "transcription": {"device": "cpu", "device_requested": "cpu"}}
+    ) == "CPU"
+    assert _device_display(
+        {"state": "running",
+         "transcription": {"device": "cpu", "device_requested": None}}
+    ) == "CPU"  # legacy records: requested unknown stays plain CPU
+    assert _device_display(
+        {"state": "running",
+         "transcription": {"device": "cpu", "device_requested": "auto"}}
+    ) == "CPU (GPU unavailable)"
+    assert _device_display(
+        {"state": "running",
+         "transcription": {"device": "cpu", "device_requested": "cuda"}}
+    ) == "CPU (GPU unavailable)"
+    assert _device_display(
+        {"state": "running",
+         "transcription": {"device": "cpu (cuda unavailable)"}}
+    ) == "CPU (GPU unavailable)"
+    assert _device_display(
+        {"state": "running", "transcription": {"device": "tpu-xyz"}}
+    ) == "tpu-xyz"  # foreign string verbatim
+    # requested-only states (the resolving/queued pair)
+    assert _device_display(
+        {"state": "running", "transcription": {"device": None,
+                                               "device_requested": "auto"}}
+    ) == "auto — resolving…"
+    assert _device_display(
+        {"state": "queued", "transcription": {"device": None,
+                                              "device_requested": "cuda"}}
+    ) == "cuda (requested)"
+    assert _device_display(
+        {"state": "running", "transcription": {}}
+    ) is None  # both null: no display at all
+
+
+def test_t22_run_stage_label_device_suffix():
+    """run_stage_label: the resolved-device suffix rides ONLY the
+    transcription-family phases with a RESOLVED fact; requested-only
+    and non-family phases render the v0.4.18 label byte-identically."""
+    pytest.importorskip("PyQt6")
+    from vidlift.gui import run_stage_label
+
+    assert run_stage_label(
+        {"state": "running", "current_phase": "transcribe", "progress": {},
+         "transcription": {"device": "cuda", "device_requested": "auto"}}
+    ) == "transcribing audio — GPU (CUDA)"
+    assert run_stage_label(
+        {"state": "running", "current_phase": "transcribe",
+         "progress": {"segments_done": 12},
+         "transcription": {"device": "cpu", "device_requested": "auto"}}
+    ) == "transcribing audio — 12 segments done — CPU (GPU unavailable)"
+    assert run_stage_label(
+        {"state": "running", "current_phase": "subs-mux", "progress": {},
+         "transcription": {"device": "cuda", "device_requested": "auto"}}
+    ) == "remuxing subtitles (stream copy — no re-encode) — GPU (CUDA)"
+    # non-family phase: NO suffix even with a resolved fact
+    assert run_stage_label(
+        {"state": "running", "current_phase": "encode",
+         "progress": {},
+         "transcription": {"device": "cuda", "device_requested": "auto"}}
+    ) == "encoding"
+    # requested-only while running: NO suffix on the stage label
+    assert run_stage_label(
+        {"state": "running", "current_phase": "transcribe", "progress": {},
+         "transcription": {"device": None, "device_requested": "auto"}}
+    ) == "transcribing audio"
+    # no transcription key at all: byte-identical v0.4.18 label
+    assert run_stage_label(
+        {"state": "running", "current_phase": "transcribe", "progress": {}}
+    ) == "transcribing audio"
+    # the download arm gains the suffix when the device is known
+    assert run_stage_label(
+        {"state": "running", "current_phase": "transcribe",
+         "progress": {"model_download": {"bytes_done": 2048,
+                                         "bytes_total": 4096}},
+         "transcription": {"device": "cpu", "device_requested": "auto"}}
+    ) == (
+        "downloading transcription model — 0.00 GB / 0.00 GB (50%) — CPU"
+        " (GPU unavailable)"
+    )
+
+
+def test_t23_gui_overlay_device_line(qapp, monkeypatch, tmp_path):
+    """The LIVE detail overlay's Device line: a running subs snapshot
+    with an echo shows 'Device: GPU (CUDA)'; a queued snapshot with
+    requested-only shows 'Device: auto (requested)'; no echo adds NO
+    Device line at all (honest-null discipline)."""
+    pytest.importorskip("PyQt6")
+    from test_v0414_mode_b_gui import _ScriptedClient, _window
+
+    path = tmp_path / "gpu-ep.mkv"
+    path.write_bytes(b"x")
+    client = _ScriptedClient()
+    client.make_job(
+        str(path),
+        [
+            {"state": "running", "current_phase": "transcribe",
+             "progress": {},
+             "transcription": {"device": "cuda", "device_requested": "auto"}},
+        ],
+        kind="subs",
+    )
+
+    import vidlift.gui as gui_mod
+
+    monkeypatch.setattr(
+        gui_mod.QFileDialog, "getOpenFileNames",
+        staticmethod(lambda *a, **k: ([str(path)], "")),
+    )
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.add_subs_button.click()
+    assert win._batch_row_for_job == {"VJ1": 0}
+    win._render_detail_for_row(0)
+    details = win.details.toPlainText()
+    assert "Device: GPU (CUDA)" in details
+
+    # requested-only + queued: the resolving-invisible case, honestly
+    # labeled — never a bare "CPU"
+    client2 = _ScriptedClient()
+    path2 = tmp_path / "queued-ep.mkv"
+    path2.write_bytes(b"x")
+    client2.make_job(
+        str(path2),
+        [
+            {"state": "queued", "current_phase": "probe",
+             "transcription": {"device": None,
+                               "device_requested": "auto"}},
+        ],
+        kind="subs",
+    )
+    monkeypatch.setattr(
+        gui_mod.QFileDialog, "getOpenFileNames",
+        staticmethod(lambda *a, **k: ([str(path2)], "")),
+    )
+    gen2 = _window(qapp, monkeypatch, tmp_path, client2)
+    win2 = next(gen2)
+    win2.add_subs_button.click()
+    win2._render_detail_for_row(0)
+    assert "Device: auto (requested)" in win2.details.toPlainText()
+
+    # no echo: no Device line at all
+    client3 = _ScriptedClient()
+    path3 = tmp_path / "noecho-ep.mkv"
+    path3.write_bytes(b"x")
+    client3.make_job(
+        str(path3),
+        [{"state": "running", "current_phase": "transcribe",
+          "progress": {}}],
+        kind="subs",
+    )
+    monkeypatch.setattr(
+        gui_mod.QFileDialog, "getOpenFileNames",
+        staticmethod(lambda *a, **k: ([str(path3)], "")),
+    )
+    gen3 = _window(qapp, monkeypatch, tmp_path, client3)
+    win3 = next(gen3)
+    win3.add_subs_button.click()
+    win3._render_detail_for_row(0)
+    assert "Device:" not in win3.details.toPlainText()
+    next(gen, None)
+    next(gen2, None)
+    next(gen3, None)
