@@ -20,6 +20,8 @@ Bob spec §12 file B. Contracts:
          EngineCancelled, scratch retained
     22 replace ON → scratch (named off the PRE-rename output) removed
     23 rmtree OSError → success stands, S-16 warning note, dir remains
+    24 stale-default scratch + custom workdir → survives, [] returned
+         (F-1)
 
 Conventions: fakes only — no ffmpeg/ffprobe/network/GPU. Import the
 house fakes from test_v0414_subs_job (FakeEngine / FakeRunner /
@@ -343,6 +345,47 @@ def test_23_cleanup_rmtree_failure_keeps_success(tmp_path, engine_on,
         and "movie.subs.mp4.subs-work" in note
         for note in result.notes
     )
+
+
+def test_24_stale_default_scratch_survives_custom_workdir(
+    tmp_path, engine_on
+):
+    """Karen F-1 (v0.4.18 validation): the mutation-3b hole, now pinned.
+    A STALE default-named {output}.subs-work (retained from a PRIOR
+    failed run, per the failure-retention rule) must survive the
+    CURRENT successful run's cleanup when that run used a
+    caller-supplied workdir — the path guard compares the CURRENT
+    workdir against the default-derived name, and they legitimately
+    differ. Without the guard, a success would silently rmtree the
+    prior run's retained diagnostic scratch."""
+    from vidlift.subs_job import cleanup_subs_scratch
+
+    stale = tmp_path / "movie.subs.mp4.subs-work"
+    stale.mkdir()
+    (stale / "prior-run-diagnostics.txt").write_text("retained")
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    runner = FakeRunner(_probe_payload())
+    result = run_subs_job(
+        _media(tmp_path),
+        probe_runner=runner,
+        runner=runner,
+        workdir=str(mine),
+        **_job(),
+    )
+    # the stale dir is NOT this run's scratch — a SUCCESS must not
+    # delete it, and no cleanup note may be claimed for it.
+    assert (stale / "prior-run-diagnostics.txt").read_text() == "retained"
+    assert not any(
+        "cleanup subs scratch" in note for note in result.notes
+    )
+    # the helper agrees at the direct-call level: the path guard
+    # returns [] (nothing removed) for the custom-workdir pair.
+    assert (
+        cleanup_subs_scratch(str(tmp_path / "movie.subs.mp4"), str(mine))
+        == []
+    )
+    assert stale.is_dir()
 
 # ---------------------------------------------------------------- group 6
 # (M3 plumbing: schemas/tools/executor/client_local/argparse forward the

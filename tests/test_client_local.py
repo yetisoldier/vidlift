@@ -121,6 +121,37 @@ def test_client_local_rejects_missing_paths_and_oversized_batches(
         client.stop()
 
 
+def test_client_local_hundred_file_subs_batch_enqueues(tmp_path, monkeypatch):
+    """Karen F-7 (v0.4.18 validation): the flagship 64→500 acceptance —
+    'a 100-file Mode B folder add enqueues' — pinned against the REAL
+    registry/executor client (the symbolic MAX_GUI_BATCH + 1 cap test
+    alone never proved the in-range case): 100 records land, in
+    submission order, one subs job per path, no BatchTooLarge, and the
+    persisted registry file agrees."""
+    monkeypatch.delenv("VIDLIFT_STATE_DIR", raising=False)
+    files = []
+    for i in range(100):
+        path = tmp_path / f"ep{i:03d}.avi"
+        path.write_text("")
+        files.append(str(path))
+    client = LocalBridgeClient(state_dir=tmp_path, start_executor=False)
+    try:
+        job_ids = client.enqueue_subs(files)
+        assert len(job_ids) == 100
+        queued = client.registry.queued()
+        assert len(queued) == 100
+        assert [record.paths[0] for record in queued] == files
+        for record in queued:
+            assert record.kind == "subs"
+            assert record.options["device"] == "auto"
+            assert record.options["force"] is False
+        data = json.loads((tmp_path / "jobs.json").read_text())
+        saved = [row for row in data["jobs"] if row["kind"] == "subs"]
+        assert len(saved) == 100
+    finally:
+        client.stop()
+
+
 def test_client_local_status_snapshot_is_bridge_status_payload(
     tmp_path, monkeypatch
 ):

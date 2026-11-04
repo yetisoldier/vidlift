@@ -38,6 +38,11 @@ pipeline) ends with the details body, live overlay, and bars reflecting
 the /history rows and the bridge status already serve. The v0.4.16.0
 cancel fix is preserved (it owns the registry/executor truth; this fix
 only repairs GUI read-path consumption of the same snapshots).
+
+v0.4.19 (D-2, Bob's decision): the client double is the HOUSE harness
+(``test_v0414_mode_b_gui``'s ``_ScriptedClient``/``_window``), not a
+per-file copy — the v0.4.18 ``suppress_srt`` ripple was the drift this
+rule exists to kill.
 """
 
 from __future__ import annotations
@@ -239,6 +244,11 @@ from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from vidlift.gui import MainWindow  # noqa: E402
 
+from test_v0414_mode_b_gui import (  # noqa: E402  (D-2: house harness)
+    _ScriptedClient,
+    _window,
+)
+
 
 _PROBE_ERROR = "probe command failed (exit 1): ffprobe: Permission denied"
 
@@ -247,144 +257,6 @@ _PROBE_ERROR = "probe command failed (exit 1): ffprobe: Permission denied"
 def qapp():
     app = QApplication.instance() or QApplication([])
     yield app
-
-
-_alive: list = []
-
-
-class _ScriptedClient:
-    """The GUI's bridge seam with a scripted snapshot sequence per job
-    id (the established v0.4.13/14 boundary harness; the subs enqueue
-    surface included). status_snapshot clamps at the sequence end, so a
-    terminal record stays terminal for every later read — the same
-    behavior a real registry view has after its record closes."""
-
-    def __init__(self):
-        self.sequences: dict[str, list] = {}
-        self.cursor: dict[str, int] = {}
-        self.jobs: dict[str, dict] = {}
-        self.armed = False
-        self.submitted: list[str] = []
-        self.counter = 0
-        self.subs_kinds: dict[str, str] = {}
-
-    def make_job(self, file_path, script: list[dict], kind="subs") -> str:
-        self.counter += 1
-        job_id = f"VJ{self.counter}"
-        self.jobs[job_id] = {"file_path": file_path}
-        self.sequences[job_id] = [{"job_id": job_id, **snap} for snap in script]
-        self.cursor[job_id] = 0
-        self.subs_kinds[job_id] = kind
-        return job_id
-
-    def active_job_count(self):
-        if not self.armed:
-            return 0
-        active = 0
-        for job_id in self.submitted:
-            seq = self.sequences[job_id]
-            current = seq[min(self.cursor[job_id], len(seq) - 1)] if seq else None
-            if current is None or current.get("state") not in (
-                "succeeded", "failed", "cancelled",
-            ):
-                active += 1
-        return active
-
-    def _submit(self, paths, kind):
-        for path in paths:
-            if not Path(path).is_file():
-                raise FileNotFoundError(f"no such file on this machine: {path}")
-        self.armed = True
-        fresh = [jid for jid in self.jobs if jid not in self.submitted]
-        chosen = fresh[: len(paths)]
-        if len(chosen) != len(paths):
-            raise AssertionError(f"scripted {kind} ids exhausted")
-        self.submitted.extend(chosen)
-        return list(chosen)
-
-    def enqueue_run(self, paths, options=None, engine="auto"):
-        """The Mode A surface (the client contract the GUI start path
-        calls; the scripted ids are kind-blind)."""
-        return self._submit(paths, "run")
-
-    def enqueue_subs(
-        self, paths, *, replace_source=False, suppress_srt=False
-    ):
-        # v0.4.17: the GUI threads the replace-source state; the default
-        # keeps this scripted surface's existing shape intact.
-        # v0.4.18 (5-E6 ripple, the §12 File F harness pattern): the GUI's
-        # enqueue now also threads the suppress_srt checkbox state; the
-        # defaulted kw keeps this duplicate double's shape intact too.
-        return self._submit(paths, "subs")
-
-    def status_snapshot(self, job_id):
-        seq = self.sequences.get(job_id) or []
-        curs = self.cursor.get(job_id, 0)
-        if seq:
-            return dict(seq[min(curs, len(seq) - 1)])
-        return None
-
-    def enqueue_snapshots(self, job_ids):
-        ticks = []
-        for job_id in job_ids:
-            ticks.append(self.status_snapshot(job_id))
-            if self.cursor.get(job_id, 0) < len(
-                self.sequences.get(job_id, [])
-            ):
-                self.cursor[job_id] += 1
-        return ticks
-
-    def cancel_batch(self, job_ids):
-        for job_id in job_ids:
-            seq = self.sequences.get(job_id)
-            if not seq:
-                continue
-            current = seq[min(self.cursor[job_id], len(seq) - 1)]
-            if (current.get("state") or "queued") in (
-                "succeeded", "failed", "cancelled",
-            ):
-                continue
-            self.sequences[job_id] = self.sequences[job_id][: self.cursor[job_id]] + [
-                {"job_id": job_id, "state": "cancelled", "current_phase": "done"}
-            ]
-        return {job_id: "cancelled" for job_id in job_ids}
-
-    def history(self, limit=20):
-        return []
-
-    def cancel(self, job_id):
-        return "cancelled"
-
-    def stop(self, **kwargs):
-        pass
-
-
-def _window(qapp, monkeypatch, tmp_path, client):
-    import PyQt6.QtCore as QtCore
-
-    def _settings(self):
-        return QtCore.QSettings(
-            str(tmp_path / "settings.ini"), QtCore.QSettings.Format.IniFormat
-        )
-
-    monkeypatch.setattr(MainWindow, "_settings", _settings)
-    monkeypatch.setattr(
-        QMessageBox, "information", staticmethod(lambda *a, **k: 1)
-    )
-    monkeypatch.setattr(
-        QMessageBox, "question", staticmethod(
-            lambda *a, **k: QMessageBox.StandardButton.Yes
-        )
-    )
-    _alive.append(MainWindow(client=client))
-    win = _alive[-1]
-    yield win
-    win.job_ids = []
-    win._run_started_at = None
-    win.deleteLater()
-    qapp.processEvents()
-    _alive.clear()
-    qapp.processEvents()
 
 
 def _report(name):
