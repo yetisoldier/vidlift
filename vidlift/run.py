@@ -2720,6 +2720,10 @@ def run_file(
                             # wait gets the same visible labeling (its
                             # signature matches the callback contract).
                             on_lock_wait=_transcribe_wait_label,
+                            # v0.4.19 (WS1, HIGH): Mode A's own
+                            # pre-resolve observes the run's cancel flag
+                            # too (download beats + entry/return).
+                            should_cancel=cancel,
                         )
                         # Clear the fact the moment resolve returns — the
                         # next record_step re-merges progress without it,

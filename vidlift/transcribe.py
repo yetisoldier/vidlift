@@ -1282,6 +1282,7 @@ def resolve_model_dir(
     fetch=None,
     on_download_progress: Callable[[int, int | None], None] | None = None,
     on_lock_wait: Callable[[int | None, float], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> str:
     """Resolve the transcription engine model: explicit pin (a user
     model PATH or a known tag) -> the machine-shared cache.
@@ -1309,7 +1310,27 @@ def resolve_model_dir(
     holder_pid_or_None, waited_seconds)`` mirrors the GPU lock's wait
     label, and an unwritable cache dir degrades OPEN (no lock, sha256
     still gates completion).
+
+    v0.4.19 (WS1, HIGH): ``should_cancel`` arms the resolution window —
+    an entry observe (before even the env refusal; a cancel is control
+    flow, never an engine-error) and, when a progress channel exists,
+    a per-beat observe inside the first-run download
+    (``EngineCancelled`` propagates: the default fetcher's BaseException
+    arm removes only the ``.tmp`` staging, the ``.part`` resume staging
+    is untouched, and the download lock's ``with`` releases). The
+    v0.4.16 conditional-arity discipline holds: with an injected legacy
+    2-arg ``fetch`` and no caller progress callback there is no beat to
+    arm, and the call keeps its byte-identical shape (entry/return
+    observes only).
     """
+    # v0.4.19 (WS1, HIGH): the entry observe — a cancel flipped before
+    # (or while waiting to enter) the cache fast-path closes cancelled,
+    # never sits at "running" until the next segment beat that may take
+    # minutes to exist.
+    if should_cancel is not None and should_cancel():
+        from .run import EngineCancelled  # lazy: cancels surface
+
+        raise EngineCancelled("cancelled during model resolution")
     if _engine_disabled_by_env():
         raise TranscriptionError(
             "transcription engine disabled by env "
@@ -1358,6 +1379,18 @@ def resolve_model_dir(
         progress = _lock_heartbeat(on_download_progress, lock_path)
     else:
         progress = None
+    # v0.4.19 (WS1, HIGH): the download's own beats observe the cancel —
+    # a multi-minute first-run fetch is itself a pre-transcription
+    # window (WS1-D3: only where a beat channel exists).
+    if should_cancel is not None and progress is not None:
+        base_progress = progress
+
+        def progress(done: int, total: int | None) -> None:  # noqa: F811
+            if should_cancel():
+                from .run import EngineCancelled  # lazy: cancels surface
+
+                raise EngineCancelled("cancelled during model download")
+            base_progress(done, total)
     with _model_download_lock(target, on_wait=on_lock_wait):
         # Second-acquirer fast path (ADR-5): re-run the contract check
         # AFTER acquiring — the winning racer may have completed while
@@ -2335,6 +2368,16 @@ def transcribe_source_to_srt(
     rebuilds, and the normalized cues are written to the KEEP sidecar
     path. Raise TranscriptionError on any failure; callers decide the
     disposition (Mode A fail-open, Mode B job failure).
+
+    v0.4.19 (WS1, HIGH): the pre-transcription steps observe the
+    ``should_cancel`` flag — a cancel between the audio extraction and
+    the first segment raises EngineCancelled at model resolution (core
+    and download), engine load, and the language-detection edges, in
+    BOTH modes (the shared core; Mode B forwards its flag, Mode A's
+    run-side pre-resolve passes its own). A cancel observed INSIDE a
+    hung native detect/load call remains uninterruptible (no
+    Python-level poll can break a native call) — the documented
+    boundary (spec §1 WS1-D5).
     """
     # v0.4.16.2 (ADR-3): VAD preflight — refuse BEFORE any ffmpeg/model
     # work. Skips under the suite-wide engine-off env guard (production
@@ -2395,7 +2438,21 @@ def transcribe_source_to_srt(
                 vad_on=vad_on,
                 on_fallback=_default_on_fallback,
             )
+        # v0.4.19 (WS1, HIGH): the pre-transcription cancel observes —
+        # the wedge class Eric hit (a job parked at transcribe-resolve /
+        # transcribe-language read the flag NOWHERE until the first
+        # segment callback). One closure, five sites; the lazy import
+        # mirrors _on_segment's observer (which stays verbatim — the
+        # hot loop is not churned). A cancel observed inside a hung
+        # NATIVE detect/load call remains uninterruptible by
+        # construction (documented boundary, spec §1 WS1-D5).
+        def _cancel_observe(message: str) -> None:
+            if should_cancel is not None and should_cancel():
+                from .run import EngineCancelled  # lazy: cancels surface
+
+                raise EngineCancelled(message)
         on_step and on_step("transcribe-resolve")
+        _cancel_observe("cancelled during model resolution")
         # v0.4.16 (model management, ADR-3): the previously decorative
         # on_download_progress parameter becomes load-bearing — the
         # download's chunk beats now reach the caller (Mode B's
@@ -2404,21 +2461,27 @@ def transcribe_source_to_srt(
             model_pin,
             state_root=state_root,
             on_download_progress=on_download_progress,
+            # v0.4.19 (WS1): the resolution/download window observes the
+            # flag itself (entry + armed beats).
+            should_cancel=should_cancel,
         )
         engine = (
             engine_factory(model_dir, **engine_kwargs)
             if engine_kwargs is not None
             else engine_factory(model_dir)
         )
+        _cancel_observe("cancelled during model load")
         if on_download_progress is not None and download_log is not None:
             download_log(
                 f"transcription model resolved: {model_dir}"
             )
         # -- language ----
         on_step and on_step("transcribe-language")
+        _cancel_observe("cancelled before language detection")
         language, guess, warnings = detect_language(
             engine, wav_path, pin=language_pin
         )
+        _cancel_observe("cancelled during language detection")
         lang_confidence = guess.confidence if guess else None
         # -- transcribe (VAD + word timestamps inside the engine) ----
         on_step and on_step("transcribe-run")
