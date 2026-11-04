@@ -4,6 +4,10 @@
 **Source:** Eric, live install of v0.4.17.0 on Windows.
 **Severity:** cosmetic — NOT blocking; fold into the next build/release.
 
+**RESOLVED in v0.4.18.0** — the `margin-top: 14px → 20px` fix shipped and Eric confirmed the
+title position "looks good" on the real Windows build (2026-11-04). The D12 tuning band
+(4-7 px clearance) was satisfied at the committed 20 px; no ±2 px adjustment was needed.
+
 ## Observation
 
 On the real Windows build (Segoe UI), the two panel titles — **"Upscale"** and
