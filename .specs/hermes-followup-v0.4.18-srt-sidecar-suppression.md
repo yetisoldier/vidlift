@@ -19,8 +19,14 @@ An opt-in "suppress `.srt` sidecar" switch on all three surfaces (GUI checkbox +
 MCP option), consistent with the `replace_source` precedent (absent-defaults everywhere,
 `api_version` unchanged).
 
-- Applies to **Mode B** (Add Subtitles) and, for symmetry, **Mode A** transcription
-  (`transcribe_subs` writes a sidecar too).
+- Applies to **BOTH modes** — the sidecar is written and kept in both:
+  - **Mode B** (Add Subtitles): the `{stem}.subs.srt` sidecar (renamed `{stem}.srt` on replace).
+  - **Mode A** (upscale): the `.srt` sidecar written beside the output by EVERY subtitle branch —
+    transcription (`source="transcribed"`), bitmap OCR, and the adopted-sidecar copy. Mode A
+    currently KEEPS this sidecar **deliberately** (the v0.4.15 "KEEP disposition",
+    `run.py:2802-2816`; `cleanup_run_artifacts` explicitly leaves `.srt` files beside the output,
+    `run.py:1127`). So suppression must reach **all** of Mode A's subtitle branches, not just
+    `transcribe_subs`.
 - Interaction with **replace-source**: when sidecar suppression is ON, there is no sidecar
   to rename on a replace — the replace helper's sidecar step becomes a no-op. Confirm the
   ordering/guard handles this cleanly.
