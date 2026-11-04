@@ -215,6 +215,7 @@ In the main window, you can toggle **Enable subtitle OCR**. When enabled, VidLif
 | Output size is too large | High bitrate setting | Check the "Plan" screen; try a different engine if available. |
 | A run appears stuck on "running" after it failed | Stale UI state (pre-v0.4.16.1) | Update to v0.4.16.1; failures now settle correctly on all surfaces and report the reason. |
 | Transcription fails immediately on a fresh install | Missing VAD assets (v0.4.16.1) | Update to v0.4.16.2. If the issue persists, run `vidlift-cli --selftest` to verify the install. |
+| "Resume retained work" is missing or unclickable | Layout overlap (pre-v0.4.17) | Update to v0.4.17.0; a layout overlap that hid the checkbox has been fixed. |
 
 ### Transcription Asset Failure
 If you are using v0.4.16.1, transcription will fail because the required Silero VAD model was not bundled. Update to v0.4.16.2 to resolve this.

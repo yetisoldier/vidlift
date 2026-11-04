@@ -17,7 +17,9 @@ A muted helper line above the controls names the canonical order:
 > 1. Add files → 2. Plan → 3. Start. Planning never writes to disk.
 
 ### Controls
+The settings surface is divided into two titled groups: **Upscale** and **Add subtitles (no upscale)**. Each group shows only the controls that the respective mode consumes.
 
+**Upscale Group**
 - **Add Files:** select one or more videos.
 - **Add Folder:** add supported videos directly inside one folder.
 - **Clear:** remove the current list.
@@ -32,13 +34,22 @@ A muted helper line above the controls names the canonical order:
   The choice persists across launches; it is fixed while a batch runs
   (cancel to change it).
 - **Enable subtitle OCR:** convert selected bitmap PGS/VobSub subtitles to text. Turning this off does not disable ordinary text-subtitle pass-through.
+- **Transcribe missing subtitles:** (Default: ON) If no subtitle track is found, VidLift will attempt to generate one from the audio using a local AI model (~1.5 GB).
+- **Replace original on success:** (Upscale only) After a verified upscale, delete the source and rename the output to the source's name.
+- **Resume retained work:** If a previous run was interrupted, this allows VidLift to pick up from the last verified chunk.
 - **Plan Batch:** probe and classify every listed file.
 - **Start Upscale:** enqueue every ready item as a tracked job.
 - **Cancel Current:** stop the running job safely through the same
   cancel path an MCP agent uses; it can take a few seconds while the
   engine exits cleanly.
 
+**Add subtitles (no upscale) Group**
+- **Add Subtitles…:** Add videos to be processed for subtitles only (no AI upscale).
+- **Replace original on success (deletes source):** After a successful subtitles pass, delete the original file and rename the output to the original name with an `.mp4` extension (e.g. `movie.avi` → `movie.mp4`). If a file of that name already exists, both files are kept.
+- **Scope:** This mode adds subtitles from the file's own audio — video streams are copied without re-encoding or upscaling.
+
 Files can also be dragged into the window.
+
 
 ## Planned batch
 

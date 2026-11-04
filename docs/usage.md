@@ -65,10 +65,12 @@ Select **Output Folder** if every planned MP4 should go to one destination.
 Leave it empty to place each output beside its source.
 
 ### Run the pre-flight plan
-
 Choose whether **Enable subtitle OCR** should remain on, then select **Plan Batch**.
 
+If you are using the **Add subtitles (no upscale)** mode, you can also choose whether to **Replace original on success**. When enabled, VidLift deletes the source file and renames the output to the source's name with an `.mp4` extension after a successful pass.
+
 ![VidLift planned batch](images/vidlift-planned-batch.png)
+
 
 The table reports:
 
