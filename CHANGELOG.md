@@ -28,9 +28,9 @@ All notable changes to VidLift. Dates are America/Chicago.
   (mux failure, OCR/transcription fail-open), the sidecar that was written is
   KEPT as the fallback no matter how the option is set. In the embedded-text
   branch the post-encode extract is skipped entirely (the track already rode
-  the encode as mov_text). The manifest/run blocks carry
-  `sidecar_subtitles`-style honesty (`sidecar_suppressed: true` XOR
-  `sidecar_path`), and the result's `srt_path` becomes `""` (the
+  the encode as mov_text). The manifest/run blocks carry honest
+  `sidecar_suppressed: true` XOR `sidecar_path` bookkeeping, and the
+  result's `srt_path` becomes `""` (the
   deliberately-suppressed sentinel) so it never claims a removed file.
 - **Mode B scratch cleanup (success-only).** After a successful subs job the
   `{output}.subs-work` scratch directory is removed (the K-5 leak's fix —
@@ -44,8 +44,9 @@ All notable changes to VidLift. Dates are America/Chicago.
   "Suppress .srt sidecar on success" beside "Add Subtitles…" and the
   replace-original checkbox (the exhaustiveness pin now asserts the five).
 - **QGroupBox titles float slightly higher** off the border line
-  (`margin-top: 14px → 20px`; the title rule itself is unchanged). Verified
-  visually on the Windows build; Linux offscreen cannot reproduce the metric.
+  (`margin-top: 14px → 20px`; the title rule itself is unchanged). Pending
+  visual verification on the Windows build (D12 band: ±2 px steps, 4–7 px
+  clearance); Linux offscreen cannot reproduce the metric.
 
 ### Notes
 
