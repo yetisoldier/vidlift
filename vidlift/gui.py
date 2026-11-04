@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -640,9 +641,15 @@ class MainWindow(QMainWindow):
         # source's own audio when no subtitle track exists. The honest
         # tooltip says the cost; QSettings-persisted like every other
         # GUI preference.
-        self.transcribe_subs = QCheckBox(
-            "Add subtitles by transcription when none exist"
-        )
+        # v0.4.17 workstream-2 (Hermes Finding 1): this checkbox was
+        # created v0.4.14 but never added to a layout — invisible and
+        # unclickable ever since (tests drove it only via setChecked).
+        # It is RENDERED by v0.4.17 workstream-2 at the upscale grid
+        # (3,3,1,3); the label is shortened to the verb-first sibling
+        # pattern ("Enable subtitle OCR") because the full semantics
+        # live verbatim in the tooltip below (no-track condition,
+        # 1.5 GB model, minutes-per-file cost, sync-from-own-audio).
+        self.transcribe_subs = QCheckBox("Transcribe missing subtitles")
         self.transcribe_subs.setChecked(
             self._settings().value(
                 "transcribe_subs", True, type=bool
@@ -755,14 +762,20 @@ class MainWindow(QMainWindow):
             "once."
         )
         self.add_subs_button.clicked.connect(self.choose_subs_files)
-        # v0.4.17 (opt-in Mode B replace-source, D4-1): the checkbox sits
-        # at grid (2, 8) immediately right of "Add Subtitles…" (2, 7) —
-        # co-located so the scope is visually unambiguous — QSettings-
-        # persisted under its own key ("subs_replace_source", no collision
-        # with Mode A's "replace_source"), default OFF, persisted from its
-        # toggled signal exactly like _replace_source_changed.
+        # v0.4.17 workstream-2 (opt-in Mode B replace-source, D4-1):
+        # the checkbox lives IN the Mode B group's own grid at (0, 1),
+        # immediately right of "Add Subtitles…" (0, 0) — co-located so
+        # the scope is visually unambiguous (D4-1) — QSettings-
+        # persisted under its own key ("subs_replace_source", no
+        # collision with Mode A's "replace_source"), default OFF,
+        # persisted from its toggled signal exactly like
+        # _replace_source_changed. Workstream-2 (Karen K-1) shortens
+        # the label from the 352px original — at (2, 8) in the shared
+        # grid its hint taxed column 8 and pushed the window minimum
+        # width 1290 -> 1532 — to the Mode A-parity verb-first label;
+        # the tooltip (workstream-1 §6.3) stays verbatim.
         self.subs_replace_source = QCheckBox(
-            "Replace original after adding subtitles (deletes the source)"
+            "Replace original on success (deletes source)"
         )
         self.subs_replace_source.setChecked(
             self._settings().value("subs_replace_source", False, type=bool)
@@ -1307,10 +1320,17 @@ class MainWindow(QMainWindow):
         helper.setWordWrap(True)
         layout.addWidget(helper)
 
-        controls = QFrame()
-        controls.setObjectName("Controls")
-        grid = QGridLayout(controls)
-        grid.setContentsMargins(18, 16, 18, 16)
+        # ---- v0.4.17 workstream-2 (Hermes findings 1/2, Karen K-1/K-2):
+        # the settings surface splits into TWO titled groups so each mode
+        # shows only its own controls. The separation is LAYOUT-STRUCTURAL —
+        # two independent grids, two independent column budgets — so no
+        # Mode B control can ever inflate the upscale grid's width again
+        # (K-1: the 352px checkbox at shared-grid (2,8) pushed the window
+        # minimum width 1290 -> 1532).
+        controls_upscale = QGroupBox("Upscale")
+        controls_upscale.setObjectName("Controls")
+        grid = QGridLayout(controls_upscale)
+        grid.setContentsMargins(18, 8, 18, 16)
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(10)
         add = QPushButton("Add Files")
@@ -1340,41 +1360,55 @@ class MainWindow(QMainWindow):
         # column 7, where cancel_button sits; the checkbox label clipped
         # under the Cancel button.
         grid.addWidget(self.replace_source, 1, 5, 1, 2)
-        # v0.4.9 (design §1.4): the resume checkbox rides row 2 beside
-        # the profile combo (row 1 is full; the monitor span below
-        # already narrowed for exactly this reason).
-        grid.addWidget(self.resume_claim, 2, 1, 1, 2)
-        # v0.4.8 (design D5): the profile combo lands on row 2 (the only
-        # row 1 cells left are behind cancel_button at (1, 7)), so the
-        # monitor span narrows 7 -> 5 columns to free (2, 5)/(2, 6).
-        grid.addWidget(QLabel("Upscale profile"), 2, 5)
-        grid.addWidget(self.profile_combo, 2, 6)
-        grid.addWidget(self.monitor_check, 2, 0, 1, 5)
-        self.monitor_check.toggled.connect(self._toggle_monitor)
         grid.addWidget(self.cancel_button, 1, 7)
         # v0.4.13 (design §4.1): Cancel Batch lands immediately right of
-        # Cancel Current — column 8, row 1, was free (Start owns (0, 8)).
+        # Cancel Current.
         grid.addWidget(self.cancel_batch_button, 1, 8)
-        # v0.4.14 (Mode B): "Add Subtitles…" lands on row 2, column 7 —
-        # the only free option-row cell (row 2 holds the monitor span
-        # (0,5) over the resume checkbox (1,2) overlap, profile label
-        # (2,5)/combo (2,6); (2,7) and (2,8) are the only untouched
-        # cells). Row 2 reads as the options/actions row tail, directly
-        # below the Cancel cluster's column.
-        grid.addWidget(self.add_subs_button, 2, 7)
-        # v0.4.17 (Mode B replace-source): the checkbox lands at (2, 8) —
-        # the Mode B action row's last free cell, immediately right of
-        # the Add Subtitles button; scope co-location (D4-1).
-        grid.addWidget(self.subs_replace_source, 2, 8)
-        # v0.4.15 (opt-in denoise): the three-state combo rides a new
-        # options row (rows 0-2 are full) directly under the profile
-        # combo, keeping the options/actions rows reading top-down as
-        # one settings block. The label names the WHEN (before the
-        # upscale); the tooltip carries the full guidance verbatim.
+        # v0.4.17 workstream-2: row 2 de-overlapped. The monitor span
+        # narrows 5 -> 4 (its 419px hint still fits the 477px four-column
+        # budget), and resume_claim moves from the invisible overlap at
+        # (2,1,1,2) — painted over by the later-created monitor (Qt stacks
+        # by CREATION order; measured 0/7314 painted pixels, the Finding-1
+        # twin) — to the row's free tail the Mode B controls vacated.
+        grid.addWidget(self.monitor_check, 2, 0, 1, 4)
+        self.monitor_check.toggled.connect(self._toggle_monitor)
+        # v0.4.8 (design D5): the profile combo rides row 2.
+        grid.addWidget(QLabel("Upscale profile"), 2, 5)
+        grid.addWidget(self.profile_combo, 2, 6)
+        grid.addWidget(self.resume_claim, 2, 7, 1, 2)
+        # v0.4.15 (opt-in denoise) row 3 — the Mode A processing-options
+        # row. v0.4.17 (Hermes Finding 1): the transcription toggle is
+        # RENDERED for the first time since v0.4.14 (created at :643 but
+        # never added to a layout); the (3,3,1,3) span's 271px column
+        # budget takes its 184px label at zero width cost.
         grid.addWidget(QLabel(DENOISE_COMBO_LABEL), 3, 1)
         grid.addWidget(self.denoise_combo, 3, 2)
+        grid.addWidget(self.transcribe_subs, 3, 3, 1, 3)
         grid.setColumnStretch(6, 1)
-        layout.addWidget(controls)
+        layout.addWidget(controls_upscale)
+
+        # ---- Mode B surface (v0.4.17 workstream-2): its own group, its
+        # own column budget, only its own controls (Hermes Finding 2). The
+        # explainer states SCOPE only; the naming rule, keep-both promise,
+        # and replace semantics live in the two tooltips (one derivation,
+        # no drift surface).
+        controls_subs = QGroupBox("Add subtitles (no upscale)")
+        controls_subs.setObjectName("Controls")
+        subs_grid = QGridLayout(controls_subs)
+        subs_grid.setContentsMargins(18, 8, 18, 12)
+        subs_grid.setHorizontalSpacing(12)
+        subs_grid.setVerticalSpacing(10)
+        subs_grid.addWidget(self.add_subs_button, 0, 0)
+        subs_grid.addWidget(self.subs_replace_source, 0, 1)
+        explainer = QLabel(
+            "Adds subtitles from the file's own audio — video streams "
+            "are copied (no upscale, no re-encode)."
+        )
+        explainer.setObjectName("Muted")
+        explainer.setWordWrap(True)
+        subs_grid.addWidget(explainer, 0, 2)
+        subs_grid.setColumnStretch(2, 1)
+        layout.addWidget(controls_subs)
         layout.addWidget(self.progress)
 
         # ---- run panel (hidden until the first Start; design §4.2) ----
@@ -1446,7 +1480,8 @@ class MainWindow(QMainWindow):
             #Muted { color: #98a196; font-size: 13px; }
             #StageLabel { color: #e8ddc0; font-size: 15px; }
             #RunPanel { background: #191d1f; border: 1px solid #2b3134; border-radius: 8px; }
-            #Controls { background: #191d1f; border: 1px solid #2b3134; border-radius: 8px; }
+            QGroupBox#Controls { background: #191d1f; border: 1px solid #2b3134; border-radius: 8px; margin-top: 14px; padding-top: 4px; font-weight: 600; }
+            QGroupBox#Controls::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 4px; color: #98a196; }
             QPushButton { background: #242a2d; border: 1px solid #3a4246; border-radius: 6px; padding: 9px 14px; color: #edf0ec; }
             QPushButton:hover { background: #30383c; border-color: #657178; }
             QPushButton:pressed { background: #1b2022; }
@@ -2059,8 +2094,24 @@ class MainWindow(QMainWindow):
             f"Subtitles: {subtitle_note or 'transcribed from the file' + chr(39) + 's own audio'}",
             f"Output: {output} (+ .srt sidecar)",
         ]
-        if target and target != "keep original":
-            lines.append(f"Resolution handling: {target}")
+        # v0.4.17 workstream-2 (Karen K-2): column 3 of a subs row carries an
+        # ACTION phrase ("replace original → .mp4" / "keep original"), not a
+        # resolution — the "Resolution handling" heading was a v0.4.14
+        # upscale-schema holdover and read incoherently under the subs
+        # schema. The heading now names the source's fate, rendered in BOTH
+        # postures (silence used to imply "kept" — the invisibility class
+        # this workstream exists to kill). The literals mirror
+        # _subs_file_rows (:1574-1577) — pinned by test 28 and §8-T8.
+        if target == "replace original → .mp4":
+            lines.append(
+                "Source file: replaced on success — output renamed to <name>.mp4"
+            )
+        elif target == "keep original":
+            lines.append(
+                "Source file: kept — output beside it as <name>.subs.mp4"
+            )
+        elif target:
+            lines.append(f"Source file: {target}")
         if warning:
             lines.extend(["", "Warnings:", f"- {warning}"])
         return "\n".join(lines)

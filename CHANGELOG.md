@@ -27,6 +27,27 @@ All notable changes to VidLift. Dates are America/Chicago.
   names the refusal, and the job still succeeds. When the source itself is an
   `.mp4`, the rename is a single atomic move (safest case).
 
+### Changed
+
+- **Settings surface split by mode.** The main window's controls are now two titled
+  groups — **Upscale** (engine, profile, denoise, GB/hour, its own replace-original, resume,
+  and the subtitle carry policy) and **Add subtitles (no upscale)** (its own
+  "Replace original on success" checkbox, moved out of the upscale grid). Each surface now
+  shows only the controls that mode actually consumes.
+- **Main-window minimum width restored** to ~1290px (a long Mode B checkbox label had
+  inflated it to 1532px on the checkpoint build).
+
+### Fixed
+
+- **"Transcribe missing subtitles" is now visible and controllable.** The transcription
+  toggle (default on) existed since v0.4.14 but was never added to the window layout — it is
+  now rendered in the Upscale group's options row. Its behavior is unchanged.
+- **"Resume retained work" is now visible.** A layout overlap had painted it under the LAN
+  monitoring checkbox since v0.4.9. No behavior change — the option itself already worked.
+- Subs detail panel wording: the source's fate is now stated coherently in both postures
+  ("Source file: kept …" / "Source file: replaced on success — output renamed to <name>.mp4")
+  instead of an incoherent "Resolution handling" heading.
+
 ### Notes
 
 - The unrelated sidecar-vs-burned `.srt` output-choice toggle Eric raised is a

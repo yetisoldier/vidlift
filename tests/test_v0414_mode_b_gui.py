@@ -879,37 +879,62 @@ def test_subs_active_batch_blocks_second_flow(qapp, monkeypatch, tmp_path):
 
 # ------------------------------------------ v0.4.17: replace-source checkbox
 def _grid_of(win):
-    """The controls grid that owns the Mode B action row."""
+    """v0.4.17 workstream-2: the Mode B group's OWN grid — 'Add
+    Subtitles…' and its replace checkbox live inside the
+    'Add subtitles (no upscale)' QGroupBox with its own column
+    budget, no longer in the shared upscale grid."""
     return win.add_subs_button.parentWidget().layout()
 
 
 def _grid_position(win, widget) -> tuple[int, int]:
-    layout = _grid_of(win)
+    """Resolve (row, column) of a widget in the layout owned by the
+    widget's own parent. For the Mode B pair this is the same grid
+    _grid_of returns (both live in the Mode B group); for Mode A
+    controls (e.g. transcribe_subs) it resolves the upscale group's
+    grid — workstream-2 renders that toggle at (3, 3) there."""
+    layout = widget.parentWidget().layout()
     for index in range(layout.count()):
         if layout.itemAt(index).widget() is widget:
             row, column, _row_span, _col_span = layout.getItemPosition(index)
             return row, column
-    raise AssertionError("widget not found in the controls grid")
+    raise AssertionError("widget not found in its parent widget's layout")
 
 
 def test_subs_replace_checkbox_exists_beside_button_default_off_tooltip(
     qapp, monkeypatch, tmp_path
 ):
-    """v0.4.17 item 25: the checkbox lives at grid (2, 8) — immediately
-    right of 'Add Subtitles…' at (2, 7) — default OFF, with the .mp4
-    naming rule (D6), the keep-both promise, and the scope
-    disambiguation in its tooltip."""
+    """v0.4.17 item 25 (workstream-2 re-placed): the checkbox lives in
+    the Mode B group's own grid at (0, 1) — immediately right of
+    'Add Subtitles…' at (0, 0) — default OFF, with the .mp4 naming
+    rule (D6), the keep-both promise, and the scope disambiguation in
+    its tooltip. Workstream-2 (Karen K-1) shortened the label and
+    moved the pair out of the shared upscale grid into the Mode B
+    group; the transcription toggle is rendered in the upscale grid
+    at (3, 3) (Finding 1's fix, fenced here too)."""
     client = _ScriptedClient()
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
-    # placement: co-located, right of the Mode B button
-    assert _grid_position(win, win.add_subs_button) == (2, 7)
-    assert _grid_position(win, win.subs_replace_source) == (2, 8)
+    # placement: co-located, right of the Mode B button, in the Mode B
+    # group's own grid
+    assert _grid_position(win, win.add_subs_button) == (0, 0)
+    assert _grid_position(win, win.subs_replace_source) == (0, 1)
+    # group separation (workstream-2): the button + checkbox share the
+    # Mode B group (spec: 'parentWidget() is not ...' must be False —
+    # the positive identity below is its exact equivalent), while Mode
+    # A's replace checkbox sits in a different (upscale) group; the
+    # transcription toggle is a sibling of replace_source at (3, 3) in
+    # the upscale grid.
+    assert win.subs_replace_source.parentWidget() is win.add_subs_button.parentWidget()
+    assert win.subs_replace_source.parentWidget() is not win.replace_source.parentWidget()
+    assert win.transcribe_subs.parentWidget() is win.replace_source.parentWidget()
+    assert _grid_position(win, win.transcribe_subs) == (3, 3)
     # default OFF (fresh QSettings, the absent-defaults rule)
     assert win.subs_replace_source.isChecked() is False
-    # labels: the mode named, the irrecoverability named
+    # labels: the irrecoverability named; D3 shortened label keeps the
+    # two load-bearing qualifiers (on success / deletes) and drops the
+    # group-title stutter ("after adding subtitles")
     assert win.subs_replace_source.text() == (
-        "Replace original after adding subtitles (deletes the source)"
+        "Replace original on success (deletes source)"
     )
     tooltip = win.subs_replace_source.toolTip().lower()
     assert "35 hours.avi" in tooltip and "35 hours.mp4" in tooltip
