@@ -963,3 +963,442 @@ def test_t23_gui_overlay_device_line(qapp, monkeypatch, tmp_path):
     next(gen, None)
     next(gen2, None)
     next(gen3, None)
+
+
+# ------------------------------------------------------------------ W2
+def _payload_with_subtitles(subtitle_codec: str) -> str:
+    """The probe payload with ONE subtitle stream (video + audio kept)."""
+    return json.dumps({
+        "streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "mpeg4",
+             "width": 640, "height": 272, "sample_aspect_ratio": "1:1",
+             "field_order": "progressive", "r_frame_rate": "25/1",
+             "avg_frame_rate": "25/1"},
+            {"index": 1, "codec_type": "audio", "codec_name": "mp3",
+             "channels": 2},
+            {"index": 2, "codec_type": "subtitle",
+             "codec_name": subtitle_codec, "tags": {"language": "eng"}},
+        ],
+        "format": {"format_name": "avi", "duration": "60.0"},
+    })
+
+
+class _CountingProbeRunner:
+    """The ffprobe seam recording every call (the zero-probe pins)."""
+
+    def __init__(self, payload: str | None = None) -> None:
+        self.payload = payload
+        self.calls = 0
+
+    def __call__(self, binary: str, args: list[str]) -> tuple[int, str, str]:
+        self.calls += 1
+        if self.payload is None:
+            return 1, "", "Permission denied"
+        return 0, self.payload, ""
+
+
+def _source(tmp_path, name: str = "movie.avi") -> str:
+    src = tmp_path / name
+    src.write_bytes(b"source")
+    return str(src)
+
+
+def test_t11_subs_plan_verdict_matrix(tmp_path):
+    """The verdict matrix (T11): output-exists WITHOUT probing (the
+    counting probe asserts zero calls); force+output-exists stays
+    blocked; force alone is ready WITHOUT probing; a text track skips;
+    bitmap-only (pgs/dvd) is ready; a probe fault fails OPEN to
+    probe-error."""
+    from vidlift.probe import ProbeError
+    from vidlift.subs_job import (
+        SUBS_VERDICT_BLOCKED_OUTPUT,
+        SUBS_VERDICT_PROBE_ERROR,
+        SUBS_VERDICT_READY,
+        SUBS_VERDICT_SKIP_SUBTITLES,
+        subs_plan_verdict,
+    )
+
+    # (a) output-exists -> blocked, probe-free
+    src = _source(tmp_path)
+    Path(str(tmp_path / "movie.subs.mp4")).write_bytes(b"already-there")
+    counter = _CountingProbeRunner(_probe_payload())
+    assert subs_plan_verdict(src, probe_runner=counter) == (
+        SUBS_VERDICT_BLOCKED_OUTPUT
+    )
+    assert counter.calls == 0  # the dominant re-add case costs no probe
+
+    # (b) force does NOT bypass the would-overwrite verdict
+    assert subs_plan_verdict(src, probe_runner=counter, force=True) == (
+        SUBS_VERDICT_BLOCKED_OUTPUT
+    )
+    assert counter.calls == 0
+
+    # (c) force alone (no output) -> ready, probe-free
+    src2 = _source(tmp_path, "forced.avi")
+    assert subs_plan_verdict(src2, probe_runner=counter, force=True) == (
+        SUBS_VERDICT_READY
+    )
+    assert counter.calls == 0
+
+    # (d) an embedded TEXT track -> skip-subtitles (the exact predicate)
+    text_counter = _CountingProbeRunner(_payload_with_subtitles("subrip"))
+    assert subs_plan_verdict(src2, probe_runner=text_counter) == (
+        SUBS_VERDICT_SKIP_SUBTITLES
+    )
+    assert text_counter.calls == 1
+
+    # (e) bitmap-only tracks (pgs / dvd) -> ready (Mode B's reason to be)
+    bitmap = _CountingProbeRunner(_payload_with_subtitles("hdmv_pgs_subtitle"))
+    assert subs_plan_verdict(src2, probe_runner=bitmap) == SUBS_VERDICT_READY
+    dvd = _CountingProbeRunner(_payload_with_subtitles("dvd_subtitle"))
+    assert subs_plan_verdict(src2, probe_runner=dvd) == SUBS_VERDICT_READY
+
+    # (f) a probe fault -> fail-OPEN (never a plan-time silent skip)
+    broken = _CountingProbeRunner(None)  # exit 1 -> ProbeError
+    assert subs_plan_verdict(src2, probe_runner=broken) == (
+        SUBS_VERDICT_PROBE_ERROR
+    )
+
+    class _OSErrorRunner:
+        """The seam that raises a raw OSError (the missing-binary case)."""
+
+        calls = 0
+
+        def __call__(self, binary: str, args: list[str]):
+            self.calls += 1
+            raise OSError("ffprobe binary vanished")
+
+    oserror = _OSErrorRunner()
+    assert subs_plan_verdict(src2, probe_runner=oserror) == (
+        SUBS_VERDICT_PROBE_ERROR
+    )
+    assert oserror.calls == 1
+
+
+def test_t12_collector_never_reingests_subs_outputs(tmp_path):
+    """The collector exclusion (T12): VidLift's own *.subs.mp4 family is
+    never re-ingested — case-insensitive, both modes; a *.subs.mkv is
+    NOT a VidLift output (outputs are always .mp4) and stays
+    collectible."""
+    from vidlift.gui import collect_video_files
+
+    root = tmp_path / "tree"
+    (root / "nested" / "deep").mkdir(parents=True)
+    (root / "nested" / "a.subs.mp4").write_bytes(b"x")
+    (root / "nested" / "B.SUBS.MP4").write_bytes(b"x")
+    (root / "nested" / "plain.mp4").write_bytes(b"x")
+    (root / "nested" / "deep" / "x.subs.mkv").write_bytes(b"x")
+    collected = collect_video_files(root)
+    assert collected == [
+        str(root / "nested" / "deep" / "x.subs.mkv"),
+        str(root / "nested" / "plain.mp4"),
+    ]
+
+
+def test_t13_gui_pick_skips_and_blocks_never_enqueue(
+    qapp, monkeypatch, tmp_path
+):
+    """T13: the pick's verdict map decides WHO gets enqueued — the ready
+    file becomes VJ1 with the preserved slate mapping; the skip and
+    blocked rows render their exact cells BELOW the job row (the stable
+    partition), and the summary names all three outcomes."""
+    pytest.importorskip("PyQt6")
+    from test_v0414_mode_b_gui import _ScriptedClient, _window
+
+    ready = tmp_path / "ep-ready.mkv"
+    ready.write_bytes(b"x")
+    skip = tmp_path / "ep-skip.mkv"
+    skip.write_bytes(b"x")
+    blocked = tmp_path / "ep-blocked.mkv"
+    blocked.write_bytes(b"x")
+
+    client = _ScriptedClient()
+    client.make_job(str(ready), [{"state": "queued"}], kind="subs")
+
+    import vidlift.gui as gui_mod
+
+    verdicts_map = {
+        str(ready): "ready",
+        str(skip): "skip-subtitles",
+        str(blocked): "blocked-output-exists",
+    }
+
+    def _fake_verdict(path, **_kw):
+        assert path in verdicts_map, path
+        return verdicts_map[path]
+
+    monkeypatch.setattr(gui_mod, "subs_plan_verdict", _fake_verdict)
+    monkeypatch.setattr(
+        gui_mod.QFileDialog, "getOpenFileNames",
+        staticmethod(
+            lambda *a, **k: ([str(ready), str(skip), str(blocked)], "")
+        ),
+    )
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.add_subs_button.click()
+
+    assert win.job_ids == ["VJ1"]
+    assert win._batch_row_for_job == {"VJ1": 0}
+    # the stable partition: ready first, then skip, then blocked
+    assert win.file_table.item(0, 0).text() == "subs ready"
+    assert win.file_table.item(1, 0).text() == "skip — already has subtitles"
+    skip_cells = [
+        win.file_table.item(1, c).text() for c in range(8)
+    ]
+    assert skip_cells[2] == "skip (no transcription)"
+    assert skip_cells[3] == "no action"
+    assert skip_cells[6] == "already subtitled — nothing to do"
+    assert skip_cells[7] == ""
+    assert win.file_table.item(2, 0).text() == (
+        "blocked — subtitles output already exists (will not be overwritten)"
+    )
+    warning = win.file_table.item(2, 7).text()
+    assert "output exists" in warning and "will not be overwritten" in warning
+    summary = win.summary_count.text()
+    assert "1 queued for subtitles" in summary
+    assert "1 skipped (already subtitled)" in summary
+    assert "1 blocked (output exists)" in summary
+    next(gen, None)
+
+
+def test_t14_all_skipped_pick_renders_static_rows(qapp, monkeypatch, tmp_path):
+    """T14: an all-skipped pick renders the static rows, enqueues
+    NOTHING (no slate, no timer bootstrap), composes the no-work S-7
+    summary, and the detail pane names the skip verdict honestly."""
+    pytest.importorskip("PyQt6")
+    from test_v0414_mode_b_gui import _ScriptedClient, _window
+
+    skip_a = tmp_path / "done-a.mkv"
+    skip_a.write_bytes(b"x")
+    skip_b = tmp_path / "done-b.mkv"
+    skip_b.write_bytes(b"x")
+
+    client = _ScriptedClient()  # nothing scripted: nothing may enqueue
+
+    import vidlift.gui as gui_mod
+
+    def _fake_verdict(path, **_kw):
+        return "skip-subtitles"
+
+    monkeypatch.setattr(gui_mod, "subs_plan_verdict", _fake_verdict)
+    monkeypatch.setattr(
+        gui_mod.QFileDialog, "getOpenFileNames",
+        staticmethod(lambda *a, **k: ([str(skip_a), str(skip_b)], "")),
+    )
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.add_subs_button.click()
+
+    assert win.job_ids == []
+    assert win._batch_row_for_job == {}
+    rows = [(0, "skip — already has subtitles"), (1, "skip — already has subtitles")]
+    for row, status in rows:
+        assert win.file_table.item(row, 0).text() == status
+    summary = win.summary_count.text()
+    assert summary == (
+        "0 queued for subtitles — 2 skipped (already subtitled)"
+    )
+    # the detail pane on a static skip row carries the verdict cell
+    win._render_detail_for_row(0)
+    assert "Verdict: skip — already has subtitles" in (
+        win.details.toPlainText()
+    )
+    next(gen, None)
+
+
+def test_t15_conflict_guard_evaluates_ready_only(
+    qapp, monkeypatch, tmp_path
+):
+    """T15 (spec deviation 3): a live subs conflict over a file the
+    pre-flight SKIPPED must not pop the conflict dialog at all — the
+    guard evaluates the ready subset."""
+    pytest.importorskip("PyQt6")
+    from test_v0414_mode_b_gui import _ScriptedClient, _window
+
+    ready = tmp_path / "live-ready.mkv"
+    ready.write_bytes(b"x")
+    skipped = tmp_path / "live-skip.mkv"
+    skipped.write_bytes(b"x")
+
+    client = _ScriptedClient()
+    client.make_job(str(ready), [{"state": "queued"}], kind="subs")
+
+    import vidlift.gui as gui_mod
+
+    def _fake_verdict(path, **_kw):
+        return "skip-subtitles" if path == str(skipped) else "ready"
+
+    monkeypatch.setattr(gui_mod, "subs_plan_verdict", _fake_verdict)
+    monkeypatch.setattr(
+        gui_mod.QFileDialog, "getOpenFileNames",
+        staticmethod(lambda *a, **k: ([str(ready), str(skipped)], "")),
+    )
+
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+
+    # a queued subs record over the SKIPPED path only
+    record = type("R", (), {"kind": "subs", "paths": [str(skipped)]})()
+    monkeypatch.setattr(
+        client, "queue_views", lambda: ([], [record]), raising=False
+    )
+    dialog_calls: list = []
+    monkeypatch.setattr(
+        gui_mod.QMessageBox, "information",
+        staticmethod(lambda *a, **k: dialog_calls.append(a)),
+    )
+
+    win.add_subs_button.click()
+    assert dialog_calls == []  # no conflict dialog for a skipped file
+    assert win.job_ids == ["VJ1"]  # the pick proceeded with the ready file
+    next(gen, None)
+
+
+def test_t16_cli_subs_skip_blocked_exit_zero_and_force_spy(
+    tmp_path, monkeypatch, capsys
+):
+    """T16: the CLI pre-flight — skip/blocked print the S-8 lines and
+    never count as failures (exit 0 on an all-done batch); a REAL
+    failure still exits 1; --force threads force=True into the verdict
+    helper (the spy pins the override)."""
+    import vidlift.cli as cli_mod
+    from vidlift.subs_job import SubsJobError
+
+    skip_file = tmp_path / "cli-skip.avi"
+    skip_file.write_bytes(b"x")
+    blocked_file = tmp_path / "cli-blocked.avi"
+    blocked_file.write_bytes(b"x")
+    blocked_file.with_name("cli-blocked.subs.mp4").write_bytes(b"out")
+
+    verdicts_map = {
+        str(skip_file): "skip-subtitles",
+        str(blocked_file): "blocked-output-exists",
+    }
+    seen_force: dict = {}
+
+    def _fake_verdict(path, *, ffprobe="ffprobe", probe_runner=None,
+                      force=False):
+        seen_force["force"] = force
+        return verdicts_map[path]
+
+    monkeypatch.setattr("vidlift.subs_job.subs_plan_verdict", _fake_verdict)
+    rc = cli_mod.main(["subs", str(skip_file), str(blocked_file)])
+    out = capsys.readouterr().out
+    assert rc == 0  # an all-done batch is NOT a failure (WS2-D9)
+    assert "  skip — already has subtitles" in out
+    assert "  blocked — output already exists (never overwritten): " in out
+    assert "cli-blocked.subs.mp4" in out
+
+    # a real failure (the run guard raised at run time) still exits 1
+    real_file = tmp_path / "cli-real.avi"
+    real_file.write_bytes(b"x")
+    verdicts_map[str(real_file)] = "ready"
+
+    def _boom(*_a, **_k):
+        raise SubsJobError("probe failed honestly")
+
+    monkeypatch.setattr("vidlift.subs_job.run_subs_job", _boom)
+    rc = cli_mod.main(["subs", str(real_file)])
+    assert rc == 1
+
+    # --force rides into the verdict helper (subtitle override only);
+    # the run beneath it still fails via the boom stub (real-failure
+    # semantics untouched), which is irrelevant to the spy pin
+    seen_force.clear()
+    rc = cli_mod.main(["subs", "--force", str(real_file)])
+    assert rc == 1
+    assert seen_force["force"] is True
+
+
+def test_t17_mcp_transcribe_additive_skipped_rows(tmp_path, monkeypatch):
+    """T17: the MCP enqueue surface — a text-subs source yields the
+    additive skipped row (S-9a keys, job_id null, ok true); force
+    enqueues; the unknown-file arm is unchanged."""
+    from vidlift.mcp_bridge.registry import Registry
+    from vidlift.mcp_bridge.tools import tool_transcribe
+
+    class _Services:
+        def __init__(self, reg):
+            self.registry = reg
+            self.engine = None
+            self.executor = self
+            self.probe_runner = None
+
+        def notify_new_work(self):
+            pass
+
+    registry = Registry(tmp_path / "state")
+    services = _Services(registry)
+    src = tmp_path / "mcp-done.avi"
+    src.write_bytes(b"x")
+    text_runner = _CountingProbeRunner(_payload_with_subtitles("subrip"))
+    services.probe_runner = text_runner
+
+    result = tool_transcribe(services, {"paths": [str(src)]})
+    assert result["jobs"] == [
+        {"path": str(src), "job_id": None, "ok": True,
+         "skipped": True,
+         "reason": "already has a usable text subtitle track"}
+    ]
+
+    # force: the source IS enqueued (the genuine-retranscription path)
+    result = tool_transcribe(services, {"paths": [str(src)], "force": True})
+    row = result["jobs"][0]
+    assert row["ok"] is True and row.get("skipped") is None
+    assert row["job_id"] == registry.require(row["job_id"]).job_id
+
+    # existing output, no force: the blocked reason
+    (tmp_path / "mcp-blocked.avi").write_bytes(b"x")
+    src_b = str(tmp_path / "mcp-blocked.avi")
+    (tmp_path / "mcp-blocked.subs.mp4").write_bytes(b"out")
+    result = tool_transcribe(services, {"paths": [src_b]})
+    assert result["jobs"][0].get("reason") == (
+        "output already exists (never overwritten)"
+    )
+    assert result["jobs"][0].get("skipped") is True
+
+    # the unknown-file arm is unchanged (fail row, no skip keys)
+    result = tool_transcribe(services, {"paths": [str(tmp_path / "nope.avi")]})
+    row = result["jobs"][0]
+    assert row["ok"] is False and "no such file" in row["error"]
+    assert "skipped" not in row
+
+
+def test_t18_run_side_backstop_unchanged(tmp_path, engine_on):
+    """T18: the run-side guards stay the ground truth backstop — a
+    direct run_subs_job on an already-subtitled source raises
+    SubsJobError with the SAME pre-0.4.19 message (never silently
+    skipped), and an existing output still refuses."""
+    from vidlift.subs_job import SubsJobError, run_subs_job
+
+    src = _source(tmp_path, "backstop.avi")
+    text_runner = FakeRunner(_payload_with_subtitles("subrip"))
+    with pytest.raises(SubsJobError) as excinfo:
+        run_subs_job(
+            src,
+            ffmpeg="ffmpeg",
+            probe_runner=text_runner,
+            runner=text_runner,
+            engine_factory=lambda p: _CountingEngine(model_path=p),
+        )
+    assert str(excinfo.value) == (
+        f"already has a usable text subtitle track (use --force to "
+        f"transcribe anyway): {src}"
+    )
+
+    out = Path(str(tmp_path / "backstop.subs.mp4"))
+    out.write_bytes(b"already-there")
+    plain_runner = FakeRunner(_probe_payload())
+    with pytest.raises(SubsJobError) as excinfo2:
+        run_subs_job(
+            src,
+            ffmpeg="ffmpeg",
+            probe_runner=plain_runner,
+            runner=plain_runner,
+            engine_factory=lambda p: _CountingEngine(model_path=p),
+        )
+    assert str(excinfo2.value) == (
+        f"output already exists (never overwritten): {out}"
+    )
+    assert out.read_bytes() == b"already-there"  # never overwritten

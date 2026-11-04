@@ -769,7 +769,11 @@ def tool_transcribe(services: BridgeServices, args: dict) -> dict:
     args: paths[] required; lang, model, device, force, replace_source,
     suppress_srt (booleans/strings, all optional). Cancel covers subs
     jobs via the existing tool_cancel (registry transitions are
-    job-kind-blind)."""
+    job-kind-blind).
+
+    v0.4.19 (WS2): already-subtitled sources and existing outputs are
+    skipped at enqueue time (additive ``skipped``/``reason`` keys;
+    ``force`` bypasses the subtitle check only)."""
     lang = args.get("lang") or ""
     model = args.get("model") or None
     device = args.get("device") or "auto"
@@ -781,12 +785,41 @@ def tool_transcribe(services: BridgeServices, args: dict) -> dict:
     # absent-defaults rule; pre-0.4.18 callers are behavior-identical);
     # when True the .srt sidecar is removed only after a successful mux.
     suppress_srt = bool(args.get("suppress_srt", False))
+    from ..subs_job import (
+        SUBS_VERDICT_BLOCKED_OUTPUT,
+        SUBS_VERDICT_SKIP_SUBTITLES,
+        subs_plan_verdict,
+    )
+
     jobs: list[dict] = []
     for path in args["paths"]:
         if not os.path.isfile(path):
             jobs.append(
                 {"path": path, "job_id": None, "ok": False,
                  "error": f"no such file: {path}"}
+            )
+            continue
+        # v0.4.19 (WS2): the shared plan-time verdict at the MCP
+        # enqueue surface — additive keys only (skipped/reason/job_id:
+        # null); api_version stays 1. A probe fault (or missing ffprobe
+        # here) enqueues to the run-side guard truth.
+        verdict = subs_plan_verdict(
+            path,
+            probe_runner=getattr(services, "probe_runner", None),
+            force=force,
+        )
+        if verdict == SUBS_VERDICT_SKIP_SUBTITLES:
+            jobs.append(
+                {"path": path, "job_id": None, "ok": True,
+                 "skipped": True,
+                 "reason": "already has a usable text subtitle track"}
+            )
+            continue
+        if verdict == SUBS_VERDICT_BLOCKED_OUTPUT:
+            jobs.append(
+                {"path": path, "job_id": None, "ok": True,
+                 "skipped": True,
+                 "reason": "output already exists (never overwritten)"}
             )
             continue
         record = services.registry.enqueue(

@@ -403,7 +403,14 @@ def _cmd_subs(
     suppress_srt: bool = False,
 ) -> int:
     """Mode B: transcribe + soft-mux; exit 0 ok, 1 job failure, 2 tool."""
-    from .subs_job import SubsJobError, run_subs_job
+    from .subs_job import (
+        SUBS_VERDICT_BLOCKED_OUTPUT,
+        SUBS_VERDICT_SKIP_SUBTITLES,
+        SubsJobError,
+        run_subs_job,
+        subs_output_path,
+        subs_plan_verdict,
+    )
     from .transcribe import TranscriptionError
 
     try:
@@ -414,6 +421,20 @@ def _cmd_subs(
     failures = 0
     for path in files:
         print(f"== {path}")
+        # v0.4.19 (WS2): the plan-time verdict — already-done files are
+        # SKIPPED, not run-side failures (the end-state already holds;
+        # WS2-D9: neither counts toward `failures`). --force remains the
+        # subtitle override; a probe fault enqueues to the run-side truth.
+        verdict = subs_plan_verdict(path, ffprobe=tools.ffprobe, force=force)
+        if verdict == SUBS_VERDICT_SKIP_SUBTITLES:
+            print("  skip — already has subtitles")
+            continue
+        if verdict == SUBS_VERDICT_BLOCKED_OUTPUT:
+            print(
+                "  blocked — output already exists (never overwritten): "
+                f"{subs_output_path(path)}"
+            )
+            continue
         try:
             result = run_subs_job(
                 path,

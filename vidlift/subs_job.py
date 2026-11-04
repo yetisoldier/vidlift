@@ -47,7 +47,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .probe import classify, probe_file
+from .probe import ProbeError, classify, probe_file
 from .subtitles import (
     SubtitleOcrError,
     mux_language,
@@ -67,6 +67,11 @@ __all__ = [
     "replace_subs_output",  # v0.4.17
     "cleanup_subs_scratch",  # v0.4.18 (WS3, K-5)
     "run_subs_job",
+    "subs_plan_verdict",  # v0.4.19 (WS2, plan-time skip)
+    "SUBS_VERDICT_READY",
+    "SUBS_VERDICT_SKIP_SUBTITLES",
+    "SUBS_VERDICT_BLOCKED_OUTPUT",
+    "SUBS_VERDICT_PROBE_ERROR",
 ]
 
 
@@ -142,6 +147,63 @@ def source_has_usable_subtitles(report) -> bool:
     never transcoded.
     """
     return any(s.kind in _USABLE_KINDS for s in report.subtitles)
+
+
+# v0.4.19 (WS2): the plan-time skip verdict — already-done files are
+# SKIPPED at the pre-flight surfaces (GUI pick, CLI subs, MCP
+# transcribe), never enqueued to fail red at run time. The run-side
+# guards above are UNCHANGED: they remain the ground-truth backstop
+# for direct enqueues (older scripted callers, API bypasses).
+SUBS_VERDICT_READY = "ready"
+SUBS_VERDICT_SKIP_SUBTITLES = "skip-subtitles"
+SUBS_VERDICT_BLOCKED_OUTPUT = "blocked-output-exists"
+SUBS_VERDICT_PROBE_ERROR = "probe-error"
+
+
+def subs_plan_verdict(
+    path: str,
+    *,
+    ffprobe: str = "ffprobe",
+    probe_runner=None,
+    force: bool = False,
+) -> str:
+    """The plan-time verdict for one Mode B file (v0.4.19, WS2).
+
+    Returns one of the ``SUBS_VERDICT_*`` constants:
+
+    - ``blocked-output-exists`` — the ``{stem}.subs.mp4`` already
+      exists; never overwritten. Checked FIRST and probe-free: the
+      dominant re-add case costs no subprocess, and when both
+      conditions hold the would-overwrite reason is the actionable one
+      (a deliberate divergence from the run guard's order — spec §1
+      WS2-D3). ``force`` does NOT bypass this (the run-side guard has
+      no force exception either).
+    - ``skip-subtitles`` — the source already carries a usable TEXT
+      subtitle track (:func:`source_has_usable_subtitles`'s exact
+      predicate: bitmap tracks and sidecars do NOT count).
+      ``force=True`` reports ``ready`` — the genuine-retranscription
+      override mirrors the run guard.
+    - ``probe-error`` — the plan probe failed (ProbeError/OSError).
+      Fail-OPEN: callers enqueue anyway and the run-side probe names
+      the truth (a plan-time probe fault is not absence — the VAD
+      preflight's "unknown proceeds" discipline).
+    - ``ready`` — enqueue.
+    """
+    if os.path.exists(subs_output_path(path)):
+        return SUBS_VERDICT_BLOCKED_OUTPUT
+    if force:
+        return SUBS_VERDICT_READY
+    probe_kwargs = {}
+    if probe_runner is not None:
+        probe_kwargs["runner"] = probe_runner
+    try:
+        media = probe_file(path, binary=ffprobe, **probe_kwargs)
+        report = classify(media)
+    except (ProbeError, OSError):
+        return SUBS_VERDICT_PROBE_ERROR
+    if source_has_usable_subtitles(report):
+        return SUBS_VERDICT_SKIP_SUBTITLES
+    return SUBS_VERDICT_READY
 
 
 def run_subs_job(

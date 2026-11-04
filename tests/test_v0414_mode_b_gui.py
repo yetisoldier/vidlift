@@ -498,10 +498,13 @@ def test_subs_cancel_batch_cancels_whole_batch(
 def test_subs_collision_blocked_row_never_overwrites(
     qapp, monkeypatch, tmp_path
 ):
-    """§4 constraint: a picked file whose {stem}.subs.mp4 already exists
-    renders the blocked + visible-warning row BEFORE submission; the
-    file is enqueued anyway (the run-side gate refuses, never
-    overwrites) and the OLD output bytes are untouched by the GUI."""
+    """§4 constraint (re-aimed v0.4.19 WS2): a picked file whose
+    {stem}.subs.mp4 already exists renders the blocked + visible-warning
+    row — and under v0.4.19 WS2 the blocked file is NEVER ENQUEUED (the
+    plan-time verdict keeps red failures out of the batch). The run-side
+    gate remains the backstop for direct enqueues; the old output bytes
+    are untouched by the GUI; the scripted second id is simply never
+    claimed."""
     good = tmp_path / "fresh-ep.mkv"
     good.write_bytes(b"x")
     blocked = tmp_path / "done-ep.mkv"
@@ -515,6 +518,14 @@ def test_subs_collision_blocked_row_never_overwrites(
 
     import vidlift.gui as gui_mod
 
+    def _fake_verdict(path, **_kw):
+        # the deterministic pre-flight: the fresh pick reads ready, the
+        # output-exists pick reads the structural blocked verdict
+        if path == str(blocked):
+            return "blocked-output-exists"
+        return "ready"
+
+    monkeypatch.setattr(gui_mod, "subs_plan_verdict", _fake_verdict)
     monkeypatch.setattr(
         gui_mod.QFileDialog, "getOpenFileNames",
         staticmethod(lambda *a, **k: ([str(good), str(blocked)], "")),
@@ -527,12 +538,16 @@ def test_subs_collision_blocked_row_never_overwrites(
     row_g = _row_by_filename(win, "fresh-ep.mkv")
     row_b = _row_by_filename(win, "done-ep.mkv")
     assert win.file_table.item(row_g, 0).text() == "subs ready"
-    assert "blocked" in win.file_table.item(row_b, 0).text()
+    assert win.file_table.item(row_b, 0).text() == (
+        "blocked — subtitles output already exists (will not be overwritten)"
+    )
     warning = win.file_table.item(row_b, 7).text()
     assert "output exists" in warning and "will not be overwritten" in warning
     # the untouched prior output
     assert existing_out.read_bytes() == b"already-there"
-    assert win.job_ids == ["VJ1", "VJ2"]
+    # the blocked file was never enqueued (WS2) — VJ2 is simply never
+    # claimed
+    assert win.job_ids == ["VJ1"]
     next(gen, None)
 
 
@@ -542,8 +557,9 @@ def test_subs_rows_output_cell_uses_subs_output_path_for_every_extension(
     """F-5 (v0.4.15.3): every row's Output cell is exactly
     subs_output_path(p) — the one regex-based derivation. The .ts case
     must produce movie.subs.mp4, NOT the old slice's 'movi.subs.mp4',
-    and no row may carry a doubled dot."""
-    from vidlift.subs_job import subs_output_path
+    and no row may carry a doubled dot. (v0.4.19 WS2: the rows render
+    from an explicit verdict map — all-ready here.)"""
+    from vidlift.subs_job import SUBS_VERDICT_READY, subs_output_path
 
     gen = _window(qapp, monkeypatch, tmp_path, _ScriptedClient())
     win = next(gen)
@@ -553,7 +569,9 @@ def test_subs_rows_output_cell_uses_subs_output_path_for_every_extension(
         "/m/movie.mpeg",
         "/m/movie.mp4",
     ]
-    rows = win._subs_file_rows(paths)
+    rows = win._subs_file_rows(
+        paths, {p: SUBS_VERDICT_READY for p in paths}
+    )
     for row, path in zip(rows, paths):
         assert row[4] == subs_output_path(path), path
         assert ".." not in row[4]
@@ -567,10 +585,13 @@ def test_subs_rows_output_cell_uses_subs_output_path_for_every_extension(
 def test_subs_rows_collision_preflight_fires_for_non_4char_extensions(
     qapp, monkeypatch, tmp_path
 ):
-    """F-5 (v0.4.15.3): with movie.subs.mp4 pre-existing beside
-    movie.ts, the Status cell is the blocked verdict — the pre-flight
-    finally fires for extensions the old path[:-4] slice mangled (which
-    silently disabled this guard for .ts/.divx/.mpeg)."""
+    """F-5 (v0.4.15.3) / rendered from the v0.4.19 WS2 plan verdict:
+    with the blocked verdict in the map, the Status cell is the blocked
+    verdict — the pre-flight's would-overwrite truth (which the old
+    path[:-4] slice silently disabled for .ts/.divx/.mpeg) renders
+    verbatim."""
+    from vidlift.subs_job import SUBS_VERDICT_BLOCKED_OUTPUT
+
     source = tmp_path / "done-ep.ts"
     source.write_bytes(b"source-bytes")
     existing = tmp_path / "done-ep.subs.mp4"
@@ -578,7 +599,9 @@ def test_subs_rows_collision_preflight_fires_for_non_4char_extensions(
 
     gen = _window(qapp, monkeypatch, tmp_path, _ScriptedClient())
     win = next(gen)
-    rows = win._subs_file_rows([str(source)])
+    rows = win._subs_file_rows(
+        [str(source)], {str(source): SUBS_VERDICT_BLOCKED_OUTPUT}
+    )
     assert rows[0][0] == (
         "blocked — subtitles output already exists (will not be overwritten)"
     )
@@ -1077,16 +1100,20 @@ def test_subs_file_rows_column3_tracks_submitted_state(
 ):
     """v0.4.17 item 28: column 3 reads 'replace original → .mp4' when
     ON and 'keep original' when OFF (the row is rendered at enqueue
-    time from the exact state being enqueued)."""
+    time from the exact state being enqueued). (v0.4.19 WS2: rows
+    render from an explicit verdict map — all-ready here.)"""
+    from vidlift.subs_job import SUBS_VERDICT_READY
+
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"x")
+    ready = {str(media): SUBS_VERDICT_READY}
     client = _ScriptedClient()
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
-    off_rows = win._subs_file_rows([str(media)])
+    off_rows = win._subs_file_rows([str(media)], ready)
     assert off_rows[0][3] == "keep original"
     win.subs_replace_source.setChecked(True)
-    on_rows = win._subs_file_rows([str(media)])
+    on_rows = win._subs_file_rows([str(media)], ready)
     assert on_rows[0][3] == "replace original → .mp4"
     next(gen, None)
 

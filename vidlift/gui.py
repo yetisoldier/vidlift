@@ -85,7 +85,17 @@ from .transcribe import DEFAULT_MODEL, model_install_state
 # stem-strip in subs_job) — the GUI's display, pre-flight, and run
 # guard reuse it so they can never diverge on non-4-char extensions
 # (.ts/.divx/.mpeg): the old path[:-4] slice mangled those stems.
-from .subs_job import subs_output_path
+# v0.4.19 (WS2): the plan-time verdict + verdict constants ride the
+# same import — the pre-flight decides WHO gets enqueued before the
+# conflict guard and the rows render.
+from .subs_job import (
+    SUBS_VERDICT_BLOCKED_OUTPUT,
+    SUBS_VERDICT_PROBE_ERROR,
+    SUBS_VERDICT_READY,
+    SUBS_VERDICT_SKIP_SUBTITLES,
+    subs_output_path,
+    subs_plan_verdict,
+)
 from .run import MissingToolError, find_tools
 from .run import summarize_batch, BatchSummary
 from .ui.gpu_meter import (
@@ -123,6 +133,9 @@ def collect_video_files(folder: str | Path) -> list[str]:
     walk order). Unreadable subtrees are skipped silently (os.walk's
     documented default). The result is fully sorted — the pre-0.4.18
     ``sorted(iterdir())`` determinism generalized to the tree.
+
+    v0.4.19 (WS2): never yields VidLift's own ``*.subs.mp4`` outputs
+    (any case).
     """
     found: list[str] = []
     for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
@@ -130,6 +143,15 @@ def collect_video_files(folder: str | Path) -> list[str]:
         for name in filenames:
             candidate = Path(dirpath) / name
             if candidate.suffix.lower() in VIDEO_EXTENSIONS:
+                # v0.4.19 (WS2): VidLift's OWN keep-original outputs
+                # (the {stem}.subs.mp4 family) are never re-ingested —
+                # re-adding a finished folder must not re-queue its own
+                # results. Name-based fast path only: the
+                # replace-source-renamed .mp4 form is
+                # name-indistinguishable and is caught by the WS2
+                # plan-time subtitle probe instead (belt + suspenders).
+                if name.lower().endswith(".subs.mp4"):
+                    continue
                 found.append(str(candidate))
     seen: set[str] = set()
     collected: list[str] = []
@@ -341,6 +363,21 @@ def _stage_label_text(stage: str) -> str:
     seconds tick inside one and the same stage; they must not reset
     the busy/ETA state every second)."""
     return stage.split(" (", 1)[0]
+
+
+def _subs_enqueue_summary(queued: int, skipped: int, blocked: int) -> str:
+    """v0.4.19 (WS2): the enqueue-time count line — enqueued jobs plus
+    the pre-flight outcome counts, so a folder re-add answers 'what
+    happened to the other 195 files' without red failures."""
+    text = f"{queued} queued for subtitles"
+    extras: list[str] = []
+    if skipped:
+        extras.append(f"{skipped} skipped (already subtitled)")
+    if blocked:
+        extras.append(f"{blocked} blocked (output exists)")
+    if extras:
+        text += " — " + ", ".join(extras)
+    return text
 
 
 def _device_display(snapshot: dict | None) -> str | None:
@@ -1801,7 +1838,9 @@ class MainWindow(QMainWindow):
 
     # -- Add Subtitles (v0.4.14 Mode B, no upscale) ---------------------
 
-    def _subs_file_rows(self, paths: list[str]) -> list[list[str]]:
+    def _subs_file_rows(
+        self, paths: list[str], verdicts: dict[str, str]
+    ) -> list[list[str]]:
         """The subs table rows (same 8-column schema as the plan view;
         the Status cell carries the subs verdict instead of the upscale
         one) — the shared-table render contract for subs batches.
@@ -1809,43 +1848,73 @@ class MainWindow(QMainWindow):
         v0.4.15.3 (F-5): the output path comes straight from
         :func:`subs_output_path` — one naming derivation for display,
         pre-flight, and the run guard. The old ``path[:-4]`` slice
-        mangled non-4-char extensions (``movie.ts`` read as stem
-        ``movi``) and silently disabled the collision pre-flight for
-        those files.
+        mangled non-4-char extensions and silently disabled the
+        collision pre-flight for those files.
+
+        v0.4.19 (WS2): the caller pre-flights every pick and hands the
+        verdict map in (structural ``SUBS_VERDICT_*`` → display string
+        mapping lives HERE, the render layer). Skip and blocked rows
+        are STATIC — they carry no job and the 1 Hz poll never rewrites
+        them. ``verdicts`` is a REQUIRED argument: a row must never be
+        rendered from a verdict the pre-flight didn't make.
         """
         rows: list[list[str]] = []
         for path in paths:
             out_path = subs_output_path(path)
             existing = Path(out_path)
-            status = (
-                "blocked — subtitles output already exists (will not be overwritten)"
-                if existing.exists()
-                else "subs ready"
+            verdict = verdicts.get(path, SUBS_VERDICT_READY)
+            action = (
+                "replace original → .mp4"
+                if self.subs_replace_source.isChecked()
+                else "keep original"
             )
-            rows.append(
-                [
-                    status,
-                    path,
-                    "transcribe",
-                    # v0.4.17: column 3 renders the EXACT state being
-                    # enqueued (the checkbox read is the submitted
-                    # option) — the display cannot diverge.
-                    (
-                        "replace original → .mp4"
-                        if self.subs_replace_source.isChecked()
-                        else "keep original"
-                    ),
-                    out_path,
-                    "",
-                    "transcribed from the file's own audio",
-                    (
+            if verdict == SUBS_VERDICT_BLOCKED_OUTPUT:
+                rows.append(
+                    [
+                        "blocked — subtitles output already exists (will not be overwritten)",
+                        path,
+                        "transcribe",
+                        action,
+                        out_path,
+                        "",
+                        "transcribed from the file's own audio",
                         "output exists: " + existing.name
-                        + " (will not be overwritten)"
-                        if existing.exists()
-                        else ""
-                    ),
-                ]
-            )
+                        + " (will not be overwritten)",
+                    ]
+                )
+            elif verdict == SUBS_VERDICT_SKIP_SUBTITLES:
+                rows.append(
+                    [
+                        "skip — already has subtitles",
+                        path,
+                        "skip (no transcription)",
+                        "no action",
+                        out_path,
+                        "",
+                        "already subtitled — nothing to do",
+                        "",
+                    ]
+                )
+            else:
+                # ready (or probe-error: fail-open — enqueue; the
+                # run-side check names the truth, and the warning cell
+                # discloses the inconclusive plan probe honestly).
+                rows.append(
+                    [
+                        "subs ready",
+                        path,
+                        "transcribe",
+                        action,
+                        out_path,
+                        "",
+                        "transcribed from the file's own audio",
+                        (
+                            "plan probe inconclusive — re-checked at run time"
+                            if verdict == SUBS_VERDICT_PROBE_ERROR
+                            else ""
+                        ),
+                    ]
+                )
         return rows
 
     @staticmethod
@@ -1957,8 +2026,34 @@ class MainWindow(QMainWindow):
         row render, and slate bootstrap. One ingestion pipeline, no
         forked copy to drift apart. The v0.4.15.1/v0.4.15.4/v0.4.17
         comments moved with the code they narrate."""
+        # v0.4.19 (WS2): plan-time pre-flight BEFORE the conflict guard
+        # — one probe per picked path (output-exists is probe-free;
+        # find_tools failure degrades to the fail-open probe-error
+        # verdict, enqueueing to the run-side truth). The verdict map
+        # decides WHO gets enqueued; skip/block rows are rendered but
+        # never become jobs (deviation 3: the conflict dialog now
+        # evaluates the ready subset only).
+        try:
+            ffprobe = find_tools().ffprobe
+        except MissingToolError:
+            ffprobe = "ffprobe"  # probe fails honestly → probe-error → ready
+        verdicts: dict[str, str] = {}
+        for path in paths:
+            verdicts[path] = subs_plan_verdict(path, ffprobe=ffprobe)
+        ready = [
+            path for path in paths
+            if verdicts[path] in (SUBS_VERDICT_READY, SUBS_VERDICT_PROBE_ERROR)
+        ]
+        skipped = [
+            path for path in paths
+            if verdicts[path] == SUBS_VERDICT_SKIP_SUBTITLES
+        ]
+        blocked = [
+            path for path in paths
+            if verdicts[path] == SUBS_VERDICT_BLOCKED_OUTPUT
+        ]
         # v0.4.15.1: the ONLY blocking condition — a live subs job over
-        # the same source. Pure read over queue_views(); a client
+        # the same (READY) source. Pure read over queue_views(); a client
         # without that surface (older scripted harnesses) yields no
         # conflict info and never blocks — independence-first, the
         # fail-open direction (the registry-side never-overwrite gate
@@ -1969,7 +2064,7 @@ class MainWindow(QMainWindow):
         except AttributeError:
             running, queued = [], []
         live_subs_paths = self._active_subs_paths(running or [], queued or [])
-        conflicts = [path for path in paths if path in live_subs_paths]
+        conflicts = [path for path in ready if path in live_subs_paths]
         if conflicts:
             shown = ", ".join(Path(path).name for path in conflicts[:5])
             more = f" (+{len(conflicts) - 5} more)" if len(conflicts) > 5 else ""
@@ -1982,6 +2077,7 @@ class MainWindow(QMainWindow):
         pending_ids: list[str] | None = None
         if self.job_ids:
             pending_ids = list(self.job_ids)
+        fresh_ids: list[str] = []
         try:
             # v0.4.17: the checkbox state IS the submitted option — it
             # rides the enqueue surface (client_local → registry
@@ -1989,11 +2085,12 @@ class MainWindow(QMainWindow):
             # exactly what this pick asked for.
             # v0.4.18 (opt-in suppress_srt, 5-E6): the same rule
             # extended — the checkbox state IS the submitted option.
-            fresh_ids = self.client.enqueue_subs(
-                paths,
-                replace_source=self.subs_replace_source.isChecked(),
-                suppress_srt=self.subs_suppress_srt.isChecked(),
-            )
+            if ready:
+                fresh_ids = self.client.enqueue_subs(
+                    ready,
+                    replace_source=self.subs_replace_source.isChecked(),
+                    suppress_srt=self.subs_suppress_srt.isChecked(),
+                )
         except (
             BatchTooLarge,
             FileNotFoundError,
@@ -2012,9 +2109,28 @@ class MainWindow(QMainWindow):
             else:
                 self.job_ids = []
             return
+        # v0.4.19 (WS2): rows ALWAYS render (the partition: ready first,
+        # then skip, then blocked — _begin_job_slate's job↔row mapping
+        # is row_offset+index over the READY list; skip/blocked rows
+        # carry no job and sit BELOW the last job row, never aliased).
+        seed = self.file_table.rowCount()
+        ordered = ready + skipped + blocked
+        self.file_table.setRowCount(seed + len(ordered))
+        for offset, cells in enumerate(self._subs_file_rows(ordered, verdicts)):
+            for column, text in enumerate(cells):
+                self.file_table.setItem(
+                    seed + offset, column, QTableWidgetItem(text)
+                )
         if not fresh_ids:
+            # nothing enqueued — the static skip/block rows still render
+            # (and the summary below names why); no slate, no timer.
             if pending_ids is not None:
                 self.job_ids = pending_ids
+            self._set_summary(
+                _subs_enqueue_summary(0, len(skipped), len(blocked)),
+                "Skipped and blocked files are not enqueued; the "
+                "run-side guards remain the backstop.",
+            )
             return
         # v0.4.15.1: the window tracks ENQUEUED-BY-THIS-WINDOW ids with
         # a LIVE (non-terminal, snapshot-provable) state — stale ids
@@ -2027,13 +2143,6 @@ class MainWindow(QMainWindow):
         # rows append after any prior batch's rows (the table is the
         # window's batch view; an old batch's terminal rows stay
         # readable above — clear_files empties the whole table).
-        seed = self.file_table.rowCount()
-        self.file_table.setRowCount(seed + len(paths))
-        for offset, cells in enumerate(self._subs_file_rows(paths)):
-            for column, text in enumerate(cells):
-                self.file_table.setItem(
-                    seed + offset, column, QTableWidgetItem(text)
-                )
         # v0.4.14 (Mode B): a fresh submission reseeds the slate — the
         # shared bootstrap gives these rows the same _batch_row_for_job
         # identity map, run_counts slots, bar, and follow engagement
@@ -2060,9 +2169,12 @@ class MainWindow(QMainWindow):
             self._reset_batch_progress()
             self._begin_job_slate(self.job_ids, row_offset=seed)
         self._set_summary(
-            f"{len(self._batch_slots)} queued for subtitles"
-            if pending_ids is not None
-            else f"{len(self.job_ids)} queued for subtitles",
+            _subs_enqueue_summary(
+                len(self._batch_slots) if pending_ids is not None
+                else len(self.job_ids),
+                len(skipped),
+                len(blocked),
+            ),
             "Transcribing audio and soft-muxing subtitles (no upscale).",
         )
 
