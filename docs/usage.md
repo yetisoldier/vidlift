@@ -46,7 +46,9 @@ Use any of these methods:
 
 - drag one or more video files into the window
 - select **Add Files**
-- select **Add Folder** to add supported videos from one folder
+- select **Add Folder** to add supported videos from one folder, including
+  every subfolder (recursion is always on — a whole show, all seasons,
+  queues at once; dropping a folder does the same walk)
 
 Recognized extensions include AVI, DivX, FLV, M4V, MKV, MOV, MP4, MPEG,
 MPG, TS, VOB, and WMV.

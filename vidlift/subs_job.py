@@ -14,6 +14,19 @@ exception to source-blindness — after a verified remux, the source is
 deleted and the output lands at ``{stem}.mp4`` (see
 :func:`replace_subs_output`). The default stays source-blind.
 
+v0.4.18 (opt-in ``suppress_srt``, strictly opt-in default OFF): with
+the flag set, the redundant ``{stem}.subs.srt`` sidecar is removed
+AFTER a successful mux (a mux failure raises before suppression and
+keeps it as the fallback deliverable) and BEFORE the replace block —
+so ``SubsJobResult.srt_path`` becomes the deliberately-empty ``""``
+sentinel (suppression never lies about a file that is gone; a removal
+OSError keeps the sidecar AND the truthful path). The default keeps
+the sidecar: pre-0.4.18 behavior is the absent-defaults rule.
+v0.4.18 (WS3, Karen K-5): after a SUCCESSFUL job the default
+``{output}.subs-work`` scratch directory is removed
+(:func:`cleanup_subs_scratch`, the Mode B counterpart of run cleanup);
+every failure/cancel path retains the scratch for diagnosis.
+
 The pipeline has no upscale, no mezzanine, no plan object: it is
 probe → guard → transcribe (GPU-phase lock claim) → remux. The MCP
 registry's ``subs`` job kind and the CLI ``vidlift subs`` subcommand
@@ -35,7 +48,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .probe import classify, probe_file
-from .subtitles import SubtitleOcrError, mux_language
+from .subtitles import (
+    SubtitleOcrError,
+    mux_language,
+    remove_srt_sidecar,  # v0.4.18 (opt-in suppress_srt; import ≠ export)
+)
 from .transcribe import (
     TRANSCRIPTION_ENABLED_DEFAULT,  # noqa: F401 (re-export convenience)
     TranscriptionError,
@@ -48,6 +65,7 @@ __all__ = [
     "subs_output_path",
     "subs_replace_target",  # v0.4.17
     "replace_subs_output",  # v0.4.17
+    "cleanup_subs_scratch",  # v0.4.18 (WS3, K-5)
     "run_subs_job",
 ]
 
@@ -62,6 +80,11 @@ class SubsJobResult:
 
     v0.4.15.3 (D4): ``device`` mirrors the transcription's device fact
     ("" when a foreign factory ran — honest unknown).
+
+    v0.4.18: ``srt_path`` is the honest post-run sidecar location;
+    v0.4.18's ``suppress_srt`` may legitimately make it ``""`` — the
+    deliberately-suppressed sentinel (never a stale claim of a file
+    that was removed).
     """
 
     source_path: str
@@ -137,6 +160,10 @@ def run_subs_job(
     # `force` — ordering inside a kw-only block is source-compatible for
     # every caller (all seven call sites pass keywords).
     replace_source: bool = False,
+    # v0.4.18 (opt-in suppress_srt, D6): strictly opt-in, default False
+    # (the sidecar is the deliverable unless the caller opts in); the
+    # empty-string srt_path sentinel is documented on SubsJobResult.
+    suppress_srt: bool = False,
     workdir: str | None = None,
     state_root: str | os.PathLike | None = None,
     on_step=None,
@@ -156,6 +183,14 @@ def run_subs_job(
     the output is ``{stem}.subs.mp4`` and a pre-existing output FAILS
     the job (not-ready, the caller decides; run-side guard mirrors the
     plan-time collision gate).
+
+    v0.4.18 (``suppress_srt``, strictly opt-in — default False keeps the
+    v0.4.17 byte behavior): after the mux SUCCEEDS the sidecar is
+    removed best-effort; a mux failure raises before the removal, so
+    ``{stem}.subs.srt`` stays exactly the fallback deliverable it is
+    today (flag-independent); a removal OSError keeps the file and the
+    truthful path. With suppression shipped, ``result.srt_path`` is
+    ``""`` (the deliberately-none sentinel — see SubsJobResult).
     """
 
     def _step(name: str) -> None:
@@ -192,6 +227,12 @@ def run_subs_job(
         os.path.dirname(output_path),
         os.path.basename(output_path)[:-4] + ".srt",
     )
+    # v0.4.18 (WS3, D10/K-5): the scratch directory is captured ONCE
+    # here, PRE-rename, replacing the inline expression at the core
+    # call — so the replace-source rename of the output can never
+    # confuse the cleanup target (cleanup_subs_scratch's path guard
+    # compares exactly this name).
+    workdir_used = workdir or (output_path + ".subs-work")
 
     # ---- transcribe (the GPU-phase lock claim, Mode A discipline) --
     _step("transcribe")
@@ -211,7 +252,7 @@ def run_subs_job(
         transcribed = transcribe_source_to_srt(
             source_path,
             output_path=output_path,
-            workdir=workdir or (output_path + ".subs-work"),
+            workdir=workdir_used,
             ffmpeg=ffmpeg,
             runner=runner if runner is not None else _default_runner,
             engine_factory=engine_factory,
@@ -243,6 +284,17 @@ def run_subs_job(
     final_output = output_path
     final_srt = transcribed.srt_path
     notes = list(transcribed.notes)
+    # v0.4.18 (opt-in suppress_srt): the mux above SUCCEEDED, so the
+    # sidecar is redundant — remove it BEFORE any replace, where the
+    # helper's isfile guard (replace_subs_output step 4) then makes the
+    # sidecar step a guaranteed no-op; on failure mplex already raised
+    # ABOVE this line, so the sidecar survived as the fallback
+    # deliverable. Removal is best-effort: an OSError keeps the file
+    # and final_srt stays truthful (the helper logs the WARNING).
+    if suppress_srt:
+        if remove_srt_sidecar(transcribed.srt_path, log_line=notes.append):
+            final_srt = ""
+            notes.append("srt sidecar suppressed after a successful mux")
     if replace_source:
         # v0.4.17: cancellation never replaces — after the remux lands,
         # before any mutation (transcribe.py's should_cancel contract).
@@ -266,6 +318,14 @@ def run_subs_job(
             notes.append(
                 f"WARNING replace-source failed; keeping both files: {exc}"
             )
+
+    # v0.4.18 (Karen K-5, success-only): the .subs-work scratch dir is
+    # Mode A's cleanup_run_artifacts counterpart. This line is reached
+    # only past a successful mux (and any requested replace); every
+    # failure/cancel above retains the scratch for diagnosis.
+    # workdir_used was captured PRE-rename; the helper's path guard
+    # deletes only the default-derived directory.
+    cleanup_subs_scratch(output_path, workdir_used, log_line=notes.append)
 
     return SubsJobResult(
         source_path=source_path,
@@ -518,3 +578,48 @@ def replace_subs_output(
                 final_srt = srt_path
     _log(f"replace-source: output now at {target}")
     return str(target), final_srt
+
+
+def cleanup_subs_scratch(
+    output_path: str, workdir_used: str, *, log_line=None
+) -> list[str]:
+    """v0.4.18 (Karen K-5): remove the ``{output}.subs-work`` scratch
+    directory after a SUCCESSFUL subs job — the Mode B counterpart of
+    run.cleanup_run_artifacts (v0.4.7), with the same three guardrails
+    held as structure, not convention:
+
+    - success-only: the sole call site sits on the verified-success
+      path (post-mux, post-replace); every raise path (probe, guard,
+      transcription, mux, cancel) skips it, so the scratch survives for
+      diagnosis, mirroring Mode A's failure/cancel retention;
+    - best-effort: an OSError logs a WARNING and the success stands —
+      cleanup never fails a job and never re-raises;
+    - path-guarded: ONLY the exact default-derived
+      ``output_path + ".subs-work"`` directory is ever deleted
+      (normcase/abspath identity). A caller-supplied ``workdir`` is the
+      caller's own directory and is NEVER touched here.
+
+    ``output_path`` is the PRE-replace ``{stem}.subs.mp4`` path — the
+    scratch name never follows a replace-source rename. Returns the
+    removed paths ([] when nothing was removed).
+    """
+    default_scratch = output_path + ".subs-work"
+    if os.path.normcase(os.path.abspath(workdir_used)) != os.path.normcase(
+        os.path.abspath(default_scratch)
+    ):
+        return []  # caller-managed workdir — the path guard
+    scratch = Path(default_scratch)
+    if not scratch.is_dir():
+        return []
+    try:
+        shutil.rmtree(scratch)
+    except OSError as exc:
+        if log_line is not None:
+            log_line(
+                f"WARNING subs scratch cleanup could not remove "
+                f"{scratch}: {exc}"
+            )
+        return []
+    if log_line is not None:
+        log_line(f"cleanup subs scratch: {scratch}")
+    return [str(scratch)]

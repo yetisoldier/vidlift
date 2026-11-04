@@ -262,6 +262,11 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
             # options["denoise"] reads as None (config default "off"),
             # so pre-0.4.15 callers are behavior-identical.
             denoise=options.get("denoise", None),
+            # v0.4.18 (opt-in sidecar suppression): absent-defaults rule
+            # again — no options["suppress_srt"] (pre-0.4.18 callers/
+            # records) reads as False → the KEEP-sidecar v0.4.17
+            # behavior, byte-identical.
+            suppress_srt=bool(options.get("suppress_srt", False)),
         )
     except EngineCancelled as exc:
         state = getattr(exc, "state", None)
@@ -472,6 +477,11 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
             # records and callers) reads as False, so the source-blind
             # v0.4.14..0.4.16 behavior is untouched for them.
             replace_source=bool(options.get("replace_source", False)),
+            # v0.4.18 (opt-in sidecar suppression): absent-defaults rule
+            # once more — no options["suppress_srt"] (pre-0.4.18
+            # records/callers) reads as False → the KEEP-sidecar
+            # v0.4.17 behavior, byte-identical.
+            suppress_srt=bool(options.get("suppress_srt", False)),
             workdir=options.get("workdir"),
             state_root=services.state_dir,
             on_progress=on_segments,

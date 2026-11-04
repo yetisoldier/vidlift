@@ -70,6 +70,12 @@ _OPTIONS_RUN = {
     # Absent -> config DENOISE_DEFAULT ("off"); pre-0.4.15 callers are
     # behavior-identical (the absent-defaults rule).
     "denoise": {"type": "string"},
+    # v0.4.18 (opt-in sidecar suppression, D6): absent -> False (the
+    # absent-defaults rule); when True the redundant .srt sidecar is
+    # removed ONLY after the subtitle track is embedded/muxed
+    # successfully — a fail-open or mux failure keeps it as the
+    # fallback deliverable. (S-1)
+    "suppress_srt": {"type": "boolean"},
 }
 
 # The binding tool surface (mcp-bridge.md Section 4, verbatim shapes).
@@ -134,6 +140,12 @@ TOOL_SCHEMAS: dict[str, dict] = {
             # the source and renames the output to {stem}.mp4 (never the
             # old extension) with a keep-both guard on collision.
             "replace_source": {"type": "boolean"},
+            # v0.4.18 (opt-in sidecar suppression, D6): absent -> False
+            # (the absent-defaults rule); when True the redundant .srt
+            # sidecar is removed ONLY after the subtitle track is
+            # embedded/muxed successfully — a fail-open or mux failure
+            # keeps it as the fallback deliverable. (S-1)
+            "suppress_srt": {"type": "boolean"},
         },
         "required": ["paths"],
     },
@@ -189,9 +201,12 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
         "beside the source — never overwriting it (unless the optional "
         "`replace_source` flag is set — then on success the source is "
         "deleted and the output takes the source's name with an .mp4 "
-        "extension, with a keep-both guard on collision). Enqueues subs "
-        "jobs; cancel works on them; status/manifest read them like any "
-        "job."
+        "extension, with a keep-both guard on collision). "
+        "With the optional suppress_srt flag the redundant .srt sidecar is "
+        "removed after a successful mux (a mux failure keeps it as the "
+        "fallback); absent means keep — pre-0.4.18 callers are "
+        "behavior-identical. Enqueues subs jobs; cancel works on them; "
+        "status/manifest read them like any job."
     ),
     "status": (
         "The full runner observability contract for one job: state, phase, "

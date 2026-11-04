@@ -31,6 +31,12 @@ bundled FFmpeg, Real-ESRGAN, and OCR tools beside the frozen executables.
 - VidLift accepts files, not discs or titles.
 - Output naming is derived from the input filename.
 - The tool reports source limits honestly instead of promising invented detail.
+- Mode B (subs) scratch lifecycle: the default `{output}.subs-work`
+  scratch directory is removed after a SUCCESSFUL subs job (the v0.4.18
+  counterpart of the run-success cleanup, v0.4.7); failures, cancels,
+  and cleanup errors retain it for diagnosis, and a caller-supplied
+  workdir is never touched (path-guarded to the default-derived
+  directory).
 
 ## State Location (registry lanes)
 

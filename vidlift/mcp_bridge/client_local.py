@@ -46,7 +46,17 @@ __all__ = [
 # The GUI refuses to enqueue more than this many files per Start click
 # (design §3): a mis-click on a folder of thousands must not silently
 # queue hours of GPU work. The plan view remains the honest gate.
-MAX_GUI_BATCH = 64
+# v0.4.18 (WS1, D4): 64 -> 500, ALIGNED with gui.MAX_FILES — one
+# batch-size policy (the v0.4.15.4 F-13a principle generalized). The
+# reason: a Mode B recursive folder-add of 65-500 files passes
+# gui.MAX_FILES and would then die on this per-call raise — the
+# feature's flagship case (5 seasons x 20 episodes) failed at enqueue
+# with a "run them in rounds" dialog. The cap stays GUI-local (the MCP
+# tool_run/tool_transcribe enqueue loops were never capped); worst
+# case is ~500 pending registry records (~0.5 MB) drained by the
+# existing terminal-retention rules, and the queue table already
+# renders 500 rows for Mode A planning.
+MAX_GUI_BATCH = 500
 
 
 def default_state_dir() -> Path:
@@ -160,7 +170,11 @@ class LocalBridgeClient:
     # mirrors enqueue_run's (a missing file raises, the picker never
     # shows fabricated rows).
     def enqueue_subs(
-        self, paths: list[str], *, replace_source: bool = False
+        self,
+        paths: list[str],
+        *,
+        replace_source: bool = False,
+        suppress_srt: bool = False,
     ) -> list[str]:
         """Validate paths, enqueue one ``subs`` job per path in
         submission order, wake the executor, and return the job_ids in
@@ -172,7 +186,11 @@ class LocalBridgeClient:
         ``_execute_subs_job``'s absent-defaults read picks it up; the GUI
         checkbox feeds it explicitly, and calls without the kwarg are
         behavior-identical to v0.4.16 (options keep carrying the False
-        default, never a fabricated ON)."""
+        default, never a fabricated ON).
+
+        v0.4.18 (opt-in sidecar suppression): ``suppress_srt`` (default
+        False — the KEEP sidecar discipline) rides the same way; calls
+        without the kwarg are behavior-identical to v0.4.17."""
         clean: list[str] = []
         for path in paths:
             path_str = str(path)
@@ -195,7 +213,8 @@ class LocalBridgeClient:
                 paths=[path],
                 options={"language": "", "model": None, "device": "auto",
                          "force": False,
-                         "replace_source": bool(replace_source)},
+                         "replace_source": bool(replace_source),
+                         "suppress_srt": bool(suppress_srt)},
             )
             self.services.executor.notify_new_work()
             job_ids.append(record.job_id)

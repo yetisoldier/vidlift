@@ -148,18 +148,24 @@ class _ScriptedClient:
         self.last_enqueued_kinds = ["run"] * len(chosen)
         return list(chosen)
 
-    def enqueue_subs(self, paths, *, replace_source=False):
+    def enqueue_subs(
+        self, paths, *, replace_source=False, suppress_srt=False
+    ):
         """The Mode B surface: kind-checked ids in pick order.
 
         v0.4.17: the GUI passes the replace-source checkbox state as a
         keyword (the spec's item 11 call shape) — the double accepts and
         records it (last_subs_replace_source) so the File B tests can
         assert ON/OFF thread through; a defaulted kwarg keeps every
-        scripted caller (incl. the v0.4.15.1 guard suite) green."""
+        scripted caller (incl. the v0.4.15.1 guard suite) green.
+        v0.4.18 (§12 File F, the enumerated harness amendment): the
+        defaulted ``suppress_srt=False`` kw + ``last_subs_suppress_srt``
+        record the same way."""
         for path in paths:
             if not Path(path).is_file():
                 raise FileNotFoundError(f"no such file on this machine: {path}")
         self.last_subs_replace_source = bool(replace_source)
+        self.last_subs_suppress_srt = bool(suppress_srt)
         self.armed = True
         fresh = [jid for jid in self.job_order if jid not in self.submitted]
         chosen = fresh[: len(paths)]
@@ -915,9 +921,11 @@ def test_subs_replace_checkbox_exists_beside_button_default_off_tooltip(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     # placement: co-located, right of the Mode B button, in the Mode B
-    # group's own grid
+    # group's own grid. v0.4.18 (4-A9 re-tile): the picker pair (button
+    # + folder button) first, then the options pair — the replace
+    # checkbox moved (0,1) -> (0,2) (the File-E T4 re-pin, same re-tile).
     assert _grid_position(win, win.add_subs_button) == (0, 0)
-    assert _grid_position(win, win.subs_replace_source) == (0, 1)
+    assert _grid_position(win, win.subs_replace_source) == (0, 2)
     # group separation (workstream-2): the button + checkbox share the
     # Mode B group (spec: 'parentWidget() is not ...' must be False —
     # the positive identity below is its exact equivalent), while Mode
@@ -1094,7 +1102,10 @@ def test_mode_a_replace_option_never_cross_wires_mode_b(
     start_src = inspect.getsource(MainWindow.start_upscale)
     assert '"replace_source": self.replace_source.isChecked()' in start_src
     assert "subs_replace_source" not in start_src
-    subs_src = inspect.getsource(MainWindow.choose_subs_files)
+    subs_src = inspect.getsource(MainWindow._enqueue_subs_paths)
+    # v0.4.18 (4-A6/4-A7): the enqueue tail moved into
+    # _enqueue_subs_paths — the fence follows the code it guards (the
+    # File-E T9 re-target, same extraction).
     assert "replace_source=self.subs_replace_source.isChecked()" in subs_src
     # and the Mode B path never reads Mode A's checkbox
     assert "self.replace_source.isChecked()" not in subs_src

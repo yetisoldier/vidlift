@@ -51,7 +51,8 @@ Stuck? → [Troubleshooting](#-troubleshooting)
 ## Plan a batch
 
 Open VidLift, then drag video files into the window or select **Add Files**
-or **Add Folder**. Choose an optional output folder, decide whether bitmap
+or **Add Folder** (folder adds include every subfolder, so a whole show
+queues at once). Choose an optional output folder, decide whether bitmap
 subtitle OCR should run, and select **Plan Batch**.
 
 ![VidLift home screen](docs/images/vidlift-home.png)
@@ -168,7 +169,9 @@ interface both process bulk queues serially so jobs do not compete for the GPU.
 For each successful job, VidLift writes:
 
 - a verified 720p HEVC MP4
-- an SRT sidecar when a subtitle was selected or recovered
+- an SRT sidecar when a subtitle was selected or recovered (opt-in: the
+  "Suppress .srt sidecar on success" option deletes it after a successful
+  embed — a failed embed always keeps it as the fallback)
 - a run log with commands, phases, and heartbeat activity
 - a JSON manifest with the input, plan, engine, timing, outputs, and
   verification result

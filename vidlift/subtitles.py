@@ -60,6 +60,7 @@ __all__ = [
     "intermediate_ext",
     "mux_language",
     "mux_srt_into_mp4",
+    "remove_srt_sidecar",  # v0.4.18 (opt-in sidecar suppression)
     "ocr_selected_track",
     "resolve_tesseract",
     "resolve_seconv",
@@ -460,6 +461,34 @@ def extract_subtitles(
 def sidecar_srt_path(output_path: str) -> str:
     """<output-stem>.srt next to the finished MP4 (the KEEP contract)."""
     return os.path.splitext(output_path)[0] + ".srt"
+
+
+def remove_srt_sidecar(srt_path: str, *, log_line=None) -> bool:
+    """v0.4.18 (opt-in sidecar suppression): best-effort removal of an
+    .srt sidecar AFTER the soft-mux/embed succeeded.
+
+    Returns True when no sidecar remains (removed, or already absent —
+    FileNotFoundError is success), False when another OSError kept it;
+    a failure logs a WARNING through ``log_line`` (the
+    cleanup_run_artifacts channel style) and is NEVER fatal — the
+    sidecar simply stays beside the output and the caller reports the
+    honest post-call truth. Only ever called on paths the current job
+    itself wrote this run (transcription/OCR outputs, the
+    adopted-sidecar COPY); a user's original sidecar file is never a
+    candidate.
+    """
+    try:
+        os.remove(srt_path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        if log_line is not None:
+            log_line(
+                f"WARNING suppress-srt: could not remove {srt_path}: {exc}"
+            )
+            return False
+        return False
+    return True
 
 
 # ---- seconv lane (Windows; port of b2m's two-pass flow) --------------------

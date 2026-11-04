@@ -17,6 +17,7 @@ never lying.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -104,6 +105,41 @@ VIDEO_EXTENSIONS = {
 # single-shot selections before planning; per-click Start enqueues at
 # most MAX_GUI_BATCH job records (client_local also enforces).
 MAX_FILES = 500
+
+
+def collect_video_files(folder: str | Path) -> list[str]:
+    """v0.4.18 (recursive folder-add, Eric's whole-show case): walk a
+    folder TREE and return every recognized video (VIDEO_EXTENSIONS),
+    deduplicated and sorted by path. Shared by BOTH Add Folder buttons
+    (Mode A upscale, Mode B subtitles) and the drop handler — one
+    ingestion traversal, one count policy. Recursion is unconditional
+    (no toggle): the file pickers remain the shallow-pick surface.
+
+    Symlink discipline: ``os.walk(followlinks=False)`` never descends
+    into a symlinked directory, so a symlink loop CANNOT form (no
+    visited-inode bookkeeping needed); file-level symlink duplicates
+    collapse via normcase(realpath) dedupe, with the lexicographically
+    first name surviving (dedupe runs over the sorted list, never on
+    walk order). Unreadable subtrees are skipped silently (os.walk's
+    documented default). The result is fully sorted — the pre-0.4.18
+    ``sorted(iterdir())`` determinism generalized to the tree.
+    """
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
+        dirnames.sort()  # deterministic descent, independent of os.walk order
+        for name in filenames:
+            candidate = Path(dirpath) / name
+            if candidate.suffix.lower() in VIDEO_EXTENSIONS:
+                found.append(str(candidate))
+    seen: set[str] = set()
+    collected: list[str] = []
+    for path in sorted(found):
+        key = os.path.normcase(os.path.realpath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        collected.append(path)
+    return collected
 
 # v0.4.5 (progress-honesty design §2, D-tail): pin-to-tail tolerance
 # for the run log widget. Within this many pixels of the scrollbar's
@@ -663,6 +699,26 @@ class MainWindow(QMainWindow):
         )
         self.transcribe_subs.toggled.connect(self._transcribe_subs_changed)
 
+        # v0.4.18 (opt-in suppress_srt, Mode A, D5/D6): strictly opt-in,
+        # default OFF — the side-by-side KEEP deliverable is the
+        # documented v0.4.15 contract, so deselected/absent means the
+        # pre-0.4.18 behavior. The checkbox state IS the submitted
+        # option (the v0.4.17 rule); QSettings persists under Mode A's
+        # own key ("suppress_srt"), never Mode B's ("subs_suppress_srt").
+        self.suppress_srt = QCheckBox("Suppress .srt sidecar on success")
+        self.suppress_srt.setChecked(
+            self._settings().value("suppress_srt", False, type=bool)
+        )
+        self.suppress_srt.setToolTip(
+            "After subtitles are safely embedded in the finished MP4, do "
+            "not keep the .srt sidecar beside the output — the toggleable "
+            "track inside the MP4 is the deliverable.\n\n"
+            "Whenever subtitles fail open (no embed), the sidecar that "
+            "was written is kept as the fallback, no matter how this "
+            "option is set."
+        )
+        self.suppress_srt.toggled.connect(self._suppress_srt_changed)
+
         # v0.4.15 (opt-in denoise): three states in a combo (Off default,
         # Light, Strong) — a checkbox cannot name two strengths. The
         # Mode A upscale flow is the ONLY surface: Mode B (subs) has no
@@ -762,6 +818,24 @@ class MainWindow(QMainWindow):
             "once."
         )
         self.add_subs_button.clicked.connect(self.choose_subs_files)
+        # v0.4.18 (WS1 recursive folder-add, D1): the Mode B twin of
+        # Mode A's "Add Folder" — an ATTRIBUTE (not a layout-local like
+        # Mode A's button) so the T1 layout fence and the F-1
+        # membership pin can hold it accountable. It feeds the SAME
+        # shared collector (collect_video_files) through
+        # choose_subs_folder: one traversal, one count policy across
+        # both modes and the drop handler. Structure preservation is by
+        # derivation, never by code: every output lands beside its own
+        # source (subs_output_path), so nested shows never relocate.
+        self.subs_add_folder_button = QPushButton("Add Folder")
+        self.subs_add_folder_button.setToolTip(
+            "Add recognized videos from a folder, including every "
+            "subfolder — a whole show (all seasons) queues at once.\n\n"
+            "Outputs land beside each source file, so the folder "
+            "structure is preserved; the same per-run options (replace "
+            "original, suppress .srt) apply as for picked files."
+        )
+        self.subs_add_folder_button.clicked.connect(self.choose_subs_folder)
         # v0.4.17 workstream-2 (opt-in Mode B replace-source, D4-1):
         # the checkbox lives IN the Mode B group's own grid at (0, 1),
         # immediately right of "Add Subtitles…" (0, 0) — co-located so
@@ -791,6 +865,33 @@ class MainWindow(QMainWindow):
         )
         self.subs_replace_source.toggled.connect(
             self._subs_replace_source_changed
+        )
+        # v0.4.18 (opt-in suppress_srt, Mode B, D5/D6): strictly opt-in,
+        # default OFF — the .srt sidecar side-by-side KEEP disposition is
+        # the documented v0.4.15 contract, so absent/deselected means the
+        # pre-0.4.18 deliverable set. The checkbox state IS the submitted
+        # option (the v0.4.17 rule); QSettings persists it under Mode B's
+        # own key ("subs_suppress_srt" — the "subs_" prefix precedent
+        # from "subs_replace_source"), isolated from Mode A's
+        # "suppress_srt".
+        self.subs_suppress_srt = QCheckBox(
+            "Suppress .srt sidecar on success"
+        )
+        self.subs_suppress_srt.setChecked(
+            self._settings().value(
+                "subs_suppress_srt", False, type=bool
+            )
+        )
+        self.subs_suppress_srt.setToolTip(
+            "After the subtitle track is safely muxed into the MP4, delete "
+            "the redundant .srt sidecar — the toggleable track inside the "
+            "MP4 is the deliverable.\n\n"
+            "If the mux fails, the .srt is kept as the fallback deliverable "
+            "no matter how this option is set. Applies to Add Subtitles "
+            "only — the upscale panel has its own sidecar option."
+        )
+        self.subs_suppress_srt.toggled.connect(
+            self._subs_suppress_srt_changed
         )
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
@@ -1233,6 +1334,19 @@ class MainWindow(QMainWindow):
         ("replace_source") key is never touched by it."""
         self._settings().setValue("subs_replace_source", bool(checked))
 
+    def _subs_suppress_srt_changed(self, checked: bool) -> None:
+        """v0.4.18: persist the Mode B suppress-sidecar preference
+        (QSettings house rule, verbatim _subs_replace_source_changed
+        pattern). "subs_suppress_srt" is Mode B's own key — Mode A's
+        ("suppress_srt") is never touched by it."""
+        self._settings().setValue("subs_suppress_srt", bool(checked))
+
+    def _suppress_srt_changed(self, checked: bool) -> None:
+        """v0.4.18: persist the Mode A suppress-sidecar preference
+        ("suppress_srt"); Mode B's "subs_suppress_srt" is never
+        touched."""
+        self._settings().setValue("suppress_srt", bool(checked))
+
     def _resume_claim_changed(self, checked: bool) -> None:
         """Persist the resume-claim preference (v0.4.9 §1.4, QSettings
         house rule); only the stored value changes."""
@@ -1337,7 +1451,13 @@ class MainWindow(QMainWindow):
         add.setToolTip("Choose one or more video files")
         add.clicked.connect(self.add_files)
         folder = QPushButton("Add Folder")
-        folder.setToolTip("Add recognized videos from a folder")
+        # v0.4.18 (WS1): the tooltip advertises recursion truthfully
+        # (S-3) — the button's reach grew from the folder's top level to
+        # the whole tree.
+        folder.setToolTip(
+            "Add recognized videos from a folder, including every "
+            "subfolder (recursion is always on — a whole show at once)."
+        )
         folder.clicked.connect(self.add_folder)
         clear = QPushButton("Clear")
         clear.clicked.connect(self.clear_files)
@@ -1384,6 +1504,13 @@ class MainWindow(QMainWindow):
         grid.addWidget(QLabel(DENOISE_COMBO_LABEL), 3, 1)
         grid.addWidget(self.denoise_combo, 3, 2)
         grid.addWidget(self.transcribe_subs, 3, 3, 1, 3)
+        # v0.4.18 (opt-in suppress_srt, row 5-E4): row 3 IS the Mode A
+        # subtitle-carry-policy row. The (3, 6, 1, 3) span is verified
+        # free (transcribe_subs spans (3,3,1,3); column 6 is the stretch
+        # column via setColumnStretch(6, 1) below) and shares the
+        # existing stretch, so the checkbox's label adds no new
+        # minimum-width contribution (T5's width gate re-proves it).
+        grid.addWidget(self.suppress_srt, 3, 6, 1, 3)
         grid.setColumnStretch(6, 1)
         layout.addWidget(controls_upscale)
 
@@ -1398,16 +1525,25 @@ class MainWindow(QMainWindow):
         subs_grid.setContentsMargins(18, 8, 18, 12)
         subs_grid.setHorizontalSpacing(12)
         subs_grid.setVerticalSpacing(10)
+        # v0.4.18 (WS1/WS2 re-tile, row 4-A9): the picker PAIR first —
+        # "Add Subtitles…" (0,0) + "Add Folder" (0,1), mirroring the
+        # upscale group's Add Files → Add Folder order — then the
+        # options pair ADJACENT: subs_replace_source (0,2, moved from
+        # (0,1)) and subs_suppress_srt (0,3, both are the run-shaping
+        # checkboxes); the scope explainer keeps the trailing stretch
+        # (col 4, moved from (0,2)).
         subs_grid.addWidget(self.add_subs_button, 0, 0)
-        subs_grid.addWidget(self.subs_replace_source, 0, 1)
+        subs_grid.addWidget(self.subs_add_folder_button, 0, 1)
+        subs_grid.addWidget(self.subs_replace_source, 0, 2)
+        subs_grid.addWidget(self.subs_suppress_srt, 0, 3)
         explainer = QLabel(
             "Adds subtitles from the file's own audio — video streams "
             "are copied (no upscale, no re-encode)."
         )
         explainer.setObjectName("Muted")
         explainer.setWordWrap(True)
-        subs_grid.addWidget(explainer, 0, 2)
-        subs_grid.setColumnStretch(2, 1)
+        subs_grid.addWidget(explainer, 0, 4)
+        subs_grid.setColumnStretch(4, 1)
         layout.addWidget(controls_subs)
         layout.addWidget(self.progress)
 
@@ -1470,6 +1606,20 @@ class MainWindow(QMainWindow):
         return pill
 
     def _apply_style(self) -> None:
+        # v0.4.18 (WS4, D12): the QGroupBox title floats visibly off its
+        # border line. MECHANICS: with `subcontrol-origin: margin` +
+        # `subcontrol-position: top left` the title anchors to the TOP
+        # of the margin box while the border sits at the margin's inner
+        # edge — so every pixel of added margin-top moves the border
+        # DOWN relative to the fixed-anchored title (the title floats up
+        # off the line by exactly that delta). REJECTED: the negative
+        # `top:` on ::title — paints above the widget's own rect; QStyle
+        # may clip that platform-dependently, and it risks the row
+        # above. TUNING (Windows Segoe UI build only): acceptance band
+        # is 4-7 px of title-bottom-to-border clearance at 100 % scale;
+        # if outside the band adjust ONLY the margin-top below in ±2 px
+        # steps and re-verify BOTH groups. Linux offscreen cannot
+        # reproduce the metric; the committed value is 20 px.
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #101214; color: #edf0ec; }
@@ -1480,7 +1630,7 @@ class MainWindow(QMainWindow):
             #Muted { color: #98a196; font-size: 13px; }
             #StageLabel { color: #e8ddc0; font-size: 15px; }
             #RunPanel { background: #191d1f; border: 1px solid #2b3134; border-radius: 8px; }
-            QGroupBox#Controls { background: #191d1f; border: 1px solid #2b3134; border-radius: 8px; margin-top: 14px; padding-top: 4px; font-weight: 600; }
+            QGroupBox#Controls { background: #191d1f; border: 1px solid #2b3134; border-radius: 8px; margin-top: 20px; padding-top: 4px; font-weight: 600; }
             QGroupBox#Controls::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 4px; color: #98a196; }
             QPushButton { background: #242a2d; border: 1px solid #3a4246; border-radius: 6px; padding: 9px 14px; color: #edf0ec; }
             QPushButton:hover { background: #30383c; border-color: #657178; }
@@ -1552,19 +1702,20 @@ class MainWindow(QMainWindow):
         self._add_paths(paths)
 
     def add_folder(self) -> None:
+        # v0.4.18 (WS1): the traversal is the SHARED recursive collector
+        # (D1: one collector, one count policy). The MAX_FILES guard now
+        # evaluates the recursive TOTAL and the warning names the count
+        # and the tree (S-4); `_add_paths` is unchanged.
         folder = QFileDialog.getExistingDirectory(self, "Choose a folder", str(Path.home()))
         if not folder:
             return
-        paths = [
-            str(path)
-            for path in sorted(Path(folder).iterdir())
-            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
-        ]
+        paths = collect_video_files(folder)
         if len(paths) > MAX_FILES:
             QMessageBox.warning(
                 self,
                 "VidLift",
-                f"That folder holds {len(paths)} videos; add at most {MAX_FILES} at once.",
+                f"That folder tree holds {len(paths)} videos (subfolders "
+                f"included); add at most {MAX_FILES} at once.",
             )
             return
         self._add_paths(paths)
@@ -1689,6 +1840,49 @@ class MainWindow(QMainWindow):
         paths = [str(path) for path in paths if str(path)]
         if not paths:
             return
+        self._enqueue_subs_paths(paths)
+
+    def choose_subs_folder(self) -> None:
+        """v0.4.18 (WS1): the Mode B folder entry — a directory picker
+        feeding the SHARED recursive collector (collect_video_files):
+        the whole tree queues at once, symlink-loop-proof, deduplicated,
+        deterministically ordered. Outputs land beside each source
+        (subs_output_path derives from the source's own directory), so
+        the nested structure is preserved by construction — the add
+        never relocates or flattens. The MAX_FILES guard evaluates the
+        recursive TOTAL and names the count; an empty folder is a
+        silent no-op (the picker's already-cancelled discipline). The
+        handoff (_enqueue_subs_paths) is choose_subs_files' exact
+        post-pick tail: same conflict guard, same enqueue surface, same
+        slate."""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose a folder of videos to add subtitles to",
+            str(Path.home()),
+        )
+        if not folder:
+            return
+        paths = collect_video_files(folder)
+        if len(paths) > MAX_FILES:
+            QMessageBox.warning(
+                self,
+                "VidLift",
+                f"That folder tree holds {len(paths)} videos (subfolders "
+                f"included); add at most {MAX_FILES} at once.",
+            )
+            return
+        if not paths:
+            return
+        self._enqueue_subs_paths(paths)
+
+    def _enqueue_subs_paths(self, paths: list[str]) -> None:
+        """v0.4.18 (WS1, row 4-A6): the post-picker tail of
+        choose_subs_files, extracted VERBATIM so both Mode B surfaces —
+        the file picker and the new folder picker — hand off through
+        the exact same conflict guard, enqueue surface (+ catch list),
+        row render, and slate bootstrap. One ingestion pipeline, no
+        forked copy to drift apart. The v0.4.15.1/v0.4.15.4/v0.4.17
+        comments moved with the code they narrate."""
         # v0.4.15.1: the ONLY blocking condition — a live subs job over
         # the same source. Pure read over queue_views(); a client
         # without that surface (older scripted harnesses) yields no
@@ -1719,9 +1913,12 @@ class MainWindow(QMainWindow):
             # rides the enqueue surface (client_local → registry
             # options) so the executor's absent-defaults read lands on
             # exactly what this pick asked for.
+            # v0.4.18 (opt-in suppress_srt, 5-E6): the same rule
+            # extended — the checkbox state IS the submitted option.
             fresh_ids = self.client.enqueue_subs(
                 paths,
                 replace_source=self.subs_replace_source.isChecked(),
+                suppress_srt=self.subs_suppress_srt.isChecked(),
             )
         except (
             BatchTooLarge,
@@ -2281,6 +2478,11 @@ class MainWindow(QMainWindow):
             # through the bridge's absent-defaults rule the same way the
             # profile rides (off would read the config default anyway).
             "denoise": self.denoise_mode,
+            # v0.4.18 (opt-in suppress_srt): rides into
+            # run_file(suppress_srt=...) through the bridge's
+            # absent-defaults rule — absent reads False (the KEEP
+            # sidecar v0.4.17 behavior), so a stale caller is safe.
+            "suppress_srt": self.suppress_srt.isChecked(),
         }
         try:
             self.job_ids = self.client.enqueue_run(
@@ -3497,22 +3699,30 @@ class MainWindow(QMainWindow):
         for path in paths:
             candidate = Path(path)
             if candidate.is_dir():
-                expanded.extend(
-                    str(child)
-                    for child in sorted(candidate.iterdir())
-                    if child.is_file() and child.suffix.lower() in VIDEO_EXTENSIONS
-                )
+                # v0.4.18 (WS1 drop parity, spec deviation 1): a dropped
+                # folder walks the SAME shared recursive collector the
+                # Add Folder buttons use — one ingestion traversal, one
+                # count policy (the F-13a parity principle). The old
+                # one-level iterdir() silently skipped every file a
+                # level down — pre-existing behavior, newly absurd next
+                # to recursive Add Folder; episodes directly inside a
+                # dropped show root still queue exactly as before.
+                expanded.extend(collect_video_files(candidate))
             else:
                 expanded.append(str(candidate))
         # v0.4.15.4 (F-13a): the drop path enforces the SAME MAX_FILES
         # cap add_folder enforces — one batch-size policy, and the modal
         # names the limit (a silent truncation would teach users to
         # re-drop; the sibling's wording generalized to the drop case).
+        # v0.4.18: the walk is recursive now (WS1), so the wording names
+        # the tree ("subfolders included", S-6), matching the folder
+        # pickers' guard.
         if len(expanded) > MAX_FILES:
             QMessageBox.warning(
                 self,
                 "VidLift",
-                f"That drop holds {len(expanded)} videos; add at most {MAX_FILES} at once.",
+                f"That drop holds {len(expanded)} videos (subfolders "
+                f"included); add at most {MAX_FILES} at once.",
             )
             return
         self._add_paths(expanded)

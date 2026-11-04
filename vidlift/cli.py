@@ -243,6 +243,9 @@ def _cmd_run(
     resume: bool = False,
     denoise: str = "off",
     no_transcribe: bool = False,
+    # v0.4.18 (opt-in sidecar suppression): trailing kw-only param; the
+    # flag rides into run_file after the transcription switch.
+    suppress_srt: bool = False,
 ) -> int:
     """Drive one file through the runner and print its state.
 
@@ -272,6 +275,10 @@ def _cmd_run(
             # config default (run.py's absent-defaults rule); False is
             # the explicit CLI off.
             transcription_enabled=(False if no_transcribe else None),
+            # v0.4.18 (opt-in suppress_srt): the explicit flag — absent
+            # (never possible through argparse's boolean) still reads
+            # False at run_file's seam (absent-defaults aligned).
+            suppress_srt=suppress_srt,
         )
     except (ProbeError, PlanError, RunError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -350,11 +357,23 @@ def _cmd_run(
                 f"subtitles: OCR carried ({ocr.get('engine', '?')}, "
                 f"{ocr.get('cue_count', '?')} cues); spot-check spelling"
             )
-            sidecar = subs.get("sidecar_path")
-            if sidecar:
-                print(f"  sidecar: {sidecar}")
+            # v0.4.18 (opt-in suppress_srt, S-14): a suppressed success
+            # has no sidecar to name — the print never claims one.
+            if subs.get("sidecar_suppressed"):
+                print("  sidecar: suppressed after a successful embed")
+            elif subs.get("sidecar_path"):
+                print(f"  sidecar: {subs.get('sidecar_path')}")
         elif status == "carried":
-            print("subtitles: carried (mov_text embedded + .srt sidecar)")
+            # v0.4.18 (opt-in suppress_srt, S-13): the suppressed arm
+            # replaces the "+ .srt sidecar" claim; the default arm
+            # prints the unchanged v0.4.17 line.
+            if subs.get("sidecar_suppressed"):
+                print(
+                    "subtitles: carried (mov_text embedded; "
+                    ".srt sidecar suppressed)"
+                )
+            else:
+                print("subtitles: carried (mov_text embedded + .srt sidecar)")
         else:
             print("subtitles: none")
     print(f"log: {state.log.path if state.log else 'none'}")
@@ -380,6 +399,8 @@ def _cmd_subs(
     # argparse flag; exit codes unchanged — a refused/failed replace is
     # a warning note inside a succeeded job (keep-both discipline).
     replace_source: bool = False,
+    # v0.4.18 (opt-in sidecar suppression): trailing kw, same pattern.
+    suppress_srt: bool = False,
 ) -> int:
     """Mode B: transcribe + soft-mux; exit 0 ok, 1 job failure, 2 tool."""
     from .subs_job import SubsJobError, run_subs_job
@@ -403,6 +424,7 @@ def _cmd_subs(
                 language_pin=lang,
                 force=force,
                 replace_source=replace_source,
+                suppress_srt=suppress_srt,
             )
         except SubsJobError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -613,6 +635,17 @@ def build_parser() -> argparse.ArgumentParser:
             "prove equal; otherwise runs clean (default: prepare fresh)"
         ),
     )
+    # v0.4.18 (opt-in sidecar suppression, D6): strictly opt-in; the
+    # help names the fail-open fallback promise (S-11).
+    run_parser.add_argument(
+        "--suppress-srt",
+        action="store_true",
+        help=(
+            "after subtitles are embedded in the verified output, delete "
+            "the redundant .srt sidecar; if the embed fails open the "
+            "sidecar is kept as the fallback (default: keep the sidecar)"
+        ),
+    )
     run_parser.add_argument(
         "--engine",
         choices=["auto", "stub", "ncnn"],
@@ -699,6 +732,17 @@ def build_parser() -> argparse.ArgumentParser:
             "rename the output to the source's name with an .mp4 extension "
             "(e.g. …35 Hours.avi → …35 Hours.mp4); if a file of that name "
             "already exists, both files are kept (default: off)"
+        ),
+    )
+    # v0.4.18 (opt-in sidecar suppression, D6): strictly opt-in; the
+    # help names the mux-failure fallback (S-12).
+    subs_parser.add_argument(
+        "--suppress-srt",
+        action="store_true",
+        help=(
+            "after the subtitle track is muxed into the MP4, delete the "
+            "redundant .srt sidecar (on a mux failure the sidecar is kept "
+            "as the fallback; default: keep the sidecar)"
         ),
     )
     subs_parser.add_argument("--ffmpeg", help="explicit ffmpeg path")
@@ -816,6 +860,8 @@ def main(argv: list[str] | None = None) -> int:
             resume=args.resume,
             denoise=args.denoise,
             no_transcribe=args.no_transcribe,
+            # v0.4.18 (opt-in sidecar suppression)
+            suppress_srt=args.suppress_srt,
         )
     if args.command == "subs":
         return _cmd_subs(
@@ -827,6 +873,8 @@ def main(argv: list[str] | None = None) -> int:
             ffmpeg=args.ffmpeg,
             ffprobe=args.ffprobe,
             replace_source=args.replace_source,
+            # v0.4.18 (opt-in sidecar suppression)
+            suppress_srt=args.suppress_srt,
         )
     if args.command == "runs":
         # v0.4.9 (design §1.6): the prune surface over the scratch GC.

@@ -97,6 +97,9 @@ ALL_MODE_A_CONTROLS = (
     "start_button",
     "cancel_button",
     "cancel_batch_button",
+    # v0.4.18 (§12 File E): the Mode A suppress-sidecar checkbox rides
+    # the upscale group at (3, 6, 1, 3) — same T1 fence.
+    "suppress_srt",
 )
 
 
@@ -149,7 +152,12 @@ def test_every_attribute_control_is_laid_out_including_explainer(
             f"{name} is constructed but reaches NO layout — the "
             "Finding-1 class (never-visible control) is back"
         )
-    for name in ("add_subs_button", "subs_replace_source"):
+    for name in (
+        "add_subs_button",
+        "subs_add_folder_button",  # v0.4.18 (WS1): the Mode B folder twin
+        "subs_replace_source",
+        "subs_suppress_srt",  # v0.4.18 (WS2): the Mode B suppress checkbox
+    ):
         assert getattr(win, name) in laid_out
     # the §6.3 explainer exists as a parented label with the exact text
     texts = {label.text() for label in win.findChildren(QLabel)}
@@ -194,6 +202,10 @@ def test_touched_checkboxes_render_real_pixels(qapp, monkeypatch, tmp_path):
         "monitor_check",
         "subs_replace_source",
         "replace_source",
+        # v0.4.18 (§12 File E): both new suppress checkboxes paint real
+        # pixels — the Finding-1 twin fence extends to them.
+        "suppress_srt",
+        "subs_suppress_srt",
     ):
         widget = getattr(win, name)
         delta = _paint_delta(qapp, win, widget)
@@ -216,6 +228,12 @@ def test_group_separation_two_titled_surfaces(qapp, monkeypatch, tmp_path):
     assert win.subs_replace_source.parentWidget() is not upscale
     assert win.add_subs_button.parentWidget() is win.subs_replace_source.parentWidget()
     assert win.transcribe_subs.parentWidget() is win.replace_source.parentWidget()
+    # v0.4.18 (§12 File E): parentage pins for the new controls — the
+    # Mode A suppress checkbox in the upscale group; the Mode B folder
+    # button + suppress checkbox in the subs group.
+    assert win.suppress_srt.parentWidget() is upscale
+    assert win.subs_add_folder_button.parentWidget() is subs
+    assert win.subs_suppress_srt.parentWidget() is subs
     assert win.resume_claim.parentWidget() is upscale
     assert win.monitor_check.parentWidget() is upscale
     titles = {group.title() for group in win.findChildren(QGroupBox)}
@@ -241,8 +259,15 @@ def test_cell_map_and_zero_overlap_on_both_grids(qapp, monkeypatch, tmp_path):
         raise AssertionError("widget missing from grid")
 
     assert _pos(subs_grid, win.add_subs_button) == (0, 0, 1, 1)
-    assert _pos(subs_grid, win.subs_replace_source) == (0, 1, 1, 1)
+    # v0.4.18 (§12 File E): the subs cell map re-pinned for the 4-A9
+    # re-tile — replace moved (0,1) → (0,2); the new folder button +
+    # suppress checkbox occupy (0,1)/(0,3); the explainer (0,4).
+    assert _pos(subs_grid, win.subs_add_folder_button) == (0, 1, 1, 1)
+    assert _pos(subs_grid, win.subs_replace_source) == (0, 2, 1, 1)
+    assert _pos(subs_grid, win.subs_suppress_srt) == (0, 3, 1, 1)
     assert _pos(upscale_grid, win.transcribe_subs) == (3, 3, 1, 3)
+    # v0.4.18: the Mode A suppress checkbox's verified-free cell
+    assert _pos(upscale_grid, win.suppress_srt) == (3, 6, 1, 3)
     assert _pos(upscale_grid, win.resume_claim) == (2, 7, 1, 2)
     assert _pos(upscale_grid, win.monitor_check) == (2, 0, 1, 4)
     assert _pos(upscale_grid, win.replace_source) == (1, 5, 1, 2)
@@ -425,8 +450,14 @@ def test_wiring_fences_reads_not_rewired():
     assert '"replace_source": self.replace_source.isChecked()' in start_src
     assert '"resume": self.resume_claim.isChecked()' in start_src
     assert "subs_replace_source" not in start_src
-    subs_src = inspect.getsource(MainWindow.choose_subs_files)
+    # v0.4.18 (§12 File E): the options fence extends to suppress_srt
+    assert '"suppress_srt": self.suppress_srt.isChecked()' in start_src
+    # v0.4.18 (4-A6/4-A7): the Mode B fence re-targeted to the extracted
+    # _enqueue_subs_paths — the enqueue line MOVED, the fence follows;
+    # the assertion text is extended with suppress_srt (File D-38).
+    subs_src = inspect.getsource(MainWindow._enqueue_subs_paths)
     assert "replace_source=self.subs_replace_source.isChecked()" in subs_src
+    assert "suppress_srt=self.subs_suppress_srt.isChecked()" in subs_src
     assert "self.replace_source.isChecked()" not in subs_src
 
 

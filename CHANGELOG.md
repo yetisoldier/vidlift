@@ -2,6 +2,59 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.18.0] - 2026-11-04
+
+### Added
+
+- **Recursive "Add Folder" for both modes (incl. drop parity).** The Add
+  Folder buttons (upsert panel and Add Subtitles) — and drag-dropping a
+  folder — now walk the folder TREE, so a whole show (all seasons) queues at
+  once. One shared collector (symlink-loop-proof: symlinked directories are
+  never descended; symlinked video FILES dedupe to one entry, keeping the
+  lexicographically first name); results are deduplicated and fully sorted.
+  A 501+-video tree is refused wholesale with a count-naming warning
+  ("subfolders included") — nothing partially added. Outputs still land
+  beside each source, so nested structure is preserved end-to-end.
+- **Per-batch limit aligned: 500** (the GUI's per-click enqueue cap, previously
+  64, now matches the folder-add cap): a 100-file Mode B folder add enqueues
+  instead of dying at Start with a "run them in rounds" dialog. (The MCP tool
+  enqueue loops were never capped; the registry drain rules are unchanged.)
+- **Opt-in `.srt` sidecar suppression (`suppress_srt`), all six surfaces**
+  (GUI×2 / CLI×2 / MCP×2). When ON, the redundant `.srt` sidecar is deleted
+  AFTER the subtitle track is safely embedded/muxed into the finished MP4 —
+  the toggleable track inside the MP4 is the deliverable. DEFAULT OFF: the
+  sidecar is kept (the v0.4.15 KEEP contract stands; an absent option is
+  behavior-identical for old callers/records). Whenever the embed fails open
+  (mux failure, OCR/transcription fail-open), the sidecar that was written is
+  KEPT as the fallback no matter how the option is set. In the embedded-text
+  branch the post-encode extract is skipped entirely (the track already rode
+  the encode as mov_text). The manifest/run blocks carry
+  `sidecar_subtitles`-style honesty (`sidecar_suppressed: true` XOR
+  `sidecar_path`), and the result's `srt_path` becomes `""` (the
+  deliberately-suppressed sentinel) so it never claims a removed file.
+- **Mode B scratch cleanup (success-only).** After a successful subs job the
+  `{output}.subs-work` scratch directory is removed (the K-5 leak's fix —
+  Mode B's counterpart of the run-success cleanup). Failures, cancels, and
+  cleanup errors retain the scratch for diagnosis; a caller-supplied workdir
+  is NEVER touched (path-guarded to the default-derived directory).
+
+### Changed
+
+- **The Mode B controls group gains two controls** — "Add Folder" and
+  "Suppress .srt sidecar on success" beside "Add Subtitles…" and the
+  replace-original checkbox (the exhaustiveness pin now asserts the five).
+- **QGroupBox titles float slightly higher** off the border line
+  (`margin-top: 14px → 20px`; the title rule itself is unchanged). Verified
+  visually on the Windows build; Linux offscreen cannot reproduce the metric.
+
+### Notes
+
+- No burn-in option exists or is planned — the v0.4.15 strip stands.
+- `run.py`'s only changes are the six enumerated WS2 touch sets (the
+  sidecar-suppression import, the `run_file` option, and the four subtitle
+  branch dispositions); `api_version` stays 1 and every new option is
+  additive absent-defaults (stale clients run v0.4.17-identical).
+
 ## [0.4.17.0] - 2026-11-04
 
 ### Added

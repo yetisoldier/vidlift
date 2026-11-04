@@ -57,6 +57,10 @@ from .subtitles import (
     SubtitlePlan,
     mux_language,
     mux_srt_into_mp4,
+    # v0.4.18 (opt-in suppress_srt): the best-effort post-embed removal
+    # helper (subtitles.py's own primitive; no circularity — this module
+    # already imports subtitles.py at module level).
+    remove_srt_sidecar,
     resolve_seconv,
     resolve_tesseract,
     run_subtitle_ocr,
@@ -1918,6 +1922,10 @@ def run_file(
     # v0.4.15 (opt-in denoise): None -> config DENOISE_DEFAULT ("off").
     # "light"/"strong" append the hqdn3d preset to the prepare chain.
     denoise: str | None = None,
+    # v0.4.18 (opt-in suppress_srt): strictly opt-in, terminal kw-only
+    # param — the redundant .srt sidecar is removed only AFTER a
+    # successful embed (the fail-open contract keeps it otherwise).
+    suppress_srt: bool = False,
 ) -> RunResult:
     """Run one file through the full pipeline and return its state.
 
@@ -1962,6 +1970,19 @@ def run_file(
     mezzanine's own decode-count must ALL prove equal; any failure or
     ambiguity falls through to the clean path (old scratch untouched
     until GC). Default OFF = byte-identical v0.4.8 behavior.
+
+    v0.4.18 (opt-in suppress_srt, strictly opt-in — default False keeps
+    the v0.4.17 byte behavior): after the subtitle embed/mux SUCCEEDS,
+    the redundant .srt sidecar is removed (transcribed/adopted/OCR
+    branches) or the post-encode extract is skipped entirely
+    (embedded-text branch: the track already rode the encode as
+    mov_text, so there is no mux to gate on and nothing to remove). A
+    fail-open or mux failure ALWAYS keeps the sidecar as the fallback
+    deliverable, no matter how this flag is set (the v0.4.1 fail-open
+    contract is untouched); the manifest's subtitles block then carries
+    ``sidecar_suppressed`` INSTEAD of ``sidecar_path`` — never both
+    (bookkeeping never claims a suppressed file exists, nor hides one
+    that does).
     """
     if tools is None:
         tools = find_tools()
@@ -2775,7 +2796,20 @@ def run_file(
                         runner=run_cmd,
                     )
                     subtitles_block["status"] = "carried"
-                    subtitles_block["sidecar_path"] = transcribed.srt_path
+                    # v0.4.18 (opt-in suppress_srt): the embed above
+                    # succeeded, so the sidecar is redundant. Truthful
+                    # bookkeeping either way: a removal failure keeps
+                    # the file AND the sidecar_path key.
+                    if suppress_srt and remove_srt_sidecar(
+                        transcribed.srt_path, log_line=log
+                    ):
+                        subtitles_block["sidecar_suppressed"] = True
+                        log(
+                            "subtitles: .srt sidecar suppressed after a "
+                            "successful embed (suppress_srt)"
+                        )
+                    else:
+                        subtitles_block["sidecar_path"] = transcribed.srt_path
                     subtitles_block["embedded"] = {
                         "codec": "mov_text",
                         "language_tag": mux_language(transcribed.language),
@@ -2797,31 +2831,49 @@ def run_file(
                     for note in transcribed.notes:
                         log(f"subtitles: {note}")
                 elif sub_plan.kind == "text" and sub_plan.source == "embedded":
-                    # Embedded text was carried IN the encode (mov_text,
-                    # selected-index map). Extract the same stream as an
-                    # .srt sidecar post-encode (the KEEP disposition,
-                    # §B.3): ffmpeg transcodes the stream to SRT.
-                    record_step("subtitle-sidecar-extract")
-                    extract_cmd = [
-                        tools.ffmpeg,
-                        "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
-                        "-i", report.path,
-                        "-map", f"0:{sub_plan.stream_index}",
-                        "-c:s", "srt",
-                        sidecar_target,
-                    ]
-                    run_command(PHASE_SUBTITLES, extract_cmd)
-                    if os.path.isfile(sidecar_target):
+                    # v0.4.18 (opt-in suppress_srt): the text track rode
+                    # the ENCODE into the MP4 as mov_text — the extract
+                    # step (the KEEP convenience) has no mux to gate on
+                    # and no failure surface to fall back from, so
+                    # suppression simply never runs it.
+                    if suppress_srt:
                         subtitles_block["status"] = "carried"
-                        subtitles_block["sidecar_path"] = sidecar_target
+                        subtitles_block["sidecar_suppressed"] = True
                         subtitles_block["embedded"] = {
                             "codec": "mov_text",
                             "language_tag": mux_language(sub_plan.lang),
                         }
-                    else:
-                        raise SubtitleOcrError(
-                            "text sidecar extraction produced no file"
+                        log(
+                            "subtitles: sidecar extract skipped — the "
+                            "track is embedded in the encode (suppress_srt)"
                         )
+                    else:
+                        # Embedded text was carried IN the encode
+                        # (mov_text, selected-index map). Extract the
+                        # same stream as an .srt sidecar post-encode (the
+                        # KEEP disposition, §B.3): ffmpeg transcodes the
+                        # stream to SRT.
+                        record_step("subtitle-sidecar-extract")
+                        extract_cmd = [
+                            tools.ffmpeg,
+                            "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+                            "-i", report.path,
+                            "-map", f"0:{sub_plan.stream_index}",
+                            "-c:s", "srt",
+                            sidecar_target,
+                        ]
+                        run_command(PHASE_SUBTITLES, extract_cmd)
+                        if os.path.isfile(sidecar_target):
+                            subtitles_block["status"] = "carried"
+                            subtitles_block["sidecar_path"] = sidecar_target
+                            subtitles_block["embedded"] = {
+                                "codec": "mov_text",
+                                "language_tag": mux_language(sub_plan.lang),
+                            }
+                        else:
+                            raise SubtitleOcrError(
+                                "text sidecar extraction produced no file"
+                            )
                 elif sub_plan.kind == "text" and sub_plan.source == "sidecar":
                     # Adopted .srt sidecar (§B.3): copy to the output
                     # sidecar, mux mov_text into the finished MP4 with
@@ -2836,7 +2888,20 @@ def run_file(
                         runner=run_cmd,
                     )
                     subtitles_block["status"] = "carried"
-                    subtitles_block["sidecar_path"] = sidecar_target
+                    # v0.4.18 (opt-in suppress_srt): removes the run's
+                    # COPY at sidecar_target after the successful mux;
+                    # the user's ORIGINAL sidecar (sub_plan.sidecar_path)
+                    # is never a candidate.
+                    if suppress_srt and remove_srt_sidecar(
+                        sidecar_target, log_line=log
+                    ):
+                        subtitles_block["sidecar_suppressed"] = True
+                        log(
+                            "subtitles: .srt sidecar suppressed after a "
+                            "successful embed (suppress_srt)"
+                        )
+                    else:
+                        subtitles_block["sidecar_path"] = sidecar_target
                     subtitles_block["embedded"] = {
                         "codec": "mov_text",
                         "language_tag": mux_language(sub_plan.lang),
@@ -2900,6 +2965,22 @@ def run_file(
                         "codec": "mov_text",
                         "language_tag": mux_language(sub_plan.lang),
                     }
+                    # v0.4.18 (opt-in suppress_srt): the OCR sidecar sits
+                    # at sidecar_target by construction
+                    # (run_subtitle_ocr derives sidecar_srt_path(output));
+                    # sidecar_path was set PRE-mux at :2883, so a
+                    # suppressed success must POP it (truthful block).
+                    # The .ocr/ diagnosis kit beside the output is
+                    # retained regardless (v0.4.1 retention contract).
+                    if suppress_srt and remove_srt_sidecar(
+                        ocr_result.srt_path, log_line=log
+                    ):
+                        subtitles_block.pop("sidecar_path", None)
+                        subtitles_block["sidecar_suppressed"] = True
+                        log(
+                            "subtitles: .srt sidecar suppressed after a "
+                            "successful embed (suppress_srt)"
+                        )
                     for note in ocr_result.notes:
                         log(f"subtitles: {note}")
                         warnings.append(note)

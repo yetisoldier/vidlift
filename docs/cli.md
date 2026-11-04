@@ -68,6 +68,9 @@ Options:
 - **--realesrgan PATH:** override the bundled ncnn executable
 - **--realesrgan-models PATH:** override the bundled model directory
 - **--no-transcribe:** disables Mode A audio transcription / subtitle transcription for that run or plan
+- **--suppress-srt:** after subtitles are embedded in the verified output, delete the
+  redundant .srt sidecar; a fail-open embed keeps the sidecar as the fallback
+  (default: keep the sidecar)
 
 Engine behavior:
 
@@ -100,11 +103,19 @@ Options:
 - **--model TAG:** whisper model tag or path (default `medium`; first use downloads it)
 - **--device auto|cuda|cpu:** transcription device (default `auto`)
 - **--force:** transcribe even when a usable text subtitle track already exists
+- **--suppress-srt:** after the subtitle track is muxed into the MP4, delete the redundant
+  `.srt` sidecar (on a mux failure the sidecar is kept as the fallback; default: keep the sidecar)
 - **--replace-source:** after a verified pass, delete the source video and rename
   the output to the source's name with an `.mp4` extension (e.g. `movie.avi` →
   `movie.mp4`). If a file of that name already exists, both files are kept
   (default: off).
 - **--ffmpeg PATH / --ffprobe PATH:** override the bundled binaries
+
+Folder adds and file drops in the GUI walk the folder tree recursively
+(subfolders included), so a whole show queues at once; outputs still land
+beside each source file. The `{stem}.subs-work` scratch directory is removed
+automatically after a successful job (failures and cancels keep it for
+diagnosis).
 
 A refused replace (for example, a name collision) still exits **0** — it is a
 successful job with a warning, never a failure.
