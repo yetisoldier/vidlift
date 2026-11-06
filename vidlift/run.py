@@ -834,6 +834,7 @@ def verify_output(
     decode_command: list[str] | None = None,
     full_decode: bool = True,
     decode_runner: Runner | None = None,
+    subtitle_expected_override: bool | None = None,
 ) -> VerificationResult:
     """Verify the encode output exists, decodes, and matches plan geometry.
 
@@ -888,6 +889,8 @@ def verify_output(
         and sub_plan.source == "embedded"
         and sub_plan.kind == "text"
     )
+    if subtitle_expected_override is not None:
+        expected_sub = subtitle_expected_override
     result.subtitle_expected = expected_sub
     mov_text = [
         s
@@ -957,6 +960,7 @@ class RunState:
     probe: MediaProbe | None = None
     plan: PlannedFile | None = None
     output_path: str | None = None
+    media_transaction: dict | None = None
     prepared_path: str | None = None
     mezzanine_path: str | None = None
     engine_name: str | None = None
@@ -1054,6 +1058,7 @@ class RunState:
             "resume": self.resume,
             "rejected_mezzanine": self.rejected_mezzanine,
             "subtitles": self.subtitles,
+            "media_transaction": self.media_transaction,
             "upscale_profile": self.upscale_profile,
             "resume_claim": self.resume_claim,
             # v0.4.15 additive: the resolved denoise selection.
@@ -1689,115 +1694,28 @@ def replace_source_with_output(
     output_path: str,
     *,
     log_line=None,
+    operation=None,
 ) -> str:
-    """Delete the source and move the verified output into its place.
+    """Commit a prepared, independently verified exact-path replacement.
 
-    v0.4.7 (Eric: "I want an option to have it delete and replace the
-    source file when the upscale is complete"): strictly opt-in, called
-    only AFTER ``verify_output`` passed, never automatically.
-
-    Guardrails:
-    - the output must already exist on disk (verify checked it);
-    - never when the output IS the source path (nothing to replace);
-    - same filesystem -> one atomic ``os.replace`` (rename(2): either
-      the old file is replaced or the call errs);
-    - cross filesystem (v0.4.15.3 F-2) -> stage the copy at a temp
-      SIBLING of the source (same directory, therefore the same
-      filesystem, therefore the final ``os.replace`` is an atomic
-      rename(2)), SHA-256-verify the staged copy against the verified
-      output, and only then rename it over the source -- the source is
-      never opened for write until a proven copy can rename into
-      place, so a mid-copy failure strands only the temp and both
-      original files survive (a verified copy never destroys the only
-      good data); staging needs transient space for one extra full
-      copy beside the source;
-    - failures raise :class:`RunError` -- the runner catches it and
-      converts to a logged warning so a replace failure can never fail
-      a successful upscale.
-
-    Returns the path the output now occupies (the source's original
-    path). The output's former path may then no longer hold a file
-    when the source and output directories differ.
+    Original backup/capture and journal are retained indefinitely. A public
+    compatibility output may remain as an explicitly reported duplicate.
     """
-    source = Path(source_path)
-    output = Path(output_path)
-    if not source.is_file():
-        raise RunError(
-            f"replace-source refused: source is gone: {source}"
-        )
-    if not output.is_file():
-        raise RunError(
-            f"replace-source refused: verified output is missing: {output}"
-        )
-    if os.path.normcase(os.path.abspath(str(source))) == os.path.normcase(
-        os.path.abspath(str(output))
-    ):
+    if os.path.abspath(source_path) == os.path.abspath(output_path):
+        from .media_transaction import fingerprint
+        fingerprint(source_path)
         if log_line is not None:
-            log_line(
-                "replace-source: skipped (source path == output path)"
-            )
-        return str(source)
-    if os.stat(str(source)).st_dev == os.stat(str(output)).st_dev:
-        try:
-            os.replace(str(output), str(source))
-        except OSError as exc:
-            raise RunError(
-                f"replace-source failed to move the output over the "
-                f"source ({source}): {exc}"
-            ) from exc
-    else:
-        # v0.4.15.3 (F-2): stage the copy at a temp SIBLING of the
-        # source (same directory -> same filesystem -> the final
-        # os.replace is an atomic rename(2)); hash-verify the temp
-        # against the verified output BEFORE the source is ever
-        # opened. A mid-copy failure can now strand only the temp —
-        # the source and the verified output both survive, which is
-        # what the docstring always promised.
-        tmp = str(source) + ".replace-tmp"
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)  # stale temp from a killed run
-            except OSError:
-                pass
-        try:
-            try:
-                shutil.copy2(str(output), tmp)
-                if _sha256_file(output) != _sha256_file(tmp):
-                    raise RunError(
-                        "replace-source: the staged copy for "
-                        f"{source} does not hash-match the verified "
-                        "output; keeping the verified original and the "
-                        "source untouched"
-                    )
-                os.replace(tmp, str(source))
-            except OSError as exc:
-                raise RunError(
-                    f"replace-source cross-filesystem copy into {source} "
-                    f"failed: {exc}"
-                ) from exc
-        finally:
-            # The temp must never outlive the call: the success path
-            # consumed it via os.replace (the rename unlinked the name),
-            # every error path strands an unproven copy that is not the
-            # source and not the verified output.
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-        # The copy hash-verified: the file at the source path is now the
-        # good data, so only the former output copy gets removed.
-        try:
-            output.unlink()
-        except OSError as exc:
-            if log_line is not None:
-                log_line(
-                    f"WARNING replace-source: the verified output copy at "
-                    f"{output} could not be removed: {exc}"
-                )
+            log_line("replace-source: skipped (source path == output path)")
+        return source_path
+    if operation is None or str(operation.source) != os.path.abspath(source_path) or operation.candidate != os.path.abspath(output_path):
+        raise RunError("prepared verified operation required; source and output retained")
+    from .media_transaction import commit_media_operation
+    operation.result = commit_media_operation(operation, cancel=getattr(operation, "cancel", None))
     if log_line is not None:
-        log_line(f"replace-source: output now at {source}")
-    return str(source)
+        for warning in operation.result.warnings:
+            log_line(warning)
+        log_line(f"replace-source: output now at {operation.result.output_path}")
+    return operation.result.output_path
 
 
 def _apply_subtitle_ocr_preference(
@@ -1926,6 +1844,7 @@ def run_file(
     # param — the redundant .srt sidecar is removed only AFTER a
     # successful embed (the fail-open contract keeps it otherwise).
     suppress_srt: bool = False,
+    transcription_batch_id: str | None = None,
 ) -> RunResult:
     """Run one file through the full pipeline and return its state.
 
@@ -1984,6 +1903,12 @@ def run_file(
     (bookkeeping never claims a suppressed file exists, nor hides one
     that does).
     """
+    from .media_transaction import (
+        prepare_media_operation, record_verified_output, commit_media_operation,
+        MediaTransactionError,
+    )
+    from .plan import _expected_output_path
+    logical_output = _expected_output_path(file_path, output_dir, target)
     if tools is None:
         tools = find_tools()
     # v0.4.16 (the §4.6 observe-fix): when the caller supplies no runner
@@ -2084,6 +2009,14 @@ def run_file(
             raise VideoToolError(phase_name, command, code, stderr or stdout)
 
     try:
+        state.current_phase = PHASE_PLAN
+        ensure_output_dir(logical_output)
+        operation = prepare_media_operation(
+            file_path, file_path if replace_source else logical_output,
+            replace_source=replace_source, suppress_srt=suppress_srt, cancel=cancel,
+        )
+        operation.fallback = logical_output
+        operation.sidecar_target = sidecar_srt_path(logical_output)
         # ---- probe ----
         phase = begin_phase(PHASE_PROBE)
         probe_cmd = [tools.ffprobe, *probe_args(file_path)]
@@ -2132,6 +2065,8 @@ def run_file(
             )
         state.plan = plan
         state.output_path = plan.output_path
+        logical_plan = plan
+        plan = replace(plan, output_path=str(operation.directory / Path(plan.output_path).name))
         log(f"planned output: {plan.output_path}")
         log(
             f"plan: {plan.output_width}x{plan.output_height} HEVC at "
@@ -2143,7 +2078,7 @@ def run_file(
                 "(VidLift upscales SD candidates only)"
             )
         ensure_output_dir(plan.output_path)
-        log(f"output dir ready: {Path(plan.output_path).parent}")
+        log(f"output dir ready: {Path(logical_plan.output_path).parent}")
         end_phase(phase, note=f"verdict={plan.process_verdict}")
 
         # v0.4.15 (opt-in denoise): absent reads the config default
@@ -2568,6 +2503,17 @@ def run_file(
         # — the honest warning names what happened and what to install.
         phase = begin_phase(PHASE_SUBTITLES)
         subtitles_block: dict = {"status": "none"}
+        transcription_failed = False
+        def mux_owned(video_path, srt_path, **kwargs):
+            return mux_srt_into_mp4(
+                video_path, srt_path, **kwargs,
+                ownership=operation, ffprobe=tools.ffprobe,
+                probe_runner=probe_runner or run_cmd, cancel=cancel,
+                verifier=lambda path: verify_output(
+                    tools, replace(plan, output_path=path), runner=run_cmd,
+                    decode_runner=_decode_runner,
+                ),
+            )
         sub_plan = getattr(plan, "subtitle_plan", None)
         if sub_plan is None:
             subtitles_block["status"] = "none"
@@ -2598,7 +2544,7 @@ def run_file(
                     # (missing model, failed sha pin, engine-off env, no
                     # audio) FAILS OPEN through the shared except below.
                     record_step("transcribe")
-                    transcribe_workdir = str(log_root / f"{run_id}.ocr-work")
+                    transcribe_workdir = str(operation.directory / f"{run_id}.ocr-work")
                     transcribe_engine_note = ""
                     transcribe_device = ""
                     # The machine-wide GPU-phase lock (the engine's own
@@ -2606,7 +2552,7 @@ def run_file(
                     # imports this module at module level).
                     from .engine_ncnn import _gpu_phase_lock
 
-                    gpu_lock = _gpu_phase_lock()
+                    gpu_lock = None if (plan.transcription or {}).get("device", "auto") == "cpu" else _gpu_phase_lock()
 
                     def _transcribe_wait_label(holder_pid, held_seconds):
                         record_step(
@@ -2615,10 +2561,14 @@ def run_file(
                             f"for {held_seconds:.0f}s)"
                         )
 
-                    lock_acquired = gpu_lock.acquire(
-                        on_wait=_transcribe_wait_label
+                    if cancel is not None and cancel():
+                        raise EngineCancelled("cancelled before transcription")
+                    lock_acquired = gpu_lock is not None and gpu_lock.acquire(
+                        on_wait=_transcribe_wait_label, should_cancel=cancel
                     )
-                    if not lock_acquired:
+                    if gpu_lock is not None and not lock_acquired:
+                        reason = getattr(gpu_lock, "last_unavailable", None) or "unknown"
+                        record_step(f"GPU phase lock unavailable ({reason}); continuing without GPU serialization")
                         # degrade-OPEN (the engine's own honesty rule):
                         # never a hang; the note lands in the block.
                         log(
@@ -2629,7 +2579,7 @@ def run_file(
                         transcribe_engine_note = (
                             "gpu-phase-lock unavailable (degrade-open)"
                         )
-                    else:
+                    elif lock_acquired and gpu_lock is not None:
                         log(f"GPU phase lock acquired: {gpu_lock.path}")
                     # v0.4.15.2: the honest CUDA fallback — the note rides
                     # the manifest's transcription block exactly like the
@@ -2656,6 +2606,7 @@ def run_file(
                         state.progress = progress
                         state.touch()
                         transcribe_fallback_notes.append(note)
+                        progress["transcription_fallback_reason"] = str(note)[:200]
                         log(f"subtitles: {note}")
 
                     try:
@@ -2663,12 +2614,23 @@ def run_file(
                             make_whisper_engine_with_fallback,
                             resolve_model_dir,
                             resolve_transcription_device,
+                            _ORIGINAL_ENGINE_FACTORY,
+                            _ORIGINAL_FALLBACK_FACTORY,
+                            _ORIGINAL_DEVICE_RESOLVER,
+                            make_whisper_engine,
                         )
 
                         knobs = plan.transcription or {}
-                        transcribe_device = resolve_transcription_device(
-                            knobs.get("device") or "auto"
+                        legacy_injected = (
+                            transcribe_engine_factory is not None
+                            or make_whisper_engine is not _ORIGINAL_ENGINE_FACTORY
+                            or make_whisper_engine_with_fallback is not _ORIGINAL_FALLBACK_FACTORY
+                            or resolve_transcription_device is not _ORIGINAL_DEVICE_RESOLVER
                         )
+                        if legacy_injected:
+                            transcribe_device = resolve_transcription_device(
+                                knobs.get("device") or "auto"
+                            )
                         # v0.4.19 (WS3): publish the resolution to the
                         # live surface IMMEDIATELY (pre-download,
                         # pre-construction) — the status echo reads
@@ -2682,6 +2644,15 @@ def run_file(
                         )
                         state.progress = progress
                         state.touch()
+
+                        def _on_transcribe_device(device, requested):
+                            nonlocal transcribe_device
+                            transcribe_device = device
+                            progress = dict(state.progress or {})
+                            progress["transcription_device"] = device
+                            progress["transcription_device_requested"] = requested
+                            state.progress = progress
+                            state.touch()
                         # v0.4.16 (model management, ADR-3): Mode A's
                         # publisher — download bytes ride the SAME
                         # progress dict the GUI tick / /status / mirror
@@ -2772,13 +2743,20 @@ def run_file(
                                         on_fallback=_on_cuda_fallback,
                                     )
                                 )
-                            ),
+                            ) if legacy_injected else None,
+                            model_pin=model_dir,
+                            device_pin=knobs.get("device") or "auto",
                             language_pin=knobs.get("language") or "",
                             on_step=record_step,
                             on_progress=record_progress,
+                            on_device=_on_transcribe_device if not legacy_injected else None,
                             should_cancel=cancel,
+                            # v0.4.20 (ADR-1/S1): scope the CUDA failure
+                            # latch to the submission group, not the per-file run id.
+                            batch_id=transcription_batch_id,
                         )
                     except TranscriptionError as exc:
+                        transcription_failed = True
                         # Mode A is fail-open: a transcription failure
                         # never fails the run. Convert to SubtitleOcrError
                         # so the shared fail-open handler below records
@@ -2808,10 +2786,10 @@ def run_file(
                             f"carried: {exc}"
                         ) from exc
                     finally:
-                        if lock_acquired:
+                        if lock_acquired and gpu_lock is not None:
                             gpu_lock.release()
                     record_step("subtitle-mux")
-                    mux_srt_into_mp4(
+                    mux_owned(
                         plan.output_path,
                         transcribed.srt_path,
                         language=transcribed.language,
@@ -2819,20 +2797,8 @@ def run_file(
                         runner=run_cmd,
                     )
                     subtitles_block["status"] = "carried"
-                    # v0.4.18 (opt-in suppress_srt): the embed above
-                    # succeeded, so the sidecar is redundant. Truthful
-                    # bookkeeping either way: a removal failure keeps
-                    # the file AND the sidecar_path key.
-                    if suppress_srt and remove_srt_sidecar(
-                        transcribed.srt_path, log_line=log
-                    ):
-                        subtitles_block["sidecar_suppressed"] = True
-                        log(
-                            "subtitles: .srt sidecar suppressed after a "
-                            "successful embed (suppress_srt)"
-                        )
-                    else:
-                        subtitles_block["sidecar_path"] = transcribed.srt_path
+                    # Private until the final accepted media commit.
+                    subtitles_block["sidecar_path"] = transcribed.srt_path
                     subtitles_block["embedded"] = {
                         "codec": "mov_text",
                         "language_tag": mux_language(transcribed.language),
@@ -2860,8 +2826,9 @@ def run_file(
                     # and no failure surface to fall back from, so
                     # suppression simply never runs it.
                     if suppress_srt:
+                        if not verification.subtitle_ok:
+                            raise SubtitleOcrError("embedded mov_text track not verified; suppression refused")
                         subtitles_block["status"] = "carried"
-                        subtitles_block["sidecar_suppressed"] = True
                         subtitles_block["embedded"] = {
                             "codec": "mov_text",
                             "language_tag": mux_language(sub_plan.lang),
@@ -2901,9 +2868,13 @@ def run_file(
                     # Adopted .srt sidecar (§B.3): copy to the output
                     # sidecar, mux mov_text into the finished MP4 with
                     # the temp-then-replace atomicity.
-                    shutil.copyfile(sub_plan.sidecar_path, sidecar_target)
+                    from .media_transaction import copy_owned_input
+                    try:
+                        copy_owned_input(operation, sub_plan.sidecar_path, sidecar_target)
+                    except OSError as exc:
+                        raise SubtitleOcrError(f"adopted subtitle copy refused: {exc}") from exc
                     record_step("subtitle-mux")
-                    mux_srt_into_mp4(
+                    mux_owned(
                         plan.output_path,
                         sidecar_target,
                         language=sub_plan.lang,
@@ -2911,20 +2882,7 @@ def run_file(
                         runner=run_cmd,
                     )
                     subtitles_block["status"] = "carried"
-                    # v0.4.18 (opt-in suppress_srt): removes the run's
-                    # COPY at sidecar_target after the successful mux;
-                    # the user's ORIGINAL sidecar (sub_plan.sidecar_path)
-                    # is never a candidate.
-                    if suppress_srt and remove_srt_sidecar(
-                        sidecar_target, log_line=log
-                    ):
-                        subtitles_block["sidecar_suppressed"] = True
-                        log(
-                            "subtitles: .srt sidecar suppressed after a "
-                            "successful embed (suppress_srt)"
-                        )
-                    else:
-                        subtitles_block["sidecar_path"] = sidecar_target
+                    subtitles_block["sidecar_path"] = sidecar_target
                     subtitles_block["embedded"] = {
                         "codec": "mov_text",
                         "language_tag": mux_language(sub_plan.lang),
@@ -2953,7 +2911,7 @@ def run_file(
                         report.path if sub_plan.source == "embedded"
                         else sub_plan.sidecar_path
                     )
-                    ocr_workdir = str(log_root / f"{run_id}.ocr-work")
+                    ocr_workdir = str(operation.directory / f"{run_id}.ocr-work")
                     ocr_result = run_subtitle_ocr(
                         sub_plan,
                         ocr_source,
@@ -2977,7 +2935,7 @@ def run_file(
                         "notes": list(ocr_result.notes),
                     }
                     record_step("subtitle-mux")
-                    mux_srt_into_mp4(
+                    mux_owned(
                         plan.output_path,
                         ocr_result.srt_path,
                         language=sub_plan.lang,
@@ -2988,22 +2946,7 @@ def run_file(
                         "codec": "mov_text",
                         "language_tag": mux_language(sub_plan.lang),
                     }
-                    # v0.4.18 (opt-in suppress_srt): the OCR sidecar sits
-                    # at sidecar_target by construction
-                    # (run_subtitle_ocr derives sidecar_srt_path(output));
-                    # sidecar_path was set PRE-mux at :2883, so a
-                    # suppressed success must POP it (truthful block).
-                    # The .ocr/ diagnosis kit beside the output is
-                    # retained regardless (v0.4.1 retention contract).
-                    if suppress_srt and remove_srt_sidecar(
-                        ocr_result.srt_path, log_line=log
-                    ):
-                        subtitles_block.pop("sidecar_path", None)
-                        subtitles_block["sidecar_suppressed"] = True
-                        log(
-                            "subtitles: .srt sidecar suppressed after a "
-                            "successful embed (suppress_srt)"
-                        )
+                    # Suppression is deferred; retain the private OCR kit.
                     for note in ocr_result.notes:
                         log(f"subtitles: {note}")
                         warnings.append(note)
@@ -3018,6 +2961,9 @@ def run_file(
                 warnings.append(reason)
                 subtitles_block["status"] = "failed-open"
                 subtitles_block["reason"] = reason
+                if transcription_failed and replace_source:
+                    warnings.append("source replacement skipped because transcription failed")
+                    log("WARNING: source replacement skipped because transcription failed")
                 if os.path.isfile(sidecar_target):
                     subtitles_block["sidecar_path"] = sidecar_target
                     subtitles_block["sidecar_kept"] = True
@@ -3040,15 +2986,65 @@ def run_file(
         observe_cancel()
 
         # ---- manifest + finish ----
+        if verification.ok:
+            operation.embedded = bool(subtitles_block.get("embedded")) and subtitles_block.get("status") != "failed-open"
+            private_srt = subtitles_block.get("sidecar_path")
+            def verify_candidate(path):
+                nonlocal verification
+                verification = verify_output(
+                    tools, replace(plan, output_path=path), runner=run_cmd,
+                    decode_runner=_decode_runner, subtitle_expected_override=operation.embedded,
+                )
+                state.verification = verification
+                if operation.embedded and not verification.subtitle_ok:
+                    operation.embedded = False
+                    subtitles_block.pop("sidecar_suppressed", None)
+                    subtitles_block["status"] = "failed-open"
+                    subtitles_block.setdefault("warnings", []).append("final subtitle track was not verified; suppression refused")
+                return verification
+            record_verified_output(
+                operation, plan.output_path,
+                verification=verify_candidate,
+                owned_srt=private_srt,
+            )
+            observe_cancel()
+            if replace_source and not transcription_failed:
+                try:
+                    replace_source_with_output(file_path, plan.output_path, log_line=log, operation=operation)
+                    committed = operation.result
+                except (RunError, OSError) as exc:
+                    log(f"WARNING: replace-source failed; keeping both files: {exc}")
+                    committed = commit_media_operation(operation, cancel=cancel, retire_source=False)
+            else:
+                committed = commit_media_operation(operation, cancel=cancel, retire_source=not transcription_failed)
+            state.output_path = committed.output_path
+            verification.output_path = committed.output_path
+            if committed.sidecar_suppressed:
+                subtitles_block.pop("sidecar_path", None)
+                subtitles_block["sidecar_suppressed"] = True
+                log("subtitles: .srt sidecar suppressed after a successful embed (suppress_srt)")
+            elif committed.srt_path:
+                subtitles_block["sidecar_path"] = committed.srt_path
+            for warning in committed.warnings:
+                log(warning)
+            state.media_transaction = {"journal_path": committed.journal_path, "backup_path": committed.backup_path, "needs_attention": committed.needs_attention}
+        plan = logical_plan
         state.ok = verification.ok
         state.finished_at = time.time()
         if not verification.ok:
             state.error = f"verification failed: {verification.error}"
         manifest = _build_manifest(state, tools, report, plan, verification)
         manifest_path = log_root / f"{run_id}.manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        state.manifest_path = str(manifest_path)
-        log(f"manifest: {manifest_path}")
+        manifest_written = False
+        try:
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            state.manifest_path = str(manifest_path)
+            manifest_written = True
+            log(f"manifest: {manifest_path}")
+        except OSError as exc:
+            if not verification.ok:
+                raise RunError(f"verification failed and manifest could not be recorded: {exc}") from exc
+            log(f"WARNING manifest write failed; media journal remains authoritative: {operation.journal}: {exc}")
         if not verification.ok:
             raise RunError(state.error)
         # v0.4.7 (success cleanup, Eric): the run is verified; remove its
@@ -3056,33 +3052,25 @@ def run_file(
         # blocks below never reach this code). Best-effort: a cleanup
         # failure logs a WARNING inside cleanup_run_artifacts and keeps
         # the success; the log and manifest are never candidates.
-        cleanup_run_artifacts(run_id, str(log_root), log_line=log)
+        safe_cleanup = manifest_written and not (state.media_transaction or {}).get("needs_attention")
+        if safe_cleanup:
+            cleanup_run_artifacts(run_id, str(log_root), log_line=log)
         # v0.4.9 (design §1.5): a claiming run's success must ALSO
         # consume the claimed old-run-id scratch — it is verified-used
         # material now. Same best-effort semantics; logs/manifests are
         # never cleanup candidates.
-        if resume_claim is not None:
+        if resume_claim is not None and safe_cleanup:
             cleanup_run_artifacts(
                 resume_claim["claimed_run_id"], str(log_root), log_line=log
             )
-        if replace_source:
-            try:
-                replaced_path = replace_source_with_output(
-                    file_path, plan.output_path, log_line=log
-                )
-                state.output_path = replaced_path
-            except (RunError, OSError) as exc:
-                # Guardrail (d): a replace failure must never crash the
-                # caller or fail the verified run; the upscale output
-                # stays exactly where the plan put it.
-                log(f"WARNING: replace-source failed; keeping both files: {exc}")
+
         state.current_phase = PHASE_DONE
         log("run complete")
         return RunResult(
             state=state,
             plan=plan,
             verification=verification,
-            manifest_path=str(manifest_path),
+            manifest_path=str(manifest_path) if manifest_written else "",
         )
     except EngineCancelled as exc:
         # A cancel is NOT a failure (clause d): the state records the
@@ -3098,7 +3086,7 @@ def run_file(
         exc.state = state  # type: ignore[attr-defined]
         _write_failure_manifest(state, tools)
         raise
-    except (ProbeError, PlanError, VideoToolError, RunError) as exc:
+    except (ProbeError, PlanError, VideoToolError, RunError, MediaTransactionError) as exc:
         state.finished_at = time.time()
         state.ok = False
         state.error = str(exc)
@@ -3161,6 +3149,7 @@ def _build_manifest(
             # consumer; additive schema v2, no bump (the doc pins this:
             # v3 is only warranted for breaking changes; there are none).
             "subtitles": state.subtitles,
+            "media_transaction": state.media_transaction,
             # v0.4.8 additive (design D5): the requested upscale profile
             # ("live-action" | "anime"), echoed for status/manifest
             # honesty under both engines and fail-open.

@@ -2,6 +2,37 @@ name: build-windows-installer
 
 on:
   workflow_dispatch:
+    inputs:
+      enable_cuda_runtime:
+        description: "Build with NVIDIA CUDA runtime (requires separately documented redistribution approval)"
+        required: true
+        type: boolean
+        default: false
+      nvidia_redistribution_approved:
+        description: "Confirm written NVIDIA redistribution clearance has been obtained"
+        required: true
+        type: boolean
+        default: false
+      size_gate_override:
+        description: "Explicit product approval to waive recorded size/baseline gate issues"
+        type: boolean
+        default: false
+      size_approval_reference:
+        description: "Written product approval reference (required for size override)"
+        type: string
+        default: ""
+      prior_installer_url:
+        description: "HTTPS prior-version installer for isolated update-over-install validation"
+        type: string
+        default: ""
+      prior_installer_sha256:
+        description: "Reviewed SHA-256 of the exact prior-version installer"
+        type: string
+        default: ""
+      gpu_runner:
+        description: "Provisioned Windows GPU runner label; empty records explicit NOT RUN"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -10,6 +41,10 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      VIDLIFT_SETTINGS_ORG: VidLift-CI-${{ github.run_id }}-${{ github.run_attempt }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
@@ -18,6 +53,19 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+
+      - name: Record external gate disposition
+        shell: pwsh
+        env:
+          CUDA_REQUESTED: ${{ inputs.enable_cuda_runtime }}
+          CUDA_APPROVED: ${{ inputs.nvidia_redistribution_approved }}
+          GPU_RUNNER: ${{ inputs.gpu_runner }}
+        run: |
+          if ($env:CUDA_REQUESTED -eq 'true' -and $env:CUDA_APPROVED -ne 'true') { throw "CUDA build requested without redistribution approval" }
+          New-Item -ItemType Directory -Force output | Out-Null
+          $status = if ([string]::IsNullOrWhiteSpace($env:GPU_RUNNER)) { 'NOT RUN (no GPU runner)' } else { 'PENDING (GPU runner provisioned)' }
+          @{ gpu_gate = $status } | ConvertTo-Json | Set-Content output\gpu-gate.json
+          "gpu_gate: $status" | Out-File $env:GITHUB_STEP_SUMMARY -Append
 
       - name: Stage FFmpeg
         shell: pwsh
@@ -88,7 +136,20 @@ jobs:
           # an sdist av; --only-binary makes any wheel miss fail loudly.
           # av 14.2.0 satisfies faster-whisper 1.2.1 (av>=11).
           python -m pip install --only-binary :all: "av==14.2.0"
-          python -m pip install -e . pytest pyinstaller
+          python -m pip install -e . pytest==9.1.1 pyinstaller PyYAML
+
+      # Opt-in only; the Python gate independently requires the explicit
+      # VIDLIFT_NVIDIA_REDISTRIBUTION_APPROVED=1 environment variable. Never
+      # enable this merely because the public artifacts can be downloaded.
+      - name: Acquire CUDA runtime (opt-in, gated)
+        if: ${{ inputs.enable_cuda_runtime && inputs.nvidia_redistribution_approved }}
+        shell: pwsh
+        env:
+          VIDLIFT_NVIDIA_REDISTRIBUTION_APPROVED: ${{ inputs.nvidia_redistribution_approved && '1' || '0' }}
+          VIDLIFT_CUDA_STAGE: ${{ runner.temp }}\vidlift-cuda-runtime
+        run: |
+          python packaging\acquire_cuda_runtime.py "$env:VIDLIFT_CUDA_STAGE"
+          if ($LASTEXITCODE -ne 0) { throw "CUDA acquisition/inventory failed; CUDA build is blocked" }
 
       - name: Install Inno Setup
         shell: pwsh
@@ -97,13 +158,15 @@ jobs:
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest -q tests/test_windows_packaging.py tests/test_gui.py
+        run: python -m pytest -q tests/test_windows_packaging.py tests/test_v04162_vad_packaging.py tests/test_cuda_build_acquisition.py tests/test_cuda_inventory_closure.py tests/test_gpu_phase_lock.py
 
       - name: Stamp executable version
+        id: version
         shell: pwsh
         run: |
           $version = (Select-String -Path pyproject.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           "VIDLIFT_VERSION=$version" | Out-File $env:GITHUB_ENV -Append
+          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append
           $parts = $version.Split(".")
           $file = "packaging\version_info.txt"
           $body = Get-Content $file -Raw
@@ -115,6 +178,9 @@ jobs:
 
       - name: Build GUI and CLI executables
         shell: pwsh
+        env:
+          VIDLIFT_CUDA_STAGE: ${{ inputs.enable_cuda_runtime && inputs.nvidia_redistribution_approved && format('{0}\vidlift-cuda-runtime', runner.temp) || '' }}
+          VIDLIFT_NVIDIA_REDISTRIBUTION_APPROVED: ${{ inputs.enable_cuda_runtime && inputs.nvidia_redistribution_approved && '1' || '0' }}
         run: |
           pyinstaller vidlift_gui.spec --noconfirm
           pyinstaller vidlift_cli.spec --noconfirm
@@ -177,11 +243,34 @@ jobs:
 
       - name: Validate installed artifact
         shell: pwsh
+        env:
+          PRIOR_INSTALLER_URL: ${{ inputs.prior_installer_url }}
+          PRIOR_INSTALLER_SHA256: ${{ inputs.prior_installer_sha256 }}
+          CUDA_REQUESTED: ${{ inputs.enable_cuda_runtime }}
         run: |
           $setup = (Resolve-Path "output\VidLift-$env:VIDLIFT_VERSION-Windows-x64-Setup.exe").Path
           $install = "$env:RUNNER_TEMP\VidLift-installed"
-          $process = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$install") -PassThru -Wait
+          $installArgument = '/DIR="{0}"' -f $install
+          $validation = "$env:RUNNER_TEMP\vidlift-update-validation"
+          New-Item -ItemType Directory -Force $validation | Out-Null
+          $env:VIDLIFT_STATE_DIR = "$validation\state"
+          $env:VIDLIFT_MONITOR_AUTOSTART = '0'
+          if ($env:PRIOR_INSTALLER_URL -notmatch '^https://' -or $env:PRIOR_INSTALLER_SHA256 -notmatch '^[a-fA-F0-9]{64}$') { throw "Prior-version update evidence requires an HTTPS installer and reviewed SHA-256" }
+          $prior = "$validation\prior-installer.exe"
+          Invoke-WebRequest -Uri $env:PRIOR_INSTALLER_URL -OutFile $prior -TimeoutSec 600
+          if ((Get-FileHash $prior -Algorithm SHA256).Hash.ToLower() -ne $env:PRIOR_INSTALLER_SHA256.ToLower()) { throw "Prior installer SHA-256 mismatch" }
+          $old = Start-Process $prior -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', $installArgument) -PassThru -Wait
+          if ($old.ExitCode -ne 0) { throw "Prior installer failed" }
+          $oldVersion = (Get-Item "$install\vidlift-cli.exe").VersionInfo.ProductVersion
+          if ([version]$oldVersion -ge [version]$env:VIDLIFT_VERSION) { throw "Update fixture must install a genuinely older version" }
+          $priorBytes = (Get-ChildItem $install -Recurse -File | Measure-Object -Property Length -Sum).Sum
+          @{ version = $oldVersion; expanded_install_bytes = [long]$priorBytes; reference_artifact = $env:PRIOR_INSTALLER_URL; installer_sha256 = $env:PRIOR_INSTALLER_SHA256.ToLower() } | ConvertTo-Json | Set-Content output\prior-size-summary.json
+          python packaging\release_gates.py --output output\seed-sentinels.json seed --root "$env:VIDLIFT_STATE_DIR" --manifest "$validation\sentinels.json" --organisation "$env:VIDLIFT_SETTINGS_ORG"
+          if ($LASTEXITCODE -ne 0) { throw "Isolated sentinel seeding failed" }
+          $process = Start-Process $setup -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", $installArgument) -PassThru -Wait
           if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)" }
+          python packaging\release_gates.py --output output\update-sentinels.json verify --root "$env:VIDLIFT_STATE_DIR" --manifest "$validation\sentinels.json"
+          if ($LASTEXITCODE -ne 0) { throw "Update changed sentinels or staged runtime DLLs in user state" }
           foreach ($file in @(
             "$install\VidLift.exe",
             "$install\vidlift-cli.exe",
@@ -220,6 +309,12 @@ jobs:
           Write-Output "installed vad assets: $(($installed.Name) -join ', ')"
           & "$install\vidlift-cli.exe" --selftest | Tee-Object "$install\selftest-cli.json"
           if ($LASTEXITCODE -ne 0) { throw "installed CLI --selftest failed — see $install\selftest-cli.json" }
+          $selftest = ((Get-Content "$install\selftest-cli.json" -Raw) -replace '^vidlift-selftest\s+', '') | ConvertFrom-Json
+          if ($env:CUDA_REQUESTED -eq 'true') {
+            $cuda = $selftest.cuda_runtime
+            if ($cuda.reason_code -eq 'not_bundled') { throw "CUDA-enabled artifact omitted runtime marker" }
+            if ($cuda.status -eq 'skipped' -and (-not $cuda.reason_code -or $cuda.resolved_device -ne 'cpu')) { throw "No-GPU fallback must report an explicit CPU reason" }
+          }
           & "$install\vidlift-cli.exe" --version
           if ($LASTEXITCODE -ne 0) { throw "Installed CLI failed" }
           & "$install\tools\ffprobe.exe" -hide_banner -version
@@ -228,6 +323,20 @@ jobs:
           Start-Sleep -Seconds 5
           if ($gui.HasExited) { throw "Installed GUI exited during launch smoke test" }
           Stop-Process -Id $gui.Id -Force
+
+      - name: Measure installer and expanded-install size gate
+        id: size
+        shell: pwsh
+        env:
+          SIZE_OVERRIDE: ${{ inputs.size_gate_override }}
+          SIZE_APPROVAL_REFERENCE: ${{ inputs.size_approval_reference }}
+        run: |
+          $args = @('packaging\release_gates.py', '--output', 'output\size-summary.json', 'size', '--installer', "output\VidLift-$env:VIDLIFT_VERSION-Windows-x64-Setup.exe", '--install-tree', "$env:RUNNER_TEMP\VidLift-installed", '--baseline', 'packaging\size-baseline.json')
+          if ($env:SIZE_OVERRIDE -eq 'true') { $args += @('--override', '--approval-reference', $env:SIZE_APPROVAL_REFERENCE) }
+          & python @args
+          $gateExit = $LASTEXITCODE
+          Get-Content output\size-summary.json | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          if ($gateExit -ne 0) { throw "Product size gate blocked; see size-summary.json" }
 
       - name: Hash installer
         shell: pwsh
@@ -243,5 +352,41 @@ jobs:
           path: |
             output/VidLift-${{ env.VIDLIFT_VERSION }}-Windows-x64-Setup.exe
             output/VidLift-${{ env.VIDLIFT_VERSION }}-Windows-x64-Setup.exe.sha256
+            output/size-summary.json
+            output/update-sentinels.json
+            output/gpu-gate.json
           if-no-files-found: error
           retention-days: 7
+
+      - name: Upload gate evidence even on failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vidlift-gate-evidence-${{ github.run_id }}
+          path: |
+            output/*summary.json
+            output/*sentinels.json
+            output/gpu-gate.json
+            dist/selftest-cli.json
+          if-no-files-found: warn
+
+  gpu-gate:
+    needs: build
+    if: ${{ inputs.gpu_runner != '' }}
+    runs-on: ${{ inputs.gpu_runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: vidlift-${{ needs.build.outputs.version }}-windows-installer
+          path: gpu-artifact
+      - name: Frozen CUDA transcription gate
+        shell: pwsh
+        run: ./packaging/gpu_gate.ps1
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: vidlift-gpu-gate-${{ github.run_id }}
+          path: gpu-evidence/
+          if-no-files-found: warn

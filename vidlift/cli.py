@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import uuid
 from pathlib import Path
 
 from . import __version__
@@ -279,6 +280,7 @@ def _cmd_run(
             # (never possible through argparse's boolean) still reads
             # False at run_file's seam (absent-defaults aligned).
             suppress_srt=suppress_srt,
+            transcription_batch_id=uuid.uuid4().hex,
         )
     except (ProbeError, PlanError, RunError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -419,6 +421,7 @@ def _cmd_subs(
         print(f"error: {exc}", file=sys.stderr)
         return 2
     failures = 0
+    batch_id = uuid.uuid4().hex
     for path in files:
         print(f"== {path}")
         # v0.4.19 (WS2): the plan-time verdict — already-done files are
@@ -446,6 +449,7 @@ def _cmd_subs(
                 force=force,
                 replace_source=replace_source,
                 suppress_srt=suppress_srt,
+                batch_id=batch_id,
             )
         except SubsJobError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -460,6 +464,7 @@ def _cmd_subs(
             f"  language: {result.language} "
             f"(confidence {result.language_confidence})\n"
             f"  cues: {result.cue_count}  model: {result.model}"
+            f"\n  device: {result.device or 'unknown'}"
         )
         for note in result.notes:
             print(f"  note: {note}")

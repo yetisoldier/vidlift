@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "expanded_install_bytes": null,
+  "reference_artifact": null,
+  "installer_limit_bytes": 2000000000,
+  "expanded_growth_limit_bytes": 1800000000,
+  "note": "Pending measured, product-reviewed prior artifact. Never infer or auto-update this baseline. Missing baseline blocks the gate unless an explicit product override with approval reference is supplied. GB thresholds use decimal bytes."
+}

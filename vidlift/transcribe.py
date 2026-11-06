@@ -61,6 +61,7 @@ from pathlib import Path
 from .config import TRANSCRIPTION_ENABLED_DEFAULT
 from .srt import Cue, normalize_cues
 
+
 __all__ = [
     "ALIGNED_MIDPOINT_REBUILD_MS",
     "ALIGN_CONFIDENCE_DROP",
@@ -85,6 +86,8 @@ __all__ = [
     "model_cache_dir",
     "model_download_url_for",
     "model_install_state",
+    "DeviceResolution",
+    "resolve_transcription_capability",
     "resolve_transcription_device",
     "resolve_model_dir",
     "selftest_report",
@@ -1028,6 +1031,7 @@ def selftest_report() -> dict:
                 "(VIDLIFT_TRANSCRIPTION_ENGINE=0)",
                 "checks": {},
                 "errors": [],
+                "cuda_runtime": {"status": "skipped", "reason_code": "engine_disabled"},
             }
         from faster_whisper.utils import get_assets_path  # deferred (N3)
 
@@ -1066,13 +1070,21 @@ def selftest_report() -> dict:
         checks["vad_load_smoke"] = "ok"
     except Exception as exc:  # noqa: BLE001 - the gate's honest failure channel
         errors.append(f"{type(exc).__name__}: {exc}")
+    cuda_section = {"status": "skipped", "reason_code": "check_failed"}
+    try:
+        from .cuda_runtime import selftest_section
+        cuda_section = selftest_section()
+        if cuda_section["status"] == "error":
+            errors.append(f"CUDA runtime: {cuda_section['reason_code']}")
+    except Exception as exc:
+        errors.append(f"CUDA runtime check failed ({type(exc).__name__})")
     ok = (
         not errors
         and bool(checks.get("onnx_files"))
         and checks.get("report_agrees") is True
         and checks.get("vad_load_smoke") == "ok"
     )
-    return {"ok": ok, "checks": checks, "errors": errors}
+    return {"ok": ok, "checks": checks, "errors": errors, "cuda_runtime": cuda_section}
 
 
 # ---- model delivery (first-run download, sha256-pinned) ---------------------
@@ -1723,30 +1735,77 @@ def model_install_state(
 # ---- device resolution --------------------------------------------------------
 
 
-def resolve_transcription_device(requested: str) -> str:
-    """auto -> cuda when CTranslate2 sees a CUDA device, else cpu.
+@dataclass(frozen=True)
+class DeviceResolution:
+    """The structured device-resolution result (v0.4.20, ADR-2 / D2).
 
-    Honest fallback: the ctypes probe mirrors ctranslate2's own check;
-    when neither applies the caller gets ``cpu`` (the ~1x realtime
-    fallback documented in the design; the run log states which one).
-    """
+    ``reason_code`` is a D6 code (None when the resolution needs no
+    explanation — strict cpu pin or an available cuda); ``detail`` is
+    sanitized (no raw native error text beyond what our own probes
+    produced); ``tested_at`` is the wall-clock of the preflight so
+    monitor/row wording can say WHEN the box was tested."""
+
+    requested: str
+    resolved: str
+    reason_code: str | None
+    reason_detail: str
+    tested_at: float
+
+
+def resolve_transcription_capability(
+    requested: str, capability_fn=None
+) -> DeviceResolution:
+    """Structured sibling of ``resolve_transcription_device`` (ADR-2).
+
+    The string resolver delegates here; the structured result carries
+    the D6 reason code + detail so monitor/row wording and support
+    diagnostics can distinguish "no NVIDIA device present" from
+    "driver too old" from "runtime DLL missing in this artifact".
+    ``capability_fn`` is injectable (default: cuda_runtime.
+    check_capability) so tests drive every branch without a GPU."""
+    from . import cuda_runtime
+
     requested = (requested or "auto").lower()
-    if requested in ("cuda", "cpu"):
-        return requested
-    if requested != "auto":
+    if requested == "cpu":
+        return DeviceResolution(
+            "cpu", "cpu", None, "strict CPU pin", time.time()
+        )
+    if requested not in {"auto", "cuda"}:
         # unknown pin: honest refusal rather than a silent guess
         raise TranscriptionError(
             f"unknown transcription device '{requested}' "
             "(expected auto|cuda|cpu)"
         )
+    probe = capability_fn or cuda_runtime.check_capability
     try:
-        import ctranslate2
+        cap = probe()
+    except Exception as exc:  # noqa: BLE001 - preflight fault means no GPU claim
+        return DeviceResolution(
+            requested, "cpu", cuda_runtime.REASON_GPU_PROBE_FAILED,
+            f"capability preflight failed ({type(exc).__name__})",
+            time.time(),
+        )
+    if cap.available:
+        return DeviceResolution(requested, "cuda", None, "", time.time())
+    return DeviceResolution(
+        requested, "cpu",
+        cap.reason_code or cuda_runtime.REASON_GPU_PROBE_FAILED,
+        cap.detail,
+        time.time(),
+    )
 
-        if ctranslate2.get_cuda_device_count() > 0:
-            return "cuda"
-    except Exception:  # noqa: BLE001 - probe failure means no GPU
-        pass
-    return "cpu"
+
+def resolve_transcription_device(requested: str) -> str:
+    """auto -> cuda when the D2 capability preflight passes, else cpu.
+
+    v0.4.20 (ADR-2): delegates to ``resolve_transcription_capability``;
+    the string contract is unchanged for existing callers (the ~1x
+    realtime fallback documented in the design; the run log states which
+    one). Honest fallback: the preflight mirrors ctranslate2's own check,
+    plus — on Windows artifacts that bundle a reviewed CUDA runtime —
+    the inventory and loader-semantics steps.
+    """
+    return resolve_transcription_capability(requested).resolved
 
 
 # ---- language (auto-detect + config pin; translation is a NON-GOAL) ----
@@ -1785,6 +1844,13 @@ def detect_language(
             f"proceeding with '{guess.code or 'unknown'}'"
         )
     return (guess.code or "en"), guess, warnings
+
+
+# Existing callers may replace these injectable seams in-process. Real
+# production defaults always take the isolated process path below.
+_ORIGINAL_ENGINE_FACTORY = make_whisper_engine
+_ORIGINAL_FALLBACK_FACTORY = make_whisper_engine_with_fallback
+_ORIGINAL_DEVICE_RESOLVER = resolve_transcription_device
 
 
 # ---- cue construction + alignment verification (the sync backstop) ----
@@ -2338,6 +2404,304 @@ def build_audio_extract_command(
     ]
 
 
+def _transcription_process(pipe, requested, model_dir, wav_path, language_pin, vad_on):
+    """Run only native engine work in a disposable spawn child."""
+    phase = "init"
+    emitted = 0
+    try:
+        resolution = resolve_transcription_capability(requested)
+        selected = resolution.resolved
+        pipe.send(("capability", (resolution.reason_code, resolution.reason_detail)))
+        pipe.send(("resolved", selected))
+        engine = make_whisper_engine(model_dir, device=selected, vad_on=vad_on)
+        pipe.send(("step", "transcribe-language"))
+        language, guess, warnings = detect_language(engine, wav_path, pin=language_pin)
+        phase = "decode"
+        pipe.send(("decode", None))
+        pipe.send(("step", "transcribe-run"))
+
+        def segment_callback(segment):
+            nonlocal emitted
+            emitted += 1
+            pipe.send(("progress", segment))
+
+        engine.transcribe_segments(wav_path, language=language, on_segment=segment_callback)
+        pipe.send(("result", ("ok", selected, language,
+                               guess.confidence if guess else None, warnings)))
+    except Exception as exc:
+        pipe.send(("result", ("error", phase, emitted, type(exc).__name__)))
+    finally:
+        pipe.close()
+
+
+_TRANSCRIPTION_PROCESS = _transcription_process
+_WORKER_INIT_TIMEOUT = 90.0
+_WORKER_DECODE_TIMEOUT = 120.0
+_WORKER_DECODE_SECONDS_PER_AUDIO_SECOND = 2.0
+_WORKER_ABSOLUTE_BASE_SECONDS = 600.0
+_WORKER_ABSOLUTE_SECONDS_PER_AUDIO_SECOND = 6.0
+
+# F5 (v0.4.20): child exception CLASS NAMES that are definitionally
+# device-independent — a CUDA attempt hitting one must NOT latch CUDA as
+# unavailable and must NOT burn the single CPU retry, which would fail
+# identically on every device. The IPC boundary carries
+# type(exc).__name__ (not the object), so names, not classes. Extend only
+# with types that are definitionally device-independent (packaging/asset
+# faults); document each addition here. VadAssetMissingError: a packaging
+# fault — the VAD asset set is absent from the payload; no device can
+# conjure it.
+_NON_DEVICE_ERROR_TYPES = frozenset({"VadAssetMissingError"})
+
+# v0.4.20 (ADR-1 / S1): the CUDA failure latch is BATCH-SCOPED. It stores
+# ``(batch_id, reason_code, detail)`` and a cached lookup returns the
+# reason ONLY for the same batch identity — one file's CUDA failure never
+# poisons another batch; a new batch re-probes (the D2 preflight is cheap
+# enough that per-batch re-probing costs nothing measurable). Callers
+# without a batch identity (batch_id None) get no latching at all: every
+# call re-probes, which is the honest behavior for direct/library use.
+# The latch stores a D6 ``(reason_code, detail)`` pair (ADR-2 / S4); the
+# visible note renders it as ``cuda unavailable — fell back to cpu
+# (<reason_code>: <detail>)``.
+_cuda_failure_lock = threading.Lock()
+_cuda_failure_batch: str | None = None
+_cuda_failure_reason: tuple[str, str] | None = None  # (reason_code, detail)
+
+
+def reset_cuda_failure_cache() -> None:
+    """Explicit test/retry escape hatch. Production recovery is batch-driven."""
+    _clear_cuda_failure()
+
+
+def _clear_cuda_failure() -> None:
+    global _cuda_failure_batch, _cuda_failure_reason
+    with _cuda_failure_lock:
+        _cuda_failure_batch = None
+        _cuda_failure_reason = None
+
+
+def _remember_cuda_failure(
+    batch_id: str | None, reason_code: str, detail: str = ""
+) -> None:
+    """Latch a CUDA failure scoped to the caller's batch identity.
+
+    A None ``batch_id`` disables latching (no batch context → no
+    cross-call memory; every call re-probes)."""
+    global _cuda_failure_batch, _cuda_failure_reason
+    if batch_id is None:
+        return
+    with _cuda_failure_lock:
+        _cuda_failure_batch = batch_id
+        _cuda_failure_reason = (reason_code, detail)
+
+
+def _cached_cuda_failure(
+    batch_id: str | None = None
+) -> tuple[str, str] | None:
+    """The latched ``(reason_code, detail)`` for THIS batch only.
+
+    Returns the reason only if ``batch_id is not None`` and matches the
+    latched batch; a different batch id (or no id) re-probes — one file's
+    CUDA failure never poisons another batch."""
+    with _cuda_failure_lock:
+        if batch_id is None or _cuda_failure_batch != batch_id:
+            return None
+        return _cuda_failure_reason
+
+
+def _cuda_fallback_note(reason_code: str, detail: str = "") -> str:
+    """The visible fallback note (ADR-2): the existing prefix is preserved;
+    the parenthetical now carries the D6 reason code and — when present —
+    the sanitized detail."""
+    if detail:
+        return f"cuda unavailable — fell back to cpu ({reason_code}: {detail[:200]})"
+    return f"cuda unavailable — fell back to cpu ({reason_code})"
+
+
+def _d6_reason_for_timeout(phase: str) -> tuple[str, str]:
+    """WorkerTimeout phase → D6 code (ADR-2): init → init_timeout; decode
+    and absolute both bound the decode window (the absolute deadline covers
+    init+decode)."""
+    from . import cuda_runtime as _cr
+
+    if phase == "init":
+        return _cr.REASON_INIT_TIMEOUT, f"engine_timeout: {phase}"
+    return _cr.REASON_DECODE_TIMEOUT, f"engine_timeout: {phase}"
+
+
+def _d6_reason_for_child_error(
+    phase: str, error_type: str, message: str = "", *, preflight_passed=True
+) -> tuple[str, str]:
+    """Child error → D6 code (ADR-2). A CUDA attempt means the preflight
+    passed by construction (the worker resolved cuda), so an init-phase
+    child error is vram_or_init_failure; a decode-phase failure is
+    decode_failure. The detail carries the sanitized type + message."""
+    from . import cuda_runtime as _cr
+
+    # IPC carries class names only. Never relay native exception payloads.
+    detail = "".join(c for c in error_type if c.isalnum() or c == "_")[:100]
+    if not preflight_passed:
+        return _cr.REASON_GPU_PROBE_FAILED, detail
+    if phase == "init":
+        return _cr.REASON_VRAM_OR_INIT_FAILURE, detail
+    return _cr.REASON_DECODE_FAILURE, detail
+
+
+def _audio_duration(wav_path: str) -> float:
+    """Allow VAD to scan long silent audio without relying on segments.
+
+    A segment callback is not a liveness signal during leading silence.
+    Budget the complete audio length, including silence, on each decode
+    deadline. This is finite, not a guarantee against slow hardware.
+    """
+    try:
+        with wave.open(wav_path, "rb") as audio:
+            duration = audio.getnframes() / audio.getframerate()
+    except (OSError, EOFError, ValueError, ZeroDivisionError, wave.Error):
+        duration = 0.0
+    return duration
+
+
+def _decode_watchdog_budget(wav_path: str) -> float:
+    return _WORKER_DECODE_TIMEOUT + _audio_duration(wav_path) * _WORKER_DECODE_SECONDS_PER_AUDIO_SECOND
+
+
+def _absolute_watchdog_budget(wav_path: str) -> float:
+    """Bound the whole attempt while allowing slow and silent audio scans."""
+    return (_WORKER_INIT_TIMEOUT + _WORKER_ABSOLUTE_BASE_SECONDS
+            + _audio_duration(wav_path) * _WORKER_ABSOLUTE_SECONDS_PER_AUDIO_SECOND)
+
+
+def _isolated_transcription(model_dir, wav_path, requested, language_pin, vad_on,
+                            should_cancel, on_step, on_progress, on_device,
+                            *, batch_id=None, on_fallback=None):
+    """Supervise engine attempts without exposing media writes to the child.
+
+    v0.4.20 (ADR-1/S1 + ADR-2/S4): ``batch_id`` scopes the CUDA failure
+    latch to this caller's batch identity (None → no latching, every call
+    re-probes); watchdog/child outcomes map to D6 reason codes and the
+    visible note carries ``(reason_code: detail)``."""
+    from . import cuda_runtime as _cr
+    from .transcription_watchdog import (
+        WorkerCancelled, WorkerExited, WorkerTimeout, supervise_worker,
+    )
+    from .run import EngineCancelled
+
+    if requested not in ("auto", "cuda", "cpu"):
+        raise TranscriptionError(f"unknown transcription device '{requested}' (expected auto|cuda|cpu)")
+    segments = []
+    selected = None
+    cached_reason = _cached_cuda_failure(batch_id) if requested != "cpu" else None
+    fallback_reason: tuple[str, str] | None = cached_reason
+    probe_reason = None
+
+    def publish_fallback(reason, *, cached=False):
+        if on_fallback and reason:
+            code, detail = reason
+            on_fallback(_cuda_fallback_note(code, f"cached {detail or code}" if cached else detail))
+
+    publish_fallback(cached_reason, cached=True)
+
+    def on_message(kind, payload):
+        nonlocal selected, probe_reason
+        if kind == "resolved":
+            selected = payload
+        elif kind == "capability":
+            code, detail = payload
+            if code:
+                probe_reason = (code, detail)
+                if requested != "cpu":
+                    publish_fallback(probe_reason)
+        elif kind == "step" and on_step:
+            on_step(payload)
+        elif kind == "progress":
+            segments.append(payload)
+            if len(segments) == 1 and on_device and selected:
+                on_device(selected, requested)
+            if on_progress:
+                on_progress(len(segments), 0)
+
+    attempts = ("cpu",) if cached_reason or requested == "cpu" else (requested, "cpu")
+    for attempt in attempts:
+        segments.clear()
+        selected = None
+        probe_reason = None
+        try:
+            result = supervise_worker(
+                _TRANSCRIPTION_PROCESS,
+                (attempt, model_dir, wav_path, language_pin, vad_on),
+                should_cancel=should_cancel, on_message=on_message,
+                init_timeout=_WORKER_INIT_TIMEOUT,
+                decode_timeout=_decode_watchdog_budget(wav_path),
+                absolute_timeout=_absolute_watchdog_budget(wav_path),
+            )
+        except WorkerCancelled as exc:
+            raise EngineCancelled("cancelled during transcription") from exc
+        except (WorkerTimeout, WorkerExited) as exc:
+            if isinstance(exc, WorkerTimeout):
+                code, detail = _d6_reason_for_timeout(exc.phase)
+            else:
+                # process-level death on a CUDA attempt: the exit fact is
+                # the detail; a cpu-attempt death keeps the generic code
+                code = (_cr.REASON_GPU_INIT_FAILED if attempt != "cpu"
+                        and selected != "cpu" else _cr.REASON_GPU_PROBE_FAILED)
+                detail = "worker exited without result"
+            reason = (code, detail)
+            if attempt != "cpu" and selected != "cpu" and not segments:
+                _remember_cuda_failure(batch_id, code, detail)
+            if attempt == "cpu" or selected == "cpu" or segments:
+                raise TranscriptionError(
+                    f"{'engine_timeout' if isinstance(exc, WorkerTimeout) else 'engine_failure'}: {code}") from exc
+            fallback_reason = reason
+            publish_fallback(reason)
+            continue
+        if result[0] == "error":
+            _, phase, emitted, error_type = result
+            # F5 (v0.4.20): a device-independent fault must not latch CUDA
+            # and must not burn the one CPU retry — the CPU attempt would
+            # fail identically. Raise directly on every arm (a cpu attempt
+            # or an emitted-progress decode failure raises today anyway;
+            # this only removes the wasted retry + latch from the rest).
+            if error_type in _NON_DEVICE_ERROR_TYPES:
+                raise TranscriptionError(
+                    f"transcription {phase} failed ({error_type}) — "
+                    "device-independent fault; no CPU retry attempted")
+            code, detail = _d6_reason_for_child_error(
+                phase, error_type, preflight_passed=selected == "cuda")
+            if attempt != "cpu" and selected != "cpu" and not emitted and not segments:
+                _remember_cuda_failure(batch_id, code, detail)
+            if attempt == "cpu" or selected == "cpu" or emitted:
+                raise TranscriptionError(f"transcription {phase} failed ({code}: {detail})")
+            fallback_reason = (code, detail)
+            publish_fallback(fallback_reason)
+            continue
+        _, actual, language, confidence, warnings = result
+        if should_cancel and should_cancel():
+            raise EngineCancelled("cancelled during transcription")
+        if on_device and not segments:
+            on_device(actual, requested)
+        # v0.4.20 (ADR-1/S1): a successful CUDA attempt clears the latch —
+        # existing behavior preserved (a success proves the failure was
+        # transient).
+        if actual == "cuda":
+            _clear_cuda_failure()
+        if requested != "cpu" and attempt != "cpu" and actual == "cpu":
+            fallback_reason = probe_reason or (_cr.REASON_NO_SUPPORTED_COMPUTE_TYPE,
+                                               _cr.EMPTY_COMPUTE_TYPES_DETAIL)
+            _remember_cuda_failure(batch_id, *fallback_reason)
+        if fallback_reason:
+            code, detail = fallback_reason
+            if cached_reason:
+                detail = f"cached {detail or code}"
+            warnings = list(warnings) + [
+                _cuda_fallback_note(code, detail)
+            ]
+        elif requested in ("auto", "cuda") and actual == "cpu":
+            warnings = list(warnings) + [_cuda_fallback_note(
+                _cr.REASON_NO_SUPPORTED_COMPUTE_TYPE)]
+        return segments, actual, language, confidence, warnings
+    raise TranscriptionError("engine_timeout: CPU retry was not completed")
+
+
 def transcribe_source_to_srt(
     source_path: str,
     *,
@@ -2363,6 +2727,12 @@ def transcribe_source_to_srt(
     # decision) and again as ("cpu", requested) if the fallback wrapper
     # rescues. Absent = zero behavior change.
     on_device: Callable[[str, str], None] | None = None,
+    # v0.4.20 (ADR-1/S1): the caller's batch identity — scopes the CUDA
+    # failure latch to this batch (one file's CUDA failure never poisons
+    # another batch; a new batch re-probes). Absent/None → no latching:
+    # every call re-probes, the honest behavior for direct/library use.
+    batch_id: str | None = None,
+    on_fallback: Callable[[str], None] | None = None,
 ) -> "TranscriptionResult":
     """The core: source audio -> normalized SRT beside ``output_path``.
 
@@ -2375,22 +2745,14 @@ def transcribe_source_to_srt(
     path. Raise TranscriptionError on any failure; callers decide the
     disposition (Mode A fail-open, Mode B job failure).
 
-    v0.4.19 (WS1, HIGH): the pre-transcription steps observe the
-    ``should_cancel`` flag — a cancel between the audio extraction and
-    the first segment raises EngineCancelled at model resolution (core
-    and download), engine load, and the language-detection edges, in
-    BOTH modes (the shared core; Mode B forwards its flag, Mode A's
-    run-side pre-resolve passes its own). A cancel observed INSIDE a
-    hung native detect/load call remains uninterruptible (no
-    Python-level poll can break a native call) — the documented
-    boundary (spec §1 WS1-D5).
+    Default engine work runs in a spawned worker, including device probe,
+    construction, language detection and decoding. Cancellation terminates
+    the child. Explicit injected or monkeypatched engine seams continue to
+    run in-process and cannot interrupt a hung native call.
 
-    v0.4.19 (WS3): ``on_device(device, requested)`` publishes the
-    device decision the moment the core resolves it (and
-    ``("cpu", requested)`` when the fallback wrapper rescues) — absent
-    (None) keeps the pre-0.4.19 silent-resolution behavior for direct
-    callers. Never fires under a foreign engine factory (the D4
-    honest-unknown rule: the core never saw that decision).
+    ``on_device(device, requested)`` publishes the actual device upon
+    first segment or successful empty completion. A foreign factory does
+    not publish a device because the core cannot know its choice.
     """
     # v0.4.16.2 (ADR-3): VAD preflight — refuse BEFORE any ffmpeg/model
     # work. Skips under the suite-wide engine-off env guard (production
@@ -2415,6 +2777,52 @@ def transcribe_source_to_srt(
             f"{(err or '').strip()[:300]}"
         )
     try:
+        if (engine_factory is None
+                and make_whisper_engine is _ORIGINAL_ENGINE_FACTORY
+                and make_whisper_engine_with_fallback is _ORIGINAL_FALLBACK_FACTORY
+                and resolve_transcription_device is _ORIGINAL_DEVICE_RESOLVER):
+            if should_cancel and should_cancel():
+                from .run import EngineCancelled
+                raise EngineCancelled("cancelled during model resolution")
+            if on_step:
+                on_step("transcribe-resolve")
+            model_dir = resolve_model_dir(
+                model_pin, state_root=state_root,
+                on_download_progress=on_download_progress,
+                should_cancel=should_cancel,
+            )
+            if on_download_progress is not None and download_log is not None:
+                download_log(f"transcription model resolved: {model_dir}")
+            segments, actual, language, confidence, warnings = _isolated_transcription(
+                model_dir, wav_path, device_pin or "auto", language_pin, vad_on,
+                should_cancel, on_step, on_progress, on_device,
+                batch_id=batch_id,
+                on_fallback=on_fallback,
+            )
+            if on_step:
+                on_step("transcribe-align")
+            result_notes = []
+            cues = segments_to_cues(segments, hold_cap_wav=wav_path, notes=result_notes)
+            cues, notes = align_verify_cues(cues, segments)
+            result_notes.extend(notes)
+            if not cues:
+                raise TranscriptionError("no speech detected in audio — transcription produced no subtitle cues")
+            if should_cancel and should_cancel():
+                from .run import EngineCancelled
+                raise EngineCancelled("cancelled before writing subtitles")
+            if on_step:
+                on_step("transcribe-write")
+            if should_cancel and should_cancel():
+                from .run import EngineCancelled
+                raise EngineCancelled("cancelled before writing subtitles")
+            from .srt import write_srt_file
+            srt_path = transcribe_sidecar_srt_path(output_path)
+            write_srt_file(srt_path, cues)
+            return TranscriptionResult(
+                srt_path=srt_path, cue_count=len(cues), language=language,
+                language_confidence=confidence, notes=list(warnings) + result_notes,
+                model=model_dir, device=actual,
+            )
         # -- engine resolution (seam-first: the factory receives the
         # resolved model dir; a missing engine package raises
         # TranscriptionError BEFORE any long work happens) ----
@@ -2447,6 +2855,8 @@ def transcribe_source_to_srt(
                 # Mode A's run-side note slot is separate) + stderr is
                 # already handled inside the wrapper factory chain.
                 fallback_notes.append(note)
+                if on_fallback is not None:
+                    on_fallback(note)
                 # v0.4.19 (WS3): the fallback wrapper ALWAYS lands on CPU
                 # (the result-device rule at the TranscriptionResult
                 # tail) — the note's existence settles the honest device.

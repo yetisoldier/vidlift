@@ -42,6 +42,7 @@ from pathlib import Path
 import time
 
 import pytest
+from _gui_checks import gui_application, wait_for_checks
 
 pytest.importorskip("PyQt6")
 
@@ -58,7 +59,7 @@ from vidlift.probe import classify, parse_probe
 # ---------------------------------------------------------------- harness
 @pytest.fixture
 def qapp():
-    app = QApplication.instance() or QApplication([])
+    app = gui_application()
     yield app
 
 
@@ -149,7 +150,7 @@ class _ScriptedClient:
         return list(chosen)
 
     def enqueue_subs(
-        self, paths, *, replace_source=False, suppress_srt=False
+        self, paths, *, replace_source=False, suppress_srt=False, device="auto", batch_id=None
     ):
         """The Mode B surface: kind-checked ids in pick order.
 
@@ -166,6 +167,7 @@ class _ScriptedClient:
                 raise FileNotFoundError(f"no such file on this machine: {path}")
         self.last_subs_replace_source = bool(replace_source)
         self.last_subs_suppress_srt = bool(suppress_srt)
+        self.last_subs_device = device
         self.armed = True
         fresh = [jid for jid in self.job_order if jid not in self.submitted]
         chosen = fresh[: len(paths)]
@@ -234,6 +236,9 @@ def _window(qapp, monkeypatch, tmp_path, client):
         )
 
     monkeypatch.setattr(MainWindow, "_settings", _settings)
+    # Most legacy behaviour tests explicitly accept review without a modal;
+    # real keyboard/default/cancel cases live in test_ui_review.py.
+    monkeypatch.setattr(MainWindow, "_confirm_options", lambda *a: True)
     # The active-batch guards pop an information box (never a question);
     # a blocked click must return cleanly, so modal informations are
     # auto-ok for this harness.
@@ -314,6 +319,8 @@ def test_subs_button_enqueues_picked_files_as_subs_jobs(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
 
     assert recorded["parent"] is win
     # same picker family as Add Files; NO resolution filter in the string
@@ -322,7 +329,7 @@ def test_subs_button_enqueues_picked_files_as_subs_jobs(
     assert "640" not in filt and "resolution" not in filt.lower()
 
     assert win.job_ids == ["VJ1", "VJ2"]
-    assert client.last_enqueued_kinds == ["subs", "subs"]
+    assert [client.subs_kinds[job_id] for job_id in win.job_ids] == ["subs", "subs"]
     # rows exist for BOTH picked files, in pick order, with the subs
     # verdict in the Status cell (not the upscale plan render)
     assert _row_by_filename(win, "alpha-ep.mkv") == 0
@@ -377,6 +384,8 @@ def test_subs_rows_render_own_states_through_real_consume(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
     assert win.job_ids == ["VJ1", "VJ2"]
 
     # Tick 1: J1 queued, J2 queued.
@@ -437,6 +446,8 @@ def test_subs_cancel_current_mid_transcribe_lands_cancelled(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
     win._tick_elapsed()  # queued
     win._tick_elapsed()  # running mid-transcribe
     assert _row_state(win, "mid-ep.mkv") == "running"
@@ -478,6 +489,8 @@ def test_subs_cancel_batch_cancels_whole_batch(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
     assert win.cancel_batch_button.isEnabled()
     win.cancel_batch_button.click()
 
@@ -534,6 +547,8 @@ def test_subs_collision_blocked_row_never_overwrites(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
 
     row_g = _row_by_filename(win, "fresh-ep.mkv")
     row_b = _row_by_filename(win, "done-ep.mkv")
@@ -642,6 +657,8 @@ def test_subs_eta_stays_honest_no_digits_for_transcribe(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
     win._tick_elapsed()
     win._tick_elapsed()
 
@@ -687,6 +704,8 @@ def test_subs_batch_then_upscale_batch_hygiene(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
     win._tick_elapsed()  # queued
     win._tick_elapsed()  # terminal lands + drains
     assert win.job_ids == []
@@ -749,6 +768,8 @@ def test_subs_batch_then_second_subs_batch_reseeds_rows(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
     win._tick_elapsed()
     win._tick_elapsed()
     assert win.job_ids == []
@@ -758,6 +779,8 @@ def test_subs_batch_then_second_subs_batch_reseeds_rows(
     # the first slate's history row, so the identity map carries the
     # offset (slots/run_counts stay 0-based submission-order arrays).
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
     assert win.job_ids == ["VJ2", "VJ3"]
     assert win._batch_row_for_job == {"VJ2": 1, "VJ3": 2}
     assert win._batch_slots == ["VJ2", "VJ3"]
@@ -847,6 +870,8 @@ def test_subs_gui_live_details_render_from_snapshot(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
     win._tick_elapsed()
     win._tick_elapsed()
     row = _row_by_filename(win, "detail-ep.mkv")
@@ -887,6 +912,8 @@ def test_subs_active_batch_blocks_second_flow(qapp, monkeypatch, tmp_path):
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
     win._tick_elapsed()
     win._tick_elapsed()
     assert "transcribing" in win.stage_label.text()
@@ -902,7 +929,11 @@ def test_subs_active_batch_blocks_second_flow(qapp, monkeypatch, tmp_path):
         staticmethod(lambda *a, **k: ([str(second)], "")),
     )
     win.add_subs_button.click()
-    assert win.job_ids == ["VJ1"]  # unchanged — the click was refused
+    wait_for_checks(win)
+    # Adds during an active batch stay staged for the next Start.
+    assert len(win._staged_subs) == 1
+    assert win._staged_subs[0]["path"] == str(second.resolve())
+    assert win.job_ids == ["VJ1"]  # live batch unchanged
     next(gen, None)
 
 
@@ -922,8 +953,13 @@ def _grid_position(win, widget) -> tuple[int, int]:
     controls (e.g. transcribe_subs) it resolves the upscale group's
     grid — workstream-2 renders that toggle at (3, 3) there."""
     layout = widget.parentWidget().layout()
+    def contains(lay):
+        return any(lay.itemAt(i).widget() is widget or
+                   (lay.itemAt(i).layout() is not None and contains(lay.itemAt(i).layout()))
+                   for i in range(lay.count()))
     for index in range(layout.count()):
-        if layout.itemAt(index).widget() is widget:
+        entry = layout.itemAt(index)
+        if entry.widget() is widget or (entry.layout() is not None and contains(entry.layout())):
             row, column, _row_span, _col_span = layout.getItemPosition(index)
             return row, column
     raise AssertionError("widget not found in its parent widget's layout")
@@ -948,7 +984,7 @@ def test_subs_replace_checkbox_exists_beside_button_default_off_tooltip(
     # + folder button) first, then the options pair — the replace
     # checkbox moved (0,1) -> (0,2) (the File-E T4 re-pin, same re-tile).
     assert _grid_position(win, win.add_subs_button) == (0, 0)
-    assert _grid_position(win, win.subs_replace_source) == (0, 2)
+    assert _grid_position(win, win.subs_replace_source) == (2, 0)
     # group separation (workstream-2): the button + checkbox share the
     # Mode B group (spec: 'parentWidget() is not ...' must be False —
     # the positive identity below is its exact equivalent), while Mode
@@ -958,7 +994,7 @@ def test_subs_replace_checkbox_exists_beside_button_default_off_tooltip(
     assert win.subs_replace_source.parentWidget() is win.add_subs_button.parentWidget()
     assert win.subs_replace_source.parentWidget() is not win.replace_source.parentWidget()
     assert win.transcribe_subs.parentWidget() is win.replace_source.parentWidget()
-    assert _grid_position(win, win.transcribe_subs) == (3, 3)
+    assert _grid_position(win, win.transcribe_subs) == (4, 1)
     # default OFF (fresh QSettings, the absent-defaults rule)
     assert win.subs_replace_source.isChecked() is False
     # labels: the irrecoverability named; D3 shortened label keeps the
@@ -1079,6 +1115,8 @@ def test_subs_pick_flow_threads_checkbox_state_into_enqueue(
     win = next(gen)
     win.subs_replace_source.setChecked(True)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()
     assert client.last_subs_replace_source is True
     # park the shared settings file OFF again for the second phase
     win.subs_replace_source.setChecked(False)
@@ -1091,6 +1129,7 @@ def test_subs_pick_flow_threads_checkbox_state_into_enqueue(
     win2 = next(gen2)
     assert win2.subs_replace_source.isChecked() is False
     win2.add_subs_button.click()
+    wait_for_checks(win2)
     assert client2.last_subs_replace_source is False
     next(gen2, None)
 
@@ -1129,11 +1168,78 @@ def test_mode_a_replace_option_never_cross_wires_mode_b(
     start_src = inspect.getsource(MainWindow.start_upscale)
     assert '"replace_source": self.replace_source.isChecked()' in start_src
     assert "subs_replace_source" not in start_src
-    subs_src = inspect.getsource(MainWindow._enqueue_subs_paths)
-    # v0.4.18 (4-A6/4-A7): the enqueue tail moved into
-    # _enqueue_subs_paths — the fence follows the code it guards (the
-    # File-E T9 re-target, same extraction).
-    assert "replace_source=self.subs_replace_source.isChecked()" in subs_src
-    # and the Mode B path never reads Mode A's checkbox
-    assert "self.replace_source.isChecked()" not in subs_src
-    assert "replace_source=self.subs_replace_source.isChecked()" in subs_src
+    subs_src = inspect.getsource(MainWindow._submit_subs_paths)
+    assert '"replace_source": self.subs_replace_source.isChecked() if replace_source is None else replace_source' in subs_src
+    assert '"suppress_srt": self.subs_suppress_srt.isChecked() if suppress_srt is None else suppress_srt' in subs_src
+
+
+def test_ws3_add_stages_until_explicit_start(qapp, monkeypatch, tmp_path):
+    """WS3: adding records a staged row; only Start creates registry work."""
+    media = tmp_path / "staged.mkv"
+    media.write_bytes(b"source")
+    client = _ScriptedClient()
+    client.make_job(str(media), [{"state": "queued"}], kind="subs")
+    import vidlift.gui as gui_mod
+    monkeypatch.setattr(gui_mod, "subs_plan_verdict", lambda *a, **k: "ready")
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win._enqueue_subs_paths([str(media)])
+    assert win.job_ids == []
+    assert client.submitted == []
+    assert win.start_subtitles_button.isEnabled()
+    monkeypatch.setattr(gui_mod.QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    win.start_subtitles()
+    assert win.job_ids == ["VJ1"]
+    assert client.job_order == ["VJ1"]
+    assert win._staged_subs == []
+
+
+def test_ws3_failed_enqueue_keeps_staged_row(qapp, monkeypatch, tmp_path):
+    media = tmp_path / "failed.mkv"
+    media.write_bytes(b"x")
+    client = _ScriptedClient()
+    import vidlift.gui as gui_mod
+    monkeypatch.setattr(gui_mod, "subs_plan_verdict", lambda *a, **k: "ready")
+    monkeypatch.setattr(gui_mod.QMessageBox, "warning", staticmethod(lambda *a, **k: None))
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win._enqueue_subs_paths([str(media)])
+    monkeypatch.setattr(client, "enqueue_subs", lambda *a, **k: (_ for _ in ()).throw(gui_mod.BridgeError("offline", "offline")))
+    win.start_subtitles()
+    assert [row["path"] for row in win._staged_subs] == [str(media.resolve())]
+    # An arbitrary BridgeError cannot prove that no job was recorded.
+    assert win._staged_subs[0]["uncertain"]
+    assert not win.start_subtitles_button.isEnabled()
+
+
+def test_ws3_mixed_option_snapshots_submit_separately(qapp, monkeypatch, tmp_path):
+    files = [tmp_path / "first.mkv", tmp_path / "second.mkv"]
+    for path in files:
+        path.write_bytes(b"x")
+    client = _ScriptedClient()
+    client.make_job(str(files[0]), [{"state": "queued"}], kind="subs")
+    client.make_job(str(files[1]), [{"state": "queued"}], kind="subs")
+    import vidlift.gui as gui_mod
+    monkeypatch.setattr(gui_mod, "subs_plan_verdict", lambda *a, **k: "ready")
+    monkeypatch.setattr(gui_mod.QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    gen = _window(qapp, monkeypatch, tmp_path, client)
+    win = next(gen)
+    win.subs_replace_source.setChecked(True)
+    win._enqueue_subs_paths([str(files[0])])
+    win.subs_replace_source.setChecked(False)
+    win.subs_suppress_srt.setChecked(True)
+    win._enqueue_subs_paths([str(files[1])])
+    calls = []
+    original = client.enqueue_subs
+    def record(paths, **options):
+        calls.append((list(paths), options.copy()))
+        return original(paths, **options)
+    monkeypatch.setattr(client, "enqueue_subs", record)
+    win.start_subtitles()
+    batch = calls[0][1]["batch_id"]
+    assert batch and calls[1][1]["batch_id"] == batch
+    assert calls == [
+        ([str(files[0].resolve())], {"replace_source": True, "suppress_srt": False, "device": "auto", "batch_id": batch}),
+        ([str(files[1].resolve())], {"replace_source": False, "suppress_srt": True, "device": "auto", "batch_id": batch}),
+    ]
+    assert win._staged_subs == []

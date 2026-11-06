@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _gui_checks import gui_application, wait_for_checks
 
 from vidlift.plan import build_file_plan, BatchPlan
 from vidlift.probe import SubtitleInfo, classify, parse_probe
@@ -169,7 +170,7 @@ class FakeClient:
             ids.append(record.job_id)
         return ids
 
-    def enqueue_subs(self, paths, *, replace_source=False):
+    def enqueue_subs(self, paths, *, replace_source=False, suppress_srt=False, device="auto"):
         """The Mode B surface (v0.4.14): one subs job per picked file,
         the pick order preserved. v0.4.17: the GUI threads the
         replace-source checkbox state; the kwarg is accepted with the
@@ -267,7 +268,7 @@ def window(client, monkeypatch, tmp_path):
         QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
     )
     monkeypatch.setattr(time, "sleep", lambda s: None)
-    app = QApplication.instance() or QApplication([])
+    app = gui_application()
     win = MainWindow(client=client)
     yield win
     win.job_ids = []
@@ -327,9 +328,7 @@ def test_disabling_ocr_removes_only_bitmap_subtitle_plan():
     assert "OCR disabled" in adjusted.subtitle_note
 
 
-def test_main_window_shows_version_output_column_and_start_action(client):
-    app = QApplication.instance() or QApplication([])
-    window = MainWindow(client=client)
+def test_main_window_shows_version_output_column_and_start_action(window):
     labels = [label.text() for label in window.findChildren(QLabel)]
     assert "VidLift" in labels
     assert any(text.startswith("v") for text in labels)  # the header pill
@@ -337,8 +336,6 @@ def test_main_window_shows_version_output_column_and_start_action(client):
     assert window.start_button.text() == "Start Upscale"
     assert not window.start_button.isEnabled()
     assert window.subtitle_ocr.text() == "Enable subtitle OCR"
-    window.close()
-    app.processEvents()
 
 
 # ---- v0.4.4 G-cases (design §8) ----------------------------------------------
@@ -518,21 +515,11 @@ def test_polish_helper_line_and_verb_order(window):
     from vidlift.gui import PLAN_HELPER_TEXT
     labels = [l.text() for l in window.findChildren(QLabel)]
     assert PLAN_HELPER_TEXT in labels
-    # Toolbar verb order on the controls grid: Plan before Start
-    # (left-to-right on row 0).
-    lay = window.plan_button.parentWidget().layout()
-    columns = {}
-    for i in range(lay.count()):
-        item = lay.itemAt(i)
-        w = item.widget()
-        if w is window.plan_button:
-            columns["plan"] = lay.getItemPosition(i)[1]
-        if w is window.start_button:
-            columns["start"] = lay.getItemPosition(i)[1]
-        if w is window.cancel_button:
-            columns["cancel"] = lay.getItemPosition(i)[1]
-    assert columns["plan"] < columns["start"]
-    assert "cancel" in columns
+    # Same verbs, now in a nested action row and shared run surface.
+    window.show()
+    QApplication.processEvents()
+    assert window.plan_button.geometry().right() < window.start_button.geometry().left()
+    assert window.cancel_button.parentWidget() is window.run_panel
 
 
 def test_polish_engine_combo_disabled_while_running(window, tmp_path):
@@ -700,10 +687,12 @@ def test_v047_replace_checkbox_no_overlap_with_cancel(
         app.processEvents()
         cb = win.replace_source
         cancel = win.cancel_button
-        assert not cb.geometry().intersects(cancel.geometry()), (
-            f"checkbox {cb.geometry()} overlaps cancel {cancel.geometry()}"
-        )
-        assert cb.geometry().right() < cancel.geometry().left()
+        win.run_panel.show()
+        win.setup_scroll.ensureWidgetVisible(cb)
+        app.processEvents()
+        from PyQt6.QtCore import QRect, QPoint
+        assert not QRect(cb.mapTo(win, QPoint()), cb.size()).intersects(
+            QRect(cancel.mapTo(win, QPoint()), cancel.size()))
     finally:
         win.job_ids = []
         win._run_started_at = None
@@ -812,10 +801,12 @@ def test_b18_profile_combo_geometry_does_not_overlap_cancel(
         app.processEvents()
         combo = win.profile_combo
         cancel = win.cancel_button
-        assert not combo.geometry().intersects(cancel.geometry()), (
-            f"profile combo {combo.geometry()} overlaps cancel {cancel.geometry()}"
-        )
-        assert combo.geometry().right() < cancel.geometry().left()
+        win.run_panel.show()
+        win.setup_scroll.ensureWidgetVisible(combo)
+        app.processEvents()
+        from PyQt6.QtCore import QRect, QPoint
+        assert not QRect(combo.mapTo(win, QPoint()), combo.size()).intersects(
+            QRect(cancel.mapTo(win, QPoint()), cancel.size()))
     finally:
         win.job_ids = []
         win._run_started_at = None
@@ -1282,9 +1273,10 @@ def test_f13a_drop_event_enforces_max_files_cap(window, monkeypatch):
     paths = [str(Path("/fake") / f"drop-{i}.avi") for i in range(501)]
     event, _mime = _make_drop_event(paths)
     window.dropEvent(event)
+    wait_for_checks(window)
     assert added == [], "the 501-file drop must not reach the planner"
-    assert len(dialogs) == 1
-    assert "501" in dialogs[0] and "500" in dialogs[0]
+    assert dialogs == []  # Worker errors use persistent, copyable guidance.
+    assert "501" in window.message_label.text() and "500" in window.message_label.text()
 
 
 def test_f13a_drop_event_at_the_cap_boundary_passes(window, monkeypatch):
@@ -1303,6 +1295,7 @@ def test_f13a_drop_event_at_the_cap_boundary_passes(window, monkeypatch):
     paths = [str(Path("/fake") / f"drop-{i}.avi") for i in range(500)]
     event, _mime = _make_drop_event(paths)
     window.dropEvent(event)
+    wait_for_checks(window)
     assert dialogs == []
     assert added == [paths]
 
@@ -1328,9 +1321,10 @@ def test_f13b_enqueue_run_oserror_dialogs_instead_of_escaping(
     monkeypatch.setattr(window.client, "enqueue_run", exploding_enqueue)
     window.batch = batch_plan_from([_plan_for(tmp_path)])
     window.start_upscale()  # must not raise
-    assert dialogs == [
-        "could not record the batch: [Errno 28] No space left on device"
-    ]
+    assert len(dialogs) == 1
+    assert "[Errno 28] No space left on device" in dialogs[0]
+    assert window.batch.files[0].report.path in dialogs[0]
+    assert window.batch.files[0].report.path in window._uncertain_upscale_paths
     assert window.job_ids == []
 
 
@@ -1357,10 +1351,15 @@ def test_f13b_enqueue_subs_oserror_dialogs_instead_of_escaping(
 
     monkeypatch.setattr(window.client, "enqueue_subs", exploding_enqueue_subs)
     window.choose_subs_files()  # must not raise
+    wait_for_checks(window)
+    window.start_subtitles()
     assert dialogs == [
-        "could not record the batch: [Errno 28] No space left on device"
+        "could not record the batch: [Errno 28] No space left on device; "
+        "submission status unknown. Inspect Recent jobs; retry is disabled."
     ]
     assert window.job_ids == []
+    assert window._staged_subs[0]["uncertain"]
+    assert not window.start_subtitles_button.isEnabled()
 
 
 # ---- v0.4.15.4 F-13c: "Cancel Current" means current -------------------------

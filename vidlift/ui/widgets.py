@@ -65,7 +65,7 @@ class EtaProgressBar(QWidget):
     flicker fix — THE rule here)."""
 
     def __init__(self, parent=None):
-        super().__init__()
+        super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
@@ -77,6 +77,20 @@ class EtaProgressBar(QWidget):
         layout.addWidget(self.bar, stretch=1)
         layout.addWidget(self.eta_label)
         self._busy = False
+        self.bar.setAccessibleName("Progress")
+        self.bar.setAccessibleDescription("Progress is unknown; no percentage is available.")
+        self.setAccessibleName("Progress")
+        self.setAccessibleDescription("Progress is unknown; no percentage is available.")
+
+    def _update_accessible_state(self) -> None:
+        if self._busy:
+            description = self.eta_label.text() or "Progress is being estimated; no percentage is available."
+        elif self.eta_label.text().startswith("ETA ") or self.bar.value() > 0:
+            description = f"Measured progress: {self.bar.value() / 10:g} percent. {self.eta_label.text()}".strip()
+        else:
+            description = "Progress is unknown; no percentage is available."
+        self.bar.setAccessibleDescription(description)
+        self.setAccessibleDescription(description)
 
     def set_busy(self, busy: bool, text: str = "estimating ...") -> None:
         self._busy = busy
@@ -92,6 +106,7 @@ class EtaProgressBar(QWidget):
                 "upscaling ...",
             ):
                 self.eta_label.setText("")
+        self._update_accessible_state()
 
     def set_value(self, fraction: float, eta_seconds: float | None = None) -> None:
         if self._busy and (eta_seconds is not None or fraction > 0.0):
@@ -101,14 +116,17 @@ class EtaProgressBar(QWidget):
             # Duplicate progress line: keep the last shown estimate — a
             # None between real ticks must never blank the ETA (found
             # in the sibling's validation run 5, 2026-10-02).
+            self._update_accessible_state()
             return
         if eta_seconds > 1:
             m, s = divmod(int(eta_seconds), 60)
             self.eta_label.setText(f"ETA {m}:{s:02d}")
         else:
             self.eta_label.setText("")
+        self._update_accessible_state()
 
     def reset(self) -> None:
         self.set_busy(False)
         self.bar.setValue(0)
         self.eta_label.setText("")
+        self._update_accessible_state()

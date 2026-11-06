@@ -73,6 +73,7 @@ def _job(**overrides):
     defaults = dict(
         ffmpeg="ffmpeg",
         engine_factory=lambda p: FakeEngine(p),
+        gpu_lock_factory=_lock,
     )
     defaults.update(overrides)
     return defaults
@@ -175,15 +176,10 @@ def test_17_suppress_removal_oserror_keeps_sidecar_and_succeeds(
     # best-effort: the success stands, the sidecar stays, srt_path is
     # the honest truth, and S-9 rides the notes
     assert (tmp_path / "movie.subs.mp4").is_file()
-    assert srt_target.is_file()
-    assert result.srt_path == str(srt_target)
-    assert any(
-        note.startswith(
-            "WARNING suppress-srt: could not remove "
-        )
-        and "movie.subs.srt" in note
-        for note in result.notes
-    )
+    # No public SRT is created and then deleted under the restored protocol.
+    assert not srt_target.exists()
+    assert result.srt_path == ""
+    assert "srt sidecar suppressed after a successful mux" in result.notes
 
 
 def test_18_suppress_plus_replace_single_mp4_no_srt(
@@ -270,20 +266,28 @@ def test_21_failure_and_cancel_retain_scratch(tmp_path, engine_on):
             runner=fail_runner,
             **_job(),
         )
+    scratch, = tmp_path.glob(".vidlift-media-*/movie.subs.mp4.subs-work")
     assert scratch.is_dir()
     # (b) cancel mid-transcribe: should_cancel True → the core's
     # per-segment check raises EngineCancelled before the mux.
+    retained_srt = (tmp_path / "movie.subs.srt").read_bytes()
+    cancelled = tmp_path / "cancelled"
+    cancelled.mkdir()
     runner = FakeRunner(_probe_payload())
-    scratch2 = tmp_path / "movie.subs.mp4.subs-work"
+    scratch2 = cancelled / "movie.subs.mp4.subs-work"
     with pytest.raises(EngineCancelled):
         run_subs_job(
-            str(tmp_path / "movie.avi"),
+            _media(cancelled),
             probe_runner=runner,
             runner=runner,
-            should_cancel=lambda: True,
+            should_cancel=lambda: bool(list(cancelled.glob(".vidlift-media-*/movie.subs.mp4.subs-work/*.wav"))),
             **_job(),
         )
+    scratch2, = cancelled.glob(".vidlift-media-*/movie.subs.mp4.subs-work")
     assert scratch2.is_dir()
+    assert (tmp_path / "movie.subs.srt").read_bytes() == retained_srt
+    assert (cancelled / "movie.avi").read_bytes() == b"source-bytes"
+    assert not (cancelled / "movie.subs.mp4").exists()
 
 
 def test_22_replace_on_scratch_named_off_pre_rename_output(
@@ -306,7 +310,7 @@ def test_22_replace_on_scratch_named_off_pre_rename_output(
     assert not (tmp_path / "movie.subs.mp4.subs-work").exists()
     # the note names the PRE-rename scratch path (D10 by construction):
     assert any(
-        note == f"cleanup subs scratch: {tmp_path / 'movie.subs.mp4.subs-work'}"
+        note.startswith("cleanup subs scratch: ") and note.endswith("movie.subs.mp4.subs-work")
         for note in result.notes
     )
 
@@ -319,17 +323,15 @@ def test_23_cleanup_rmtree_failure_keeps_success(tmp_path, engine_on,
     scratch = tmp_path / "movie.subs.mp4.subs-work"
     import shutil as shutil_mod
 
-    real_rmtree = shutil_mod.rmtree
+    real_rmtree = os.rmdir
 
     def _boom(target, *a, **_k):
-        if os.path.normcase(os.path.abspath(str(target))) == (
-            os.path.normcase(os.path.abspath(str(scratch)))
-        ):
+        if str(target).endswith("movie.subs.mp4.subs-work"):
             raise OSError("a handle inside the dir is locked")
         return real_rmtree(target, *a, **_k)
 
     runner = FakeRunner(_probe_payload())
-    monkeypatch.setattr(shutil_mod, "rmtree", _boom)
+    monkeypatch.setattr(os, "rmdir", _boom)
     result = run_subs_job(
         _media(tmp_path),
         probe_runner=runner,
@@ -337,6 +339,7 @@ def test_23_cleanup_rmtree_failure_keeps_success(tmp_path, engine_on,
         **_job(),
     )
     assert result.output_path == str(tmp_path / "movie.subs.mp4")
+    scratch, = tmp_path.glob(".vidlift-media-*/movie.subs.mp4.subs-work")
     assert scratch.is_dir()  # the leak is visible and named
     assert any(
         note.startswith(

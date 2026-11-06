@@ -94,6 +94,8 @@ class RegistryError(RuntimeError):
 class JobRecord:
     """One job: run or benchmark (mcp-bridge.md Section 6)."""
 
+    _extra: dict
+
     def __init__(
         self,
         *,
@@ -184,6 +186,7 @@ class JobRecord:
 
     def to_dict(self) -> dict:
         return {
+            **getattr(self, "_extra", {}),
             "job_id": self.job_id,
             "kind": self.kind,
             "paths": list(self.paths),
@@ -214,7 +217,7 @@ class JobRecord:
 
     @classmethod
     def from_dict(cls, data: dict) -> "JobRecord":
-        return cls(
+        record = cls(
             job_id=str(data["job_id"]),
             kind=str(data.get("kind", "run")),
             paths=list(data.get("paths", [])),
@@ -234,9 +237,11 @@ class JobRecord:
             result=data.get("result"),
             progress_snapshot=data.get("progress_snapshot"),
         )
+        record._extra = {key: value for key, value in data.items() if key not in record.to_dict()}
+        return record
 
 
-class Registry:
+class _LegacyRegistry:
     """The persisted registry: load, enqueue, mutate, atomic save.
 
     ``sweep_orphans()`` runs on startup (Section 6's restart rule).
@@ -777,3 +782,74 @@ class Registry:
             self._cancel_flags.pop(job_id, None)
         else:
             self._cancel_flags[job_id] = flag
+
+
+# The legacy implementation above is retained only as a migration reference.
+# All production imports use the transaction protocol below. Keep this facade
+# in the historical module so callers do not need an import-path migration.
+from .registry_transactions import TransactionalRegistry as _TransactionalRegistry
+
+
+class Registry(_TransactionalRegistry):
+    """Compatibility facade enforcing the process-local owner on closes.
+
+    A stale executor may not finish a job after another process has recovered
+    or otherwise replaced its claim. The owner identity is captured durably by
+    claim_next/transition(running); terminal writers must match it.
+    """
+
+    def _assert_owner_for_close(self, job_id: str, new_state: str) -> None:
+        if new_state not in TERMINAL_STATES:
+            return
+        from .registry_transactions import owner_fact
+        current = owner_fact()
+        with self._transaction() as image:
+            row = next((item for item in image["jobs"] if item["job_id"] == job_id), None)
+            if row is None:
+                raise RegistryError(f"job not found: {job_id}")
+            owner = row.get("owner") or {}
+            current = owner_fact()
+            if row.get("state") == "running" and any(owner.get(key) != value for key, value in current.items()):
+                raise RegistryError(f"stale owner cannot close job {job_id}")
+
+    def transition(self, record, new_state):
+        if new_state not in TERMINAL_STATES:
+            return super().transition(record, new_state)
+        from .registry_transactions import owner_fact
+        baseline = self._baseline.get(record.job_id, {})
+        claim_token = (getattr(record, "_extra", {}).get("owner") or {}).get("claim_token")
+        deltas = {k: v for k, v in record.to_dict().items()
+                  if v != baseline.get(k) and k != "state"}
+        with self._transaction() as image:
+            row = next((item for item in image["jobs"] if item["job_id"] == record.job_id), None)
+            if row is None:
+                raise RegistryError(f"job not found: {record.job_id}")
+            owner = row.get("owner") or {}
+            if row.get("state") == "running" and (
+                not claim_token or owner.get("claim_token") != claim_token
+                or any(owner.get(key) != value for key, value in owner_fact().items())
+            ):
+                raise RegistryError(f"stale owner cannot close job {record.job_id}")
+            current = JobRecord.from_dict(row)
+            current.transition(new_state)
+            row.update(deltas)
+            row.update(state=current.state, started_at=current.started_at,
+                       finished_at=current.finished_at, last_activity_at=current.last_activity_at)
+        self._cancel_flags.pop(record.job_id, None)
+
+    def finish_job(self, job_id, new_state, *, owner_token=None, **fields):
+        from .registry_transactions import owner_fact
+        with self._transaction() as image:
+            row = next((item for item in image["jobs"] if item["job_id"] == job_id), None)
+            if row is None:
+                raise RegistryError(f"job not found: {job_id}")
+            owner = row.get("owner") or {}
+            current = owner_fact()
+            if row.get("state") == "running" and (not owner_token or owner.get("claim_token") != owner_token or any(owner.get(key) != value for key, value in current.items())):
+                raise RegistryError(f"stale owner or missing claim token cannot close job {job_id}")
+            current = JobRecord.from_dict(row)
+            current.transition(new_state)
+            row.update(fields)
+            row.update(state=new_state, finished_at=current.finished_at,
+                       last_activity_at=current.last_activity_at)
+        self._cancel_flags.pop(job_id, None)

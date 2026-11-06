@@ -34,6 +34,7 @@ import os
 from pathlib import Path
 
 import pytest
+from _gui_checks import wait_for_checks
 
 pytest.importorskip("PyQt6")
 
@@ -187,6 +188,7 @@ def test_07_mode_a_add_folder_walks_the_recursive_tree(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_folder()
+    wait_for_checks(win)
     assert added == [expected]
     next(gen, None)
 
@@ -214,17 +216,19 @@ def test_08_mode_a_folder_guard_names_count_and_tree(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
 
-    monkeypatch.setattr(gui_mod, "collect_video_files", lambda folder: list(fake))
+    monkeypatch.setattr(gui_mod, "collect_video_files", lambda folder, **kwargs: list(fake))
     win.add_folder()
-    assert len(warned) == 1
-    assert "501" in warned[0] and "500" in warned[0]
-    assert "subfolders included" in warned[0]
+    wait_for_checks(win)
+    assert warned == []
+    assert "501" in win.message_label.text() and "500" in win.message_label.text()
+    assert "subfolders included" in win.message_label.text()
     assert added == [], "the 501-video tree must not be added"
 
     # boundary: exactly MAX_FILES passes (the cap is >500, not >=500)
     warned.clear()
-    monkeypatch.setattr(gui_mod, "collect_video_files", lambda folder: list(fake[:MAX_FILES]))
+    monkeypatch.setattr(gui_mod, "collect_video_files", lambda folder, **kwargs: list(fake[:MAX_FILES]))
     win.add_folder()
+    wait_for_checks(win)
     assert warned == []
     assert added == [fake[:MAX_FILES]]
     next(gen, None)
@@ -261,9 +265,11 @@ def test_09_mode_b_choose_subs_folder_enqueues_tree_sorted_one_call(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.subs_add_folder_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
 
-    assert len(client.subs_calls) == 1
-    assert client.subs_calls[0][0] == expected  # sorted, full tree
+    assert [paths[0] for paths, _ in client.subs_calls] == expected
+    assert all(len(paths) == 1 for paths, _ in client.subs_calls)
     assert win.job_ids == client.job_order
     # one row per nested file; the Source cell carries the FULL nested
     # path (structure preserved — never flattened)
@@ -284,7 +290,7 @@ def test_10_mode_b_folder_guard_names_count_and_tree(
     )
     monkeypatch.setattr(
         gui_mod, "collect_video_files",
-        lambda folder: [str(Path("/fake") / f"tv-{i}.mp4") for i in range(501)],
+        lambda folder, **kwargs: [str(Path("/fake") / f"tv-{i}.mp4") for i in range(501)],
     )
     warned: list[str] = []
     monkeypatch.setattr(
@@ -295,9 +301,11 @@ def test_10_mode_b_folder_guard_names_count_and_tree(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.subs_add_folder_button.click()
-    assert len(warned) == 1
-    assert "501" in warned[0] and "500" in warned[0]
-    assert "subfolders included" in warned[0]
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
+    assert warned == []
+    assert "501" in win.message_label.text() and "500" in win.message_label.text()
+    assert "subfolders included" in win.message_label.text()
     assert client.subs_calls == [], "the guard must refuse the whole tree"
     next(gen, None)
 
@@ -319,6 +327,8 @@ def test_11_mode_b_empty_folder_is_a_silent_noop(qapp, monkeypatch, tmp_path):
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.subs_add_folder_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
     assert warned == []  # no dialog at all — the picker-cancelled posture
     assert client.subs_calls == []
     assert win.file_table.rowCount() == 0
@@ -341,9 +351,9 @@ class _RecordingQueueViewsClient(_QueueViewsClient):
 def test_12_mode_b_folder_live_conflict_blocks_nothing_enqueued(
     qapp, monkeypatch, tmp_path
 ):
-    """The v0.4.15.1 conflict discipline through the FOLDER surface: a
-    nested file whose source is a LIVE subs job blocks the whole add
-    with the same dialog — no partial enqueue under the conflict."""
+    """Folder additions stay staged while any batch is live, including
+    when the folder contains a source already being processed.
+    """
     expected = _nested_tree(tmp_path)
     colliding = expected[0]  # one nested file is already live
     client = _RecordingQueueViewsClient()
@@ -370,6 +380,8 @@ def test_12_mode_b_folder_live_conflict_blocks_nothing_enqueued(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
     win._tick_elapsed()  # queued snapshot
     win._tick_elapsed()  # running snapshot (the live state the guard reads)
     assert "transcribing" in win.stage_label.text()
@@ -392,9 +404,13 @@ def test_12_mode_b_folder_live_conflict_blocks_nothing_enqueued(
     )
     ids_before = list(win.job_ids)
     win.subs_add_folder_button.click()
-    assert blocked["text"].startswith("Wait for the current batch")
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
+    assert "active batch" in win.subs_start_help.text()
+    assert not win.start_subtitles_button.isEnabled()
     assert win.job_ids == ids_before
-    assert client.subs_calls == calls_before  # no new enqueue happened
+    assert client.subs_calls == calls_before
+    assert [row["path"] for row in win._staged_subs] == expected
     next(gen, None)
 
 
@@ -411,5 +427,6 @@ def test_13_drop_directory_arm_walks_a_real_nested_folder(
     win = next(gen)
     event, _mime = _drop_dir_event(str(tmp_path))
     win.dropEvent(event)
+    wait_for_checks(win)
     assert added == [expected]
     next(gen, None)

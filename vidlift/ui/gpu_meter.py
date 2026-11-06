@@ -211,6 +211,8 @@ class GpuMeterWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFixedSize(QSize(GPU_METER_WIDTH, GPU_METER_HEIGHT))
+        self.setAccessibleName("NVIDIA GPU utilization")
+        self.setAccessibleDescription("NVIDIA GPU utilization unavailable")
         self.setToolTip(
             "NVIDIA GPU utilization (max across devices, sampled every "
             "0.5 s via nvidia-smi).\nShows n/a when nvidia-smi is not "
@@ -264,6 +266,14 @@ class GpuMeterWidget(QWidget):
     def _accept_sample(self, sample: GpuSample) -> None:
         self._samples.append(sample)
         del self._samples[:-SAMPLE_CAPACITY]
+        if sample.tool_available and sample.utilization is not None:
+            description = f"NVIDIA GPU utilization {int(round(sample.utilization))} percent"
+            if sample.device_count > 1:
+                description += f", {sample.device_count} devices"
+        else:
+            description = "NVIDIA GPU utilization unavailable"
+        # Update the textual equivalent without dispatching per-sample events.
+        self.setAccessibleDescription(description)
         self.update()  # repaint ONLY; layout is fixed forever
 
     # -- pure rendering inputs (asserted by unit tests) -------------------

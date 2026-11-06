@@ -24,15 +24,12 @@ class FakeRunState:
         self.last_activity_at = time.time()
 
 
-def _running_record(tmp_path: Path, snapshot: dict | None = None) -> JobRecord:
-    record = JobRecord(
-        job_id="vl-test-mirror",
-        kind="run",
-        paths=["/tmp/whatever.avi"],
-        options={},
-    )
-    record.state = "running"
-    record.progress_snapshot = snapshot
+def _running_record(registry: Registry, snapshot: dict | None = None) -> JobRecord:
+    record = registry.enqueue(kind="run", paths=["/tmp/whatever.avi"], options={})
+    registry.transition(record, "running")
+    registry.update_job(record.job_id, expected_state="running",
+                        owner_token=record._extra["owner"]["claim_token"],
+                        progress_snapshot=snapshot)
     return record
 
 
@@ -41,8 +38,7 @@ def test_m1_mirror_copies_state_into_record_within_cadence(tmp_path):
     progress/current_phase/last_activity into record.progress_snapshot;
     the throttle gate (maybe_mirror) honrors PROGRESS_MIRROR_SECONDS."""
     registry = Registry(tmp_path / "state")
-    record = _running_record(tmp_path)
-    registry._jobs[record.job_id] = record
+    record = _running_record(registry)
     record.set_live(
         "state_box",
         {"state": FakeRunState({"step": "chunk", "frames_done": 5})},
@@ -68,14 +64,13 @@ def test_m2_payload_falls_back_to_snapshot_without_state_box(tmp_path):
     but a persisted progress_snapshot serves the mirror's progress."""
     registry = Registry(tmp_path / "state")
     record = _running_record(
-        tmp_path,
+        registry,
         snapshot={
             "progress": {"step": "chunk", "frames_done": 9, "frames_total": 52},
             "current_phase": "upscale",
             "last_activity_at": 1234.5,
         },
     )
-    registry._jobs[record.job_id] = record
 
     services = SimpleNamespace(registry=registry)
 
@@ -160,16 +155,11 @@ def test_m5_activity_age_computed_not_persisted(tmp_path):
     last_activity_at and NEVER persisted to jobs.json."""
     state_dir = tmp_path / "state"
     state_dir.mkdir()
-    record = JobRecord(
-        job_id="vl-test-age",
-        kind="run",
-        paths=["/tmp/x.avi"],
-        options={},
-    )
-    record.state = "running"
-    record.last_activity_at = time.time() - 120.0
     registry = Registry(state_dir)
-    registry._jobs[record.job_id] = record
+    record = _running_record(registry)
+    registry.update_job(record.job_id, expected_state="running",
+                        owner_token=record._extra["owner"]["claim_token"],
+                        last_activity_at=time.time() - 120.0)
 
     services = SimpleNamespace(registry=registry)
 
@@ -192,8 +182,7 @@ def test_m6_mirror_throttle_respects_cadence(tmp_path):
     monkeypatched clock past the cadence, then the second call (the
     test's original shape) is the in-window no-op."""
     registry = Registry(tmp_path / "state")
-    record = _running_record(tmp_path)
-    registry._jobs[record.job_id] = record
+    record = _running_record(registry)
     record.set_live("state_box", {"state": FakeRunState({"step": "x"})})
 
     services = SimpleNamespace(registry=registry)
@@ -223,21 +212,20 @@ def test_first_command_does_not_trigger_mirror_save(tmp_path, monkeypatch):
     of executor life have actually elapsed (a start()ed executor's
     timer mirrors on the cadence exactly as before)."""
     registry = Registry(tmp_path / "state")
-    record = _running_record(tmp_path)
-    registry._jobs[record.job_id] = record
+    record = _running_record(registry)
     record.set_live("state_box", {"state": FakeRunState({"step": "x"})})
 
     services = SimpleNamespace(registry=registry)
 
     executor = JobExecutor(services, executor_fn=lambda *_: None)
     saves: list[tuple] = []
-    real_save = registry.save
+    real_update = registry.update_job
 
-    def spy_save():
+    def spy_update(*args, **kwargs):
         saves.append(("save", time.monotonic()))
-        real_save()
+        return real_update(*args, **kwargs)
 
-    monkeypatch.setattr(registry, "save", spy_save)
+    monkeypatch.setattr(registry, "update_job", spy_update)
 
     # RED-FIRST (pre-fix behavior: the first call always mirrors —
     # monotonic() - 0.0 exceeds any process-uptime-bounded cadence).

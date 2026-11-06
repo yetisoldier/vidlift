@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _gui_checks import wait_for_checks
 
 from vidlift.run import EngineCancelled
 from vidlift.transcribe import TranscriptionError, resolve_model_dir
@@ -37,6 +38,7 @@ from test_v0414_subs_job import (  # house fakes (spec §12 conventions)
     FakeRunner,
     _probe_payload,
     _seed_model_state,
+    no_lock,
 )
 
 
@@ -506,7 +508,7 @@ def _wait_terminal(server, job_id: str, timeout: float = 20.0) -> dict:
     raise AssertionError(f"job never reached terminal; last: {last}")
 
 
-def test_t8_mode_b_blocks_at_model_load_close_cancelled(tmp_path, engine_on):
+def test_t8_mode_b_blocks_at_model_load_close_cancelled(tmp_path, engine_on, no_lock):
     """W1b T8 (the wedged-job defect, end to end): Mode B claims, blocks
     INSIDE the engine factory (the model-load window), the cancel flips,
     the factory returns, and the job closes ``cancelled`` — never
@@ -696,9 +698,11 @@ def test_t19_core_seam_publishes_resolution_and_fallback(
         ),
     )
     # (a) default factory path: two publications, in order
+    fallback_root = tmp_path / "fallback"
+    fallback_root.mkdir()
     result = transcribe_source_to_srt(
         **_core(
-            tmp_path,
+            fallback_root,
             engine_factory=None,
             on_device=lambda device, requested: calls.append(
                 (device, requested)
@@ -711,11 +715,17 @@ def test_t19_core_seam_publishes_resolution_and_fallback(
     assert result.device == "cpu"
 
     # (b) foreign factory: the core never saw the decision — no calls
+    foreign_root = tmp_path / "foreign"
+    foreign_root.mkdir()
+    first_sidecar = next(fallback_root.glob("*.srt"))
+    first_bytes = first_sidecar.read_bytes()
     calls.clear()
     transcribe_source_to_srt(
-        **_core(tmp_path, on_device=lambda d, r: calls.append((d, r)))
+        **_core(foreign_root, on_device=lambda d, r: calls.append((d, r)))
     )
     assert calls == []  # D4: no fabricated device under a foreign factory
+    assert first_sidecar.read_bytes() == first_bytes
+    assert list(foreign_root.glob("*.srt"))
 
 
 def test_t20_transcription_echo_live_first_arms(tmp_path):
@@ -912,6 +922,8 @@ def test_t23_gui_overlay_device_line(qapp, monkeypatch, tmp_path):
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
     assert win._batch_row_for_job == {"VJ1": 0}
     win._render_detail_for_row(0)
     details = win.details.toPlainText()
@@ -938,6 +950,8 @@ def test_t23_gui_overlay_device_line(qapp, monkeypatch, tmp_path):
     gen2 = _window(qapp, monkeypatch, tmp_path, client2)
     win2 = next(gen2)
     win2.add_subs_button.click()
+    wait_for_checks(win2)
+    win2.start_subtitles()
     win2._render_detail_for_row(0)
     assert "Device: auto (requested)" in win2.details.toPlainText()
 
@@ -958,6 +972,7 @@ def test_t23_gui_overlay_device_line(qapp, monkeypatch, tmp_path):
     gen3 = _window(qapp, monkeypatch, tmp_path, client3)
     win3 = next(gen3)
     win3.add_subs_button.click()
+    wait_for_checks(win3)
     win3._render_detail_for_row(0)
     assert "Device:" not in win3.details.toPlainText()
     next(gen, None)
@@ -1137,28 +1152,27 @@ def test_t13_gui_pick_skips_and_blocks_never_enqueue(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
 
     assert win.job_ids == ["VJ1"]
-    assert win._batch_row_for_job == {"VJ1": 0}
-    # the stable partition: ready first, then skip, then blocked
-    assert win.file_table.item(0, 0).text() == "subs ready"
-    assert win.file_table.item(1, 0).text() == "skip — already has subtitles"
+    assert win._batch_row_for_job == {"VJ1": 2}
+    # Staged static rows remain in pick order; submitted jobs follow them.
+    assert win.file_table.item(0, 0).text() == "skip — already has subtitles"
     skip_cells = [
-        win.file_table.item(1, c).text() for c in range(8)
+        win.file_table.item(0, c).text() for c in range(8)
     ]
     assert skip_cells[2] == "skip (no transcription)"
     assert skip_cells[3] == "no action"
     assert skip_cells[6] == "already subtitled — nothing to do"
     assert skip_cells[7] == ""
-    assert win.file_table.item(2, 0).text() == (
+    assert win.file_table.item(1, 0).text() == (
         "blocked — subtitles output already exists (will not be overwritten)"
     )
-    warning = win.file_table.item(2, 7).text()
+    warning = win.file_table.item(1, 7).text()
     assert "output exists" in warning and "will not be overwritten" in warning
     summary = win.summary_count.text()
-    assert "1 queued for subtitles" in summary
-    assert "1 skipped (already subtitled)" in summary
-    assert "1 blocked (output exists)" in summary
+    assert summary == "1 queued for subtitles"
     next(gen, None)
 
 
@@ -1189,6 +1203,8 @@ def test_t14_all_skipped_pick_renders_static_rows(qapp, monkeypatch, tmp_path):
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
 
     assert win.job_ids == []
     assert win._batch_row_for_job == {}
@@ -1197,7 +1213,7 @@ def test_t14_all_skipped_pick_renders_static_rows(qapp, monkeypatch, tmp_path):
         assert win.file_table.item(row, 0).text() == status
     summary = win.summary_count.text()
     assert summary == (
-        "0 queued for subtitles — 2 skipped (already subtitled)"
+        "2 subtitle file(s) staged. Click Start Subtitles to begin."
     )
     # the detail pane on a static skip row carries the verdict cell
     win._render_detail_for_row(0)
@@ -1250,6 +1266,8 @@ def test_t15_conflict_guard_evaluates_ready_only(
     )
 
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
     assert dialog_calls == []  # no conflict dialog for a skipped file
     assert win.job_ids == ["VJ1"]  # the pick proceeded with the ready file
     next(gen, None)

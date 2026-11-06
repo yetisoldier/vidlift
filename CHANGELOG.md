@@ -2,6 +2,48 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.20.0] - 2026-11-06
+
+Combined workflow, transcription and replacement release. The standard installer
+does not bundle NVIDIA CUDA/cuDNN runtime binaries; GPU transcription is not
+certified by this release. Missing runtime support is reported with CPU fallback.
+
+### Changed
+- Separate **AI Upscale** and **Subtitles Only** workflow tabs retain independent
+  options and share queue/results. Tab switching does not plan or submit jobs.
+  Subtitles-only files are staged for review before **Start Subtitles**.
+- Checkboxes have explicit empty-square and checked-tick indicators, including
+  disabled states; the tick asset is included as package data.
+- Built-in transcription uses a supervised child process with cancellation and
+  bounded init/decode/absolute timeouts. Eligible pre-progress CUDA failures
+  retry once on CPU; failures after progress do not silently restart. CUDA
+  failure caching is scoped to the submitted batch; a new batch probes again.
+- Media publication verifies candidates, checks source identity/content, avoids
+  clobbering unrelated files and retains journals/recovery material. Opt-in
+  replacement retains an independent original backup and captured source.
+  Sidecar suppression withholds the public SRT only after verified embedding;
+  private recovery copies remain. See the [storage and recovery guide](docs/usage.md#replacement-sidecars-and-recovery-storage).
+
+### Fixed
+- Windows replacement no longer refuses the platform unconditionally: local
+  capture/publication checks gate it. Pathname/handle timestamp differences on
+  Windows no longer falsely reject stable files; mutation checks remain active.
+- Replacement faults after verification retain the verified output and report
+  warnings/recovery paths rather than claiming the requested replacement worked.
+
+### Validation and limits
+- Independent focused Linux validation: **438 passed**. A fresh canonical
+  isolated full suite after release stamping records **1606 passed, 2 skipped**; the skips
+  remain Windows-only GPU-meter checks, not GPU proof.
+- Native Windows CPython 3.12/3.13 generated-fixture checks cover replacement,
+  suppression, collision/sharing failures and source/candidate mutation controls.
+  This is source-level evidence, not AI quality, GPU, frozen executable,
+  installer or power-loss certification. Windows directory-entry power-loss
+  durability is not guaranteed.
+- Backups, captures, candidates and journals remain indefinitely, with extra
+  disk usage and no automatic recovery replay. Read-only-source support with a
+  separate output folder is explicitly deferred, not a release blocker.
+
 ## [0.4.19.0] - 2026-11-04
 
 ### Fixed

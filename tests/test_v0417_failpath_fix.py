@@ -57,6 +57,7 @@ import urllib.request
 from pathlib import Path
 
 import pytest
+from _gui_checks import wait_for_checks
 
 from vidlift.mcp_bridge import (
     BridgeServices,
@@ -330,6 +331,8 @@ def test_subs_probe_failure_lands_failed_on_details_overlay_and_bars(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
     assert win.job_ids == ["VJ1"]
 
     # Tick 1: queued — the slate pulses like a real run start.
@@ -493,6 +496,8 @@ def test_queued_cancel_batch_settles_bars_too(qapp, monkeypatch, tmp_path):
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
     assert win.cancel_batch_button.isEnabled()
     win.cancel_batch_button.click()
     for _ in range(4):

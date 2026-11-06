@@ -125,6 +125,17 @@ class FakeRunner:
         self.commands.append((binary, argv))
         joined = " ".join(argv)
         if "-show_format" in argv and "-show_streams" in argv:
+            if argv[-1].endswith((".muxing.mp4", ".subs.mp4")):
+                # The final independent probe describes the remux, not the
+                # source AVI/PGS inventory. Verification itself stays real.
+                output = json.loads(self.payload)
+                output["streams"] = [s for s in output["streams"]
+                                     if s["codec_type"] in {"video", "audio"}]
+                output["streams"].append({"index": len(output["streams"]),
+                    "codec_type": "subtitle", "codec_name": "mov_text",
+                    "tags": {"language": "eng"}})
+                output["format"]["format_name"] = "mov,mp4,m4a,3gp,3g2,mj2"
+                return 0, json.dumps(output), ""
             return 0, self.payload, ""
         if "-c:s" in argv and "mov_text" in argv:
             if self.remux_fails:

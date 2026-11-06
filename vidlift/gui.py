@@ -20,10 +20,14 @@ from __future__ import annotations
 import os
 import sys
 import time
+import uuid
+import threading
+import copy
+import json
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QTimer, QThreadPool
-from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent, QFont
+from PyQt6.QtCore import QSettings, Qt, QTimer, QThreadPool, QUrl, QByteArray, QEvent
+from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent, QFont, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -43,6 +47,9 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QScrollArea,
+    QSizePolicy,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -63,7 +70,7 @@ from .config import (
     QSETTINGS_DENOISE_KEYS,
 )
 from .mcp_bridge.client_local import (
-    BatchTooLarge,
+    GuiSubmissionResult,
     LocalBridgeClient,
     default_state_dir,
 )
@@ -104,6 +111,10 @@ from .ui.gpu_meter import (
     GpuMeterWidget,
 )
 from .ui.widgets import ActivityDots, EtaProgressBar
+from .ui.view_state import PlanInputs, SubtitleOptions, positive_gbph
+from .ui.drop_area import SubtitleDropGroup
+from .ui.preflight import PreparationRunnable, PreflightRunnable, PreflightSignals, probe_runner
+from .ui.review import BatchReviewDialog
 
 
 VIDEO_EXTENSIONS = {
@@ -117,7 +128,7 @@ VIDEO_EXTENSIONS = {
 MAX_FILES = 500
 
 
-def collect_video_files(folder: str | Path) -> list[str]:
+def collect_video_files(folder: str | Path, *, cancel: threading.Event | None = None) -> list[str]:
     """v0.4.18 (recursive folder-add, Eric's whole-show case): walk a
     folder TREE and return every recognized video (VIDEO_EXTENSIONS),
     deduplicated and sorted by path. Shared by BOTH Add Folder buttons
@@ -139,8 +150,12 @@ def collect_video_files(folder: str | Path) -> list[str]:
     """
     found: list[str] = []
     for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
+        if cancel is not None and cancel.is_set():
+            return []
         dirnames.sort()  # deterministic descent, independent of os.walk order
         for name in filenames:
+            if cancel is not None and cancel.is_set():
+                return []
             candidate = Path(dirpath) / name
             if candidate.suffix.lower() in VIDEO_EXTENSIONS:
                 # v0.4.19 (WS2): VidLift's OWN keep-original outputs
@@ -161,6 +176,27 @@ def collect_video_files(folder: str | Path) -> list[str]:
             continue
         seen.add(key)
         collected.append(path)
+    return collected
+
+
+def _collect_inputs(paths: tuple[str, ...], cancel: threading.Event) -> list[str]:
+    """Shared worker ingestion, preserving tree order and canonical deduplication."""
+    collected, seen = [], set()
+    for raw in paths:
+        if cancel.is_set():
+            return []
+        candidate = Path(raw)
+        expanded = collect_video_files(candidate, cancel=cancel) if candidate.is_dir() else [raw]
+        for path in expanded:
+            if cancel.is_set():
+                return []
+            candidate = Path(path)
+            if candidate.suffix.lower() not in VIDEO_EXTENSIONS or candidate.name.lower().endswith(".subs.mp4"):
+                continue
+            key = os.path.normcase(os.path.realpath(candidate))
+            if key not in seen:
+                seen.add(key)
+                collected.append(str(candidate))
     return collected
 
 # v0.4.5 (progress-honesty design §2, D-tail): pin-to-tail tolerance
@@ -245,7 +281,8 @@ DENOISE_TOOLTIP = (
 )
 DENOISE_CHOICES = (("Off", "off"), ("Light", "light"), ("Strong", "strong"))
 
-PLAN_HELPER_TEXT = "1. Add files → 2. Plan → 3. Start. Planning never writes to disk."
+PLAN_HELPER_TEXT = ("Add files → Plan Batch → Review → Start Upscale. "
+                    "Adding and planning never start processing.")
 
 
 def format_bytes(value: int | None) -> str:
@@ -603,11 +640,35 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.files: list[str] = []
         self.batch: BatchPlan | None = None
+        self._planned_inputs: PlanInputs | None = None
+        self._plan_dirty = False
+        self._preflight_generation = 0
+        self._preflights: dict[int, tuple] = {}
+        self._plan_checking = False
+        self._preparation_kind: str | None = None
+        self._upscale_submitting = False
+        self._ui_closed = False
+        self._uncertain_upscale_paths: set[str] = set()
+        self._uncertain_subtitle_paths: set[str] = set()
+        self._degraded_jobs: set[str] = set()
 
         # ---- v0.4.4 unified-run state (design §4.1) ----
         # The bridge client owns the registry + JobExecutor (one worker,
         # serial). The GUI is a projection: every tick re-reads status.
         self.client = client or LocalBridgeClient()
+        self._submission_attempts = {}
+        self._receipt_recovery_error = None
+        self._recovery_receipts = []
+        if hasattr(self.client, "submission_recovery"):
+            try:
+                self._recovery_receipts = self.client.submission_recovery()
+                for receipt in self._recovery_receipts:
+                    if receipt["state"] == "prepared":
+                        paths = (self._uncertain_subtitle_paths if receipt["payload"]["kind"] == "subs"
+                                 else self._uncertain_upscale_paths)
+                        paths.add(receipt["payload"]["source"])
+            except Exception as exc:
+                self._receipt_recovery_error = str(exc)
         self.job_ids: list[str] = []
         # v0.4.10 (R2): the batch bar's chunk-color cache — changed
         # ONLY through _apply_batch_summary so a QSS restyle fires
@@ -669,9 +730,8 @@ class MainWindow(QMainWindow):
         # of __init__ (the pill must exist before a fallback-port
         # report reaches it). Startup failure is non-fatal — the pill
         # says so and the app continues.
-        self.monitor_check = QCheckBox(
-            "LAN monitoring (agents check upscale progress from other machines)"
-        )
+        self.monitor_check = QCheckBox("LAN monitoring")
+        self.monitor_check.setToolTip("Allow agents to check video/subtitle job progress from other machines.")
         self.monitor_pill = QLabel("")
         self.monitor_pill.setObjectName("VersionBadge")
         self.monitor_port_reported: int | None = None
@@ -683,7 +743,7 @@ class MainWindow(QMainWindow):
         # state, not per-plan input).
         self.subs_model_pill = QLabel("")
         self.subs_model_pill.setObjectName("VersionBadge")
-        self.subs_model_button = QPushButton("Install")
+        self.subs_model_button = QPushButton("Install subtitle model")
         self.subs_model_button.setObjectName("ModelInstallButton")
         self.subs_model_button.setToolTip(
             "Download the transcription model (~1.5 GB, one time, "
@@ -715,9 +775,9 @@ class MainWindow(QMainWindow):
         # its click would permanently kill.
         self._running_job_id: str | None = None
 
-        self.file_table = QTableWidget(0, 8)
+        self.file_table = QTableWidget(0, 9)
         self.file_table.setHorizontalHeaderLabels(
-            ["Status", "File", "Source", "Target", "Output", "Size", "Subtitles", "Warnings"]
+            ["Status", "File", "Source", "Target / source policy", "Output", "Size", "Subtitles", "Warnings", "Mode"]
         )
         self.file_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.file_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -731,11 +791,13 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        header.setMaximumSectionSize(360)
         self.file_table.itemSelectionChanged.connect(self._sync_details)
 
         self.details = QTextEdit()
         self.details.setReadOnly(True)
-        self.details.setPlaceholderText("Add video files, then run Plan Batch.")
+        self.details.setPlaceholderText("Select a video to review its plan, staged options or job results.")
 
         self.gbph = QLineEdit("1.5")
         self.gbph.setFixedWidth(90)
@@ -881,7 +943,7 @@ class MainWindow(QMainWindow):
         self.plan_button = QPushButton("Plan Batch")
         self.plan_button.setObjectName("PrimaryButton")
         self.plan_button.setToolTip("Probe and classify every listed file. Nothing is written to disk.")
-        self.plan_button.clicked.connect(self.plan_batch)
+        self.plan_button.clicked.connect(self.request_plan)
         self.start_button = QPushButton("Start Upscale")
         self.start_button.setObjectName("StartButton")
         self.start_button.setEnabled(False)
@@ -914,6 +976,8 @@ class MainWindow(QMainWindow):
         # (_begin_job_slate) are shared with the upscale flow; the slate
         # machinery is job-kind-blind so row rendering/Cancel Batch ride
         # the exact v0.4.13 paths.
+        self._staged_subs: list[dict] = []
+        self._subs_submitting = False
         self.add_subs_button = QPushButton("Add Subtitles…")
         self.add_subs_button.setEnabled(True)
         # v0.4.17: the "never modified" sentence names the per-run opt-in
@@ -947,6 +1011,26 @@ class MainWindow(QMainWindow):
             "original, suppress .srt) apply as for picked files."
         )
         self.subs_add_folder_button.clicked.connect(self.choose_subs_folder)
+        self.start_subtitles_button = QPushButton("Start Subtitles")
+        self.start_subtitles_button.setEnabled(False)
+        self.start_subtitles_button.clicked.connect(self.request_start_subtitles)
+        self.start_subtitles_button.setObjectName("StartButton")
+        self.subs_device_combo = QComboBox()
+        for label, value in (("Auto", "auto"), ("GPU (CUDA)", "cuda"), ("CPU", "cpu")):
+            self.subs_device_combo.addItem(label, value)
+        stored_device = self._settings().value("subs_device", "auto", type=str)
+        self.subs_device_combo.setCurrentIndex(max(0, self.subs_device_combo.findData(stored_device)))
+        self.subs_device_combo.setToolTip(
+            "Requested transcription device for files added next. GPU may fall back "
+            "to CPU; the live Device line reports the actual resolved device."
+        )
+        self.subs_device_combo.currentIndexChanged.connect(
+            lambda: self._settings().setValue("subs_device", self.subs_device_combo.currentData())
+        )
+        self.subs_remove_button = QPushButton("Remove selected staged")
+        self.subs_remove_button.clicked.connect(self.remove_staged_subtitles)
+        self.subs_clear_button = QPushButton("Clear staged subtitles")
+        self.subs_clear_button.clicked.connect(self.clear_staged_subtitles)
         # v0.4.17 workstream-2 (opt-in Mode B replace-source, D4-1):
         # the checkbox lives IN the Mode B group's own grid at (0, 1),
         # immediately right of "Add Subtitles…" (0, 0) — co-located so
@@ -1009,13 +1093,18 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.progress.hide()
 
-        add_action = QAction("Add files", self)
-        add_action.triggered.connect(self.add_files)
-        self.addAction(add_action)
-
         self.setCentralWidget(self._build_shell())
         self._apply_style()
-        self._set_summary("No files planned yet", "Drop videos here or choose Add Files.")
+        self._configure_accessibility()
+        for field in (self.gbph, self.output_dir):
+            field.textChanged.connect(self._invalidate_plan)
+        self.subtitle_ocr.toggled.connect(self._invalidate_plan)
+        self.transcribe_subs.toggled.connect(self._invalidate_plan)
+        for widget in (self.replace_source, self.suppress_srt, self.resume_claim):
+            widget.toggled.connect(lambda _checked: self._render_detail_for_row())
+        for combo in (self.engine_combo, self.profile_combo, self.denoise_combo):
+            combo.currentIndexChanged.connect(lambda _index: self._render_detail_for_row())
+        self._set_summary("No files planned yet", "Drop videos into the selected workflow or use its Add button.")
         self._render_recent_jobs()
         # v0.4.6 (§4.1): default-on start AFTER the shell exists — the
         # pill is built, so a fallback-port report can reach it.
@@ -1027,11 +1116,576 @@ class MainWindow(QMainWindow):
         # v0.4.16 (model management, ADR-4): the subs-model pill's first
         # truth lands with the window (construction-time disk check).
         self._refresh_subs_model_pill()
+        geometry = self._settings().value("ui/window_geometry")
+        if isinstance(geometry, (bytes, QByteArray)):
+            self.restoreGeometry(geometry)
+        screen = self.screen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            self.resize(min(self.width(), area.width()), min(self.height(), area.height()))
+            self.move(max(area.left(), min(self.x(), area.right() - self.width() + 1)),
+                      max(area.top(), min(self.y(), area.bottom() - self.height() + 1)))
+        splitter = self._settings().value("ui/details_splitter")
+        if isinstance(splitter, (bytes, QByteArray)):
+            self.details_splitter.restoreState(splitter)
+        # External serial work can finish without this window owning a run
+        # timer. Refresh only staging eligibility, never enqueue automatically.
+        self._staged_controls_timer = QTimer(self)
+        self._staged_controls_timer.setInterval(1000)
+        self._staged_controls_timer.timeout.connect(self._refresh_staged_controls)
+        self._staged_controls_timer.start()
 
     # -- engine persistence (design §7) ---------------------------------
 
+    def _current_plan_inputs(self) -> PlanInputs:
+        return PlanInputs(tuple(self.files), positive_gbph(self.gbph.text()),
+                          self.output_dir.text().strip(), self.subtitle_ocr.isChecked(),
+                          self.transcribe_subs.isChecked())
+
+    def _invalidate_plan(self, *_args) -> None:
+        if self._plan_checking:
+            self.cancel_checking()
+        if self.batch is not None:
+            self._plan_dirty = True
+            self.start_button.setEnabled(False)
+            self._show_message("Settings changed. Plan again before starting an upscale.")
+
+    def request_plan(self) -> None:
+        """User-facing Plan action; subprocess probing never runs in the Qt thread."""
+        if self._preflights or self.job_ids or self.client.active_job_count() > 0:
+            self._show_message("Finish current checking/submitted work before planning again.")
+            return
+        if not self.files or self._valid_size() is None:
+            self._show_message("Add files first and enter a finite positive GB/hour value.")
+            return
+        try:
+            tools = find_tools()
+        except MissingToolError as exc:
+            self._show_message(f"Cannot check files: {exc}")
+            return
+        inputs = self._current_plan_inputs()
+        self._preflight_generation += 1
+        generation = self._preflight_generation
+        cancel = threading.Event()
+        signals = PreflightSignals()
+        signals.progress.connect(self._preflight_progress)
+        signals.finished.connect(self._preflight_finished)
+        self._preflights[generation] = (inputs, cancel, signals)
+        self._plan_checking = True
+        self._plan_dirty = True
+        self.plan_button.setEnabled(False)
+        self.start_button.setEnabled(False)
+        self.cancel_check_button.setEnabled(True)
+        self._show_message("Checking files in the background. No jobs are being submitted.")
+        runner = probe_runner(cancel)
+        worker = PreflightRunnable(generation, inputs.paths,
+            lambda path: probe_and_classify(path, binary=tools.ffprobe, runner=runner), cancel, signals)
+        QThreadPool.globalInstance().start(worker)
+
+    def cancel_checking(self) -> None:
+        pending = self._preflights.get(self._preflight_generation)
+        if pending:
+            pending[1].set()
+        self._preflight_generation += 1
+        self._plan_checking = False
+        self._preparation_kind = None
+        self.cancel_check_button.setEnabled(False)
+        self.plan_button.setEnabled(not self.job_ids)
+        self._sync_staged_controls()
+        self._show_message("Checking cancelled. Submitted jobs are unchanged; Plan again to review files.")
+
+    def _preflight_progress(self, generation: int, done: int, total: int) -> None:
+        if generation == self._preflight_generation and not self._ui_closed:
+            self._show_message(f"Checking file {done} of {total}. No execution jobs created." if total else
+                               "Scanning folders; total file count is not yet known. No jobs created.")
+
+    def _preflight_finished(self, generation: int, reports, failures) -> None:
+        pending = self._preflights.pop(generation, None)
+        if pending is None or generation != self._preflight_generation or self._ui_closed:
+            if not self._ui_closed:
+                self._sync_staged_controls()
+            return
+        self._plan_checking = False
+        self._preparation_kind = None
+        self.cancel_check_button.setEnabled(False)
+        self.plan_button.setEnabled(not self.job_ids)
+        self._sync_staged_controls()
+        if isinstance(pending[0], dict):
+            self._accept_preparation(pending[0], reports, failures)
+            return
+        try:
+            same_inputs = pending[0] == self._current_plan_inputs()
+        except ValueError:
+            same_inputs = False
+        if not same_inputs or self.job_ids or self.client.active_job_count() > 0:
+            self._show_message("Files/settings changed during checking. Plan again before starting.")
+            return
+        self._accept_plan_reports(reports, failures, pending[0])
+
+    def _request_preparation(self, context: dict, operation) -> bool:
+        if self._ui_closed or self._preflights or self._subs_submitting or self._upscale_submitting:
+            self._show_message("Another check or submission is still stopping/finishing. Try again when it settles.")
+            return False
+        self._preflight_generation += 1
+        generation = self._preflight_generation
+        cancel = threading.Event()
+        signals = PreflightSignals()
+        signals.progress.connect(self._preflight_progress)
+        signals.finished.connect(self._preflight_finished)
+        self._preflights[generation] = (context, cancel, signals)
+        self._preparation_kind = context["kind"]
+        self.cancel_check_button.setEnabled(True)
+        self.plan_button.setEnabled(False)
+        self._sync_staged_controls()
+        self._show_message("Scanning/checking in the background. No execution jobs created.")
+        QThreadPool.globalInstance().start(PreparationRunnable(generation, operation, cancel, signals))
+        return True
+
+    def _request_ingestion(self, paths: list[str], *, subtitles: bool) -> None:
+        if not paths:
+            return
+        inputs = tuple(paths)
+        options = SubtitleOptions(self.subs_replace_source.isChecked(), self.subs_suppress_srt.isChecked(),
+                                  self.subs_device_combo.currentData())
+        try:
+            ffprobe = find_tools().ffprobe if subtitles else ""
+        except MissingToolError:
+            ffprobe = "ffprobe"
+
+        def operation(cancel, progress):
+            progress(0, 0)
+            found = _collect_inputs(inputs, cancel)
+            if subtitles:
+                found = [str(Path(path).expanduser().resolve()) for path in found]
+            if len(found) > MAX_FILES:
+                raise ValueError(f"That selection holds {len(found)} videos (subfolders included); add at most {MAX_FILES} at once.")
+            verdicts = {}
+            runner = probe_runner(cancel)
+            if subtitles:
+                for index, path in enumerate(found):
+                    if cancel.is_set():
+                        return None
+                    verdicts[path] = subs_plan_verdict(path, ffprobe=ffprobe, probe_runner=runner)
+                    progress(index + 1, len(found))
+            return found, verdicts
+
+        self._request_preparation({"kind": "add-subs" if subtitles else "add-upscale", "options": options}, operation)
+
+    def request_start_subtitles(self) -> None:
+        if self._subtitle_start_blocked():
+            return
+        eligible = [r for r in self._staged_subs if r["verdict"] in
+                    (SUBS_VERDICT_READY, SUBS_VERDICT_PROBE_ERROR) and not r.get("uncertain")]
+        if not eligible:
+            return
+        ids = tuple(r["id"] for r in eligible)
+        paths = tuple(r["path"] for r in eligible)
+        try:
+            ffprobe = find_tools().ffprobe
+        except MissingToolError:
+            ffprobe = "ffprobe"
+
+        def operation(cancel, progress):
+            verdicts = {}
+            runner = probe_runner(cancel)
+            for index, path in enumerate(paths):
+                if cancel.is_set():
+                    return None
+                verdicts[path] = subs_plan_verdict(path, ffprobe=ffprobe, probe_runner=runner)
+                progress(index + 1, len(paths))
+            return verdicts
+
+        self._request_preparation({"kind": "start-subs", "ids": ids}, operation)
+
+    def _accept_preparation(self, context: dict, result, failures: list[str]) -> None:
+        if failures:
+            self._show_message("Checking failed. Nothing was submitted/added. Retry after resolving:\n" + "\n".join(failures))
+            return
+        if result is None:
+            return
+        if context["kind"] == "start-subs":
+            expected = set(context["ids"])
+            current = {r["id"] for r in self._staged_subs}
+            if not expected <= current:
+                self._show_message("Staging changed during checking. Review and Start again.")
+                return
+            for staged in self._staged_subs:
+                if staged["id"] not in expected:
+                    continue
+                staged["verdict"] = result[staged["path"]]
+                for row in range(self.file_table.rowCount()):
+                    if self._row_meta(row).get("staged_id") == staged["id"]:
+                        self._write_staged_row(row, staged)
+                        break
+            self._sync_staged_controls()
+            self.start_subtitles(checked_verdicts=result, staged_ids=expected)
+        elif context["kind"] == "add-subs":
+            paths, verdicts = result
+            self._enqueue_subs_paths(paths, verdicts=verdicts, options=context["options"])
+        else:
+            self._add_paths(result[0])
+
+    def _show_message(self, text: str) -> None:
+        self._message_text = text
+        lines = text.splitlines()
+        summary = "\n".join(lines[:3])[:400]
+        if summary != text:
+            summary += "\nFull message available with Copy message."
+        self.message_label.setText(summary)
+        self.message_label.setToolTip(text)
+        self.message_label.setVisible(bool(text))
+        self.copy_message_button.setEnabled(bool(text))
+
+    def _copy_message(self) -> None:
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(getattr(self, "_message_text", ""))
+
+    def _valid_size(self) -> float | None:
+        try:
+            value = positive_gbph(self.gbph.text())
+        except ValueError as exc:
+            self._show_message(str(exc))
+            self.gbph.setFocus()
+            self.gbph.setAccessibleDescription(str(exc))
+            return None
+        self.gbph.setAccessibleDescription("Approximate final size per hour of video.")
+        self._show_message("")
+        return value
+
+    def _row_meta(self, row: int) -> dict:
+        item = self.file_table.item(row, 0)
+        return (item.data(Qt.ItemDataRole.UserRole) or {}) if item else {}
+
+    def _tag_row(self, row: int, **data) -> None:
+        item = self.file_table.item(row, 0)
+        if item is not None:
+            meta = self._row_meta(row)
+            meta.setdefault("row_id", uuid.uuid4().hex)
+            meta.update(data)
+            kind = meta.get("kind", "video")
+            mode = "Subtitles only" if kind in ("staged-subtitles", "subtitles") else "Upscale"
+            self.file_table.setItem(row, 8, QTableWidgetItem(mode))
+            for col in range(self.file_table.columnCount()):
+                cell = self.file_table.item(row, col)
+                if cell is not None:
+                    cell.setData(Qt.ItemDataRole.UserRole, meta)
+                    cell.setData(Qt.ItemDataRole.AccessibleDescriptionRole, "Mode: " + str(meta.get("kind", "video")))
+                    cell.setToolTip(cell.text())
+
+    def _reindex_job_rows(self) -> None:
+        tracked = set(self._batch_row_for_job)
+        self._batch_row_for_job = {
+            meta["job_id"]: row for row in range(self.file_table.rowCount())
+            if (meta := self._row_meta(row)).get("job_id") in tracked
+        }
+
+    def _remove_display_rows(self, rows: list[int]) -> None:
+        # One structural boundary: selection callbacks never see half-updated maps.
+        blocked = self.file_table.blockSignals(True)
+        try:
+            for job, row in self._batch_row_for_job.items():
+                self._tag_row(row, job_id=job)
+            for row in sorted(set(rows), reverse=True):
+                self.file_table.removeRow(row)
+            self._reindex_job_rows()
+        finally:
+            self.file_table.blockSignals(blocked)
+
+    def _append_staged_row(self, staged: dict) -> None:
+        row = self.file_table.rowCount()
+        self.file_table.insertRow(row)
+        self._write_staged_row(row, staged)
+
+    def _write_staged_row(self, row: int, staged: dict) -> None:
+        cells = self._subs_file_rows([staged["path"]], {staged["path"]: staged["verdict"]})[0]
+        if staged["verdict"] != SUBS_VERDICT_SKIP_SUBTITLES:
+            cells[3] = "replace original → .mp4" if staged["replace_source"] else "keep original"
+            cells[6] = "Will transcribe own audio if eligible"
+        if staged.get("error"):
+            cells[0] = "submission unknown" if staged.get("uncertain") else "not submitted"
+            cells[7] = staged["error"]
+        for col, text in enumerate(cells):
+            self.file_table.setItem(row, col, QTableWidgetItem(text))
+        self._tag_row(row, kind="staged-subtitles", staged_id=staged["id"], row_id=staged["id"],
+                      options=staged["options"])
+
+    def _restore_staged_rows(self) -> None:
+        for staged in self._staged_subs:
+            self._append_staged_row(staged)
+        self._sync_staged_controls()
+
+    def _refresh_staged_controls(self) -> None:
+        # A QObject-bound slot disconnects on window destruction. Do not use
+        # a closure retaining a deleted window across a queued timer event.
+        if self._staged_subs and not self._ui_closed:
+            self._sync_staged_controls()
+
+    def _sync_staged_controls(self) -> None:
+        reason = self._subtitle_start_reason()
+        eligible = any(r["verdict"] in (SUBS_VERDICT_READY, SUBS_VERDICT_PROBE_ERROR)
+                       and not r.get("uncertain") for r in self._staged_subs)
+        self.start_subtitles_button.setEnabled(eligible and not reason and not self._subs_submitting and not self._preflights)
+        self.start_subtitles_button.setToolTip(
+            reason or
+            "Submit all eligible staged subtitle files in order, not just the selected row."
+        )
+        self.subs_start_help.setText(
+            "Drop subtitle videos here. Options apply to files added next; outputs stay beside each source. " +
+            (reason or "Start submits all eligible staged subtitle files in order."))
+        self.subs_clear_button.setEnabled(bool(self._staged_subs) and not self._subs_submitting)
+        self.subs_remove_button.setEnabled(bool(self._staged_subs) and not self._subs_submitting)
+
+    def _subtitle_start_reason(self) -> str:
+        if self._upscale_submitting:
+            return "Wait for the upscale submission review to finish. New subtitle files stay staged."
+        try:
+            live = self.client.active_job_count() > 0 or bool(self.job_ids)
+        except Exception:
+            return "Cannot check active jobs. Start is disabled until the queue is readable."
+        return ("Wait for the active batch to finish or cancellation to settle. New files stay staged."
+                if live else "")
+
+    def _subtitle_start_blocked(self) -> bool:
+        reason = self._subtitle_start_reason()
+        if reason:
+            self._sync_staged_controls()
+            self._show_message(reason)
+        return bool(reason)
+
+    def remove_staged_subtitles(self) -> None:
+        if self._subs_submitting:
+            return
+        rows = [index.row() for index in self.file_table.selectionModel().selectedRows()
+                if self._row_meta(index.row()).get("kind") == "staged-subtitles"]
+        ids = {self._row_meta(row).get("staged_id") for row in rows}
+        self._staged_subs = [r for r in self._staged_subs if r["id"] not in ids]
+        self._remove_display_rows(rows)
+        self._sync_staged_controls()
+        self._show_message(f"Removed {len(rows)} staged subtitle file(s). No media was deleted.")
+        self._render_detail_for_row()
+
+    def clear_staged_subtitles(self) -> None:
+        if self._subs_submitting:
+            return
+        if self._preparation_kind in ("add-subs", "start-subs"):
+            self.cancel_checking()
+        rows = [r for r in range(self.file_table.rowCount())
+                if self._row_meta(r).get("kind") == "staged-subtitles"]
+        self._staged_subs.clear()
+        self._remove_display_rows(rows)
+        self._sync_staged_controls()
+        self._show_message("Staged subtitles cleared. Submitted jobs and media are unchanged.")
+        self._render_detail_for_row()
+
+    def clear_upscale_files(self) -> None:
+        """Discard only unsent upscale choices; live rows belong to the executor."""
+        if self._plan_checking or self._preparation_kind == "add-upscale":
+            self.cancel_checking()
+        live_rows = set(self._batch_row_for_job.values())
+        removable = [row for row in range(self.file_table.rowCount())
+                     if row not in live_rows and self._row_meta(row).get("kind") in
+                     ("pending-upscale", "planned-upscale")]
+        self.files = []
+        self._planned_inputs = None
+        self._plan_dirty = True
+        if not self.job_ids and self.client.active_job_count() == 0:
+            self.batch = None
+        self._remove_display_rows(removable)
+        self.start_button.setEnabled(False)
+        self._show_message("Unsent upscale files cleared. Staged subtitles, submitted jobs and media are unchanged.")
+        self._render_detail_for_row()
+
+    def _confirm_options(self, title: str, details: str) -> bool:
+        dialog = BatchReviewDialog(title, details, self)
+        return dialog.exec() == dialog.DialogCode.Accepted
+
+    def _configure_accessibility(self) -> None:
+        names = {
+            "gbph": "Upscale output size, GB per hour", "output_dir": "Upscale output folder",
+            "engine_combo": "Upscale engine", "profile_combo": "Upscale profile",
+            "denoise_combo": "Denoise source before upscaling",
+            "subs_device_combo": "Subtitle transcription device requested",
+            "file_table": "Video plan, staged subtitles and submitted jobs",
+            "details": "Selected video details", "run_log_tail": "Current job log tail",
+            "add_subs_button": "Add files for subtitles only",
+            "subs_add_folder_button": "Add folder for subtitles only",
+        }
+        for attr, name in names.items():
+            getattr(self, attr).setAccessibleName(name)
+        self.stage_bar.bar.setAccessibleName("Current file progress")
+        self.overall_bar.bar.setAccessibleName("Queue resolution progress")
+        self.progress.setAccessibleName("Batch outcomes: resolved, succeeded, failed and cancelled")
+        self.subs_model_button.setAccessibleName("Install subtitle model")
+        menu_bar = self.menuBar()
+        assert menu_bar is not None
+        menu = menu_bar.addMenu("&File")
+        assert menu is not None
+        self._command_actions = {}
+        for title, shortcut, slot, button in (
+            ("Add files to upscale", "Ctrl+O", self.add_files, self.upscale_add_button),
+            ("Add files for subtitles only", "Ctrl+Shift+O", self.choose_subs_files, self.add_subs_button),
+            ("Plan upscale batch", "Ctrl+P", self.request_plan, self.plan_button),
+        ):
+            action = QAction(title, self)
+            action.setShortcut(shortcut)
+            action.triggered.connect(slot)
+            button.clicked.disconnect(slot)
+            button.clicked.connect(action.trigger)
+            self._command_actions[button] = action
+            button.installEventFilter(self)
+            action.changed.connect(lambda button=button, action=action: button.setEnabled(action.isEnabled()))
+            action.setEnabled(button.isEnabled())
+            menu.addAction(action)
+        view = menu_bar.addMenu("&View")
+        assert view is not None
+        system_colours = QAction("Use &system colours (including contrast themes)", self)
+        system_colours.setCheckable(True)
+        system_colours.setChecked(self._settings().value("ui/system_palette", False, type=bool))
+        system_colours.toggled.connect(self._set_system_colours)
+        view.addAction(system_colours)
+        recovery_menu = menu_bar.addMenu("&Submission recovery")
+        recovery_menu.aboutToShow.connect(lambda: self._populate_recovery_menu(recovery_menu))
+        remove = QAction("Remove selected staged subtitles", self.file_table)
+        remove.setShortcut("Delete")
+        remove.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        remove.triggered.connect(self.remove_staged_subtitles)
+        self.file_table.addAction(remove)
+        for table in (self.file_table, self.history_table):
+            copy = QAction("Copy selected table cells", table)
+            copy.setShortcut("Ctrl+C")
+            copy.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+            copy.triggered.connect(lambda _checked=False, table=table: self._copy_table_cells(table))
+            table.addAction(copy)
+        order = [self.subs_model_button, self.workflow_tabs.tabBar(), self.upscale_add_button, self.upscale_folder_button,
+                 self.upscale_clear_button, self.gbph, self.upscale_output_button,
+                 self.output_dir, self.engine_combo, self.profile_combo, self.denoise_combo,
+                 self.subtitle_ocr, self.transcribe_subs, self.replace_source, self.suppress_srt,
+                 self.resume_claim, self.monitor_check, self.plan_button, self.start_button, self.add_subs_button,
+                 self.subs_add_folder_button, self.subs_device_combo, self.subs_replace_source,
+                 self.subs_suppress_srt, self.subs_remove_button, self.subs_clear_button,
+                 self.start_subtitles_button, self.cancel_check_button, self.copy_message_button,
+                 self.cancel_button, self.cancel_batch_button, self.log_toggle, self.run_log_tail,
+                 self.queue_tabs.tabBar(), self.file_table, self.history_table, self.details,
+                 *self.output_action_buttons]
+        for before, after in zip(order, order[1:]):
+            self.setTabOrder(before, after)
+
+    def eventFilter(self, watched, event):
+        actions = getattr(self, "_command_actions", {})
+        if watched in actions and event.type() == QEvent.Type.EnabledChange:
+            actions[watched].setEnabled(watched.isEnabled())
+        return super().eventFilter(watched, event)
+
+    def _submit_gui_job(self, kind: str, path: str, options: dict,
+                        engine: str = "auto") -> GuiSubmissionResult:
+        """Use exact bridge receipts; old/injected clients fail closed on errors."""
+        try:
+            submit = getattr(self.client, "submit_gui_job", None)
+            if submit is not None:
+                if self._receipt_recovery_error:
+                    return GuiSubmissionResult("unknown", error=RuntimeError(self._receipt_recovery_error))
+                key = (kind, os.path.normcase(str(Path(path).resolve())))
+                attempt = self._submission_attempts.get(key)
+                if attempt is None:
+                    attempt = {"id": uuid.uuid4().hex, "options": copy.deepcopy(options), "engine": engine}
+                    self._submission_attempts[key] = attempt
+                result = submit(kind, path, options=attempt["options"], engine=attempt["engine"],
+                                submission_id=attempt["id"])
+                if result.state in {"accepted", "rejected"}:
+                    self._submission_attempts.pop(key, None)
+                return result
+            # Compatibility with old bridge doubles/adapters. Their exception
+            # class and active queue deltas cannot establish acceptance.
+            ids = (self.client.enqueue_subs([path], **options) if kind == "subs" else
+                   self.client.enqueue_run([path], options=options, engine=engine))
+            if len(ids) == 1 and ids[0]:
+                return GuiSubmissionResult("accepted", tuple(ids))
+            return GuiSubmissionResult("unknown")
+        except Exception as exc:
+            return GuiSubmissionResult("unknown", error=exc)
+
+    def _populate_recovery_menu(self, menu):
+        menu.clear()
+        recovery = getattr(self.client, "submission_recovery", None)
+        if recovery is None:
+            action = menu.addAction("Durable recovery unavailable in this bridge")
+            action.setEnabled(False)
+            return
+        try:
+            receipts = recovery()
+            self._receipt_recovery_error = None
+        except Exception as exc:
+            self._receipt_recovery_error = str(exc)
+            action = menu.addAction("Registry unavailable; new submissions blocked")
+            action.setEnabled(False)
+            return
+        if not receipts:
+            menu.addAction("No durable submission intents").setEnabled(False)
+        for receipt in receipts:
+            submenu = menu.addMenu(f"{receipt['state']}: {receipt['payload']['source']}")
+            detail = submenu.addAction("Show exact receipt and history")
+            detail.triggered.connect(lambda _checked=False, r=receipt: self._review_recovery(r, details_only=True))
+            if receipt["state"] == "prepared":
+                review = submenu.addAction("Review and submit this intent")
+                review.triggered.connect(lambda _checked=False, r=receipt: self._review_recovery(r))
+                discard = submenu.addAction("Discard intent")
+                discard.triggered.connect(lambda _checked=False, r=receipt: self._discard_recovery(r))
+
+    def _review_recovery(self, receipt, *, details_only=False):
+        dialog = BatchReviewDialog("Exact submission recovery", json.dumps(receipt, indent=2, ensure_ascii=False), self)
+        if details_only:
+            dialog.start_button.setEnabled(False)
+        if dialog.exec() != dialog.DialogCode.Accepted or details_only:
+            return
+        if self.client.active_job_count():
+            self._show_message("Wait for active jobs before explicitly submitting a prepared intent.")
+            return
+        payload = receipt["payload"]
+        # Repeat eligibility/output/source consent review; replay keeps the
+        # original frozen payload and batch, never creates a new CUDA attempt.
+        if payload["kind"] == "subs" and subs_plan_verdict(payload["source"]) not in (SUBS_VERDICT_READY, SUBS_VERDICT_PROBE_ERROR):
+            self._show_message("Prepared source is no longer eligible; intent retained without submission.")
+            return
+        result = self.client.submit_gui_job(payload["kind"], payload["source"], options=payload["options"],
+            engine=payload["options"].get("engine", "auto"), submission_id=receipt["submission_id"])
+        self._show_message(f"Submission recovery: {result.state}; exact jobs: {', '.join(result.job_ids) or 'none'}. "
+                           f"{result.error or ''}")
+        if result.state == "accepted":
+            self._clear_recovered_source(payload["source"])
+
+    def _clear_recovered_source(self, source):
+        for paths in (self._uncertain_subtitle_paths, self._uncertain_upscale_paths):
+            paths.difference_update([p for p in paths if os.path.normcase(str(Path(p).resolve())) == source])
+        for key in list(self._submission_attempts):
+            if key[1] == source:
+                del self._submission_attempts[key]
+
+    def _discard_recovery(self, receipt):
+        if QMessageBox.question(self, "Discard prepared intent", "Discard this non-executable intent? No job or media will be changed.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self.client.registry.abandon_submission(receipt["submission_id"])
+        self._clear_recovered_source(receipt["payload"]["source"])
+        self._show_message("Prepared intent abandoned. Any later attempt requires a new reviewed submission.")
+
+    def _set_system_colours(self, checked: bool) -> None:
+        self._settings().setValue("ui/system_palette", checked)
+        self._apply_style()
+
+
     def _settings(self) -> QSettings:
-        return QSettings("YetiWurks", "VidLift")
+        # CI uses a distinct organisation so Windows native settings remain
+        # isolated too (XDG_CONFIG_HOME only isolates Linux settings).
+        return QSettings(os.environ.get("VIDLIFT_SETTINGS_ORG") or "YetiWurks", "VidLift")
+
+    def _pending_submission_ids(self, ids: list[str]) -> list[str]:
+        """Do not drop a just-finished receipt before the poll records its outcome."""
+        live = set(self._live_window_ids(ids, self.client))
+        return [job for job in ids if job in live or
+                (job in self._batch_slot_index and
+                 self._batch_slot_index[job] < len(self.run_counts) and
+                 self.run_counts[self._batch_slot_index[job]] is None)]
 
     def _load_engine_choice(self) -> str:
         """The persisted engine choice; a stale/unknown value reads as
@@ -1361,7 +2015,7 @@ class MainWindow(QMainWindow):
             )
             self.subs_model_button.setVisible(True)
             self.subs_model_button.setEnabled(True)
-            self.subs_model_button.setText("Install")
+            self.subs_model_button.setText("Install subtitle model")
         else:  # not-installed — the install affordance is the point
             self.subs_model_pill.setText(
                 f"Subs model ({tag}): not installed — first subtitles "
@@ -1369,7 +2023,7 @@ class MainWindow(QMainWindow):
             )
             self.subs_model_button.setVisible(True)
             self.subs_model_button.setEnabled(True)
-            self.subs_model_button.setText("Install")
+            self.subs_model_button.setText("Install subtitle model")
 
     def _install_subs_model(self) -> None:
         """ADR-4: GUI-owned install on a QThreadPool runnable (the GPU-meter
@@ -1495,11 +2149,12 @@ class MainWindow(QMainWindow):
     def _build_shell(self) -> QWidget:
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(24, 22, 24, 18)
-        layout.setSpacing(16)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
 
         title_row = QHBoxLayout()
         title = QLabel("VidLift")
+        self.title_label = title
         title.setObjectName("Title")
         title_stack = QVBoxLayout()
         title_stack.addWidget(title)
@@ -1513,24 +2168,28 @@ class MainWindow(QMainWindow):
         subs_model_row_layout = QHBoxLayout(subs_model_row)
         subs_model_row_layout.setContentsMargins(0, 0, 0, 0)
         subs_model_row_layout.setSpacing(6)
-        subs_model_row_layout.addWidget(self.subs_model_pill)
+        subs_model_row_layout.addWidget(self.subs_model_pill, 1)
         subs_model_row_layout.addWidget(self.subs_model_button)
-        subs_model_row_layout.addStretch(1)
-        title_stack.addWidget(subs_model_row, alignment=Qt.AlignmentFlag.AlignLeft)
-        title_stack.addWidget(QLabel("Plan and run batch SD video upscales"))
-        title_row.addLayout(title_stack)
-        title_row.addStretch(1)
+        title_stack.addWidget(subs_model_row)
+        title_stack.addWidget(QLabel("Upscale video or add subtitles"))
+        self.subs_model_pill.setWordWrap(True)
+        self.subs_model_pill.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        # Give wrapped status text real width instead of an empty header
+        # stretch squeezing it into a tall column above the workflow tabs.
+        title_row.addLayout(title_stack, 3)
         self.summary_count = QLabel()
         self.summary_count.setObjectName("SummaryCount")
         self.summary_note = QLabel()
         self.summary_note.setObjectName("SummaryNote")
+        self.summary_note.setWordWrap(True)
+        self.summary_count.setWordWrap(True)
         self.total_pill = QLabel()
         self.total_pill.setObjectName("TotalPill")
         summary = QVBoxLayout()
         summary.addWidget(self.total_pill, alignment=Qt.AlignmentFlag.AlignRight)
         summary.addWidget(self.summary_count, alignment=Qt.AlignmentFlag.AlignRight)
         summary.addWidget(self.summary_note, alignment=Qt.AlignmentFlag.AlignRight)
-        title_row.addLayout(summary)
+        title_row.addLayout(summary, 2)
         # v0.4.10 (R1): the GPU meter sits at the top bar's far right,
         # vertically centered against the stacked title/pill column.
         # Fixed size → the bar's geometry is decided once; samples
@@ -1543,7 +2202,6 @@ class MainWindow(QMainWindow):
         helper = QLabel(PLAN_HELPER_TEXT)
         helper.setObjectName("Muted")
         helper.setWordWrap(True)
-        layout.addWidget(helper)
 
         # ---- v0.4.17 workstream-2 (Hermes findings 1/2, Karen K-1/K-2):
         # the settings surface splits into TWO titled groups so each mode
@@ -1559,9 +2217,13 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(10)
         add = QPushButton("Add Files")
+        self.upscale_add_button = add
+        add.setAccessibleName("Add files to upscale")
         add.setToolTip("Choose one or more video files")
         add.clicked.connect(self.add_files)
         folder = QPushButton("Add Folder")
+        self.upscale_folder_button = folder
+        folder.setAccessibleName("Add folder to upscale")
         # v0.4.18 (WS1): the tooltip advertises recursion truthfully
         # (S-3) — the button's reach grew from the folder's top level to
         # the whole tree.
@@ -1570,9 +2232,11 @@ class MainWindow(QMainWindow):
             "subfolder (recursion is always on — a whole show at once)."
         )
         folder.clicked.connect(self.add_folder)
-        clear = QPushButton("Clear")
-        clear.clicked.connect(self.clear_files)
+        clear = QPushButton("Clear unsent upscale")
+        self.upscale_clear_button = clear
+        clear.clicked.connect(self.clear_upscale_files)
         browse_output = QPushButton("Output Folder")
+        self.upscale_output_button = browse_output
         browse_output.clicked.connect(self.choose_output_dir)
         # Canonical verb order left-to-right: Add → Plan → Start (§12).
         grid.addWidget(add, 0, 0)
@@ -1630,7 +2294,9 @@ class MainWindow(QMainWindow):
         # explainer states SCOPE only; the naming rule, keep-both promise,
         # and replace semantics live in the two tooltips (one derivation,
         # no drift surface).
-        controls_subs = QGroupBox("Add subtitles (no upscale)")
+        controls_subs = SubtitleDropGroup("Add subtitles (no upscale)")
+        self.controls_subs = controls_subs
+        controls_subs.pathsDropped.connect(self._stage_subtitle_drop)
         controls_subs.setObjectName("Controls")
         subs_grid = QGridLayout(controls_subs)
         subs_grid.setContentsMargins(18, 8, 18, 12)
@@ -1645,8 +2311,9 @@ class MainWindow(QMainWindow):
         # (col 4, moved from (0,2)).
         subs_grid.addWidget(self.add_subs_button, 0, 0)
         subs_grid.addWidget(self.subs_add_folder_button, 0, 1)
-        subs_grid.addWidget(self.subs_replace_source, 0, 2)
-        subs_grid.addWidget(self.subs_suppress_srt, 0, 3)
+        subs_grid.addWidget(self.start_subtitles_button, 0, 2)
+        subs_grid.addWidget(self.subs_replace_source, 0, 3)
+        subs_grid.addWidget(self.subs_suppress_srt, 0, 5)
         explainer = QLabel(
             "Adds subtitles from the file's own audio — video streams "
             "are copied (no upscale, no re-encode)."
@@ -1656,6 +2323,111 @@ class MainWindow(QMainWindow):
         subs_grid.addWidget(explainer, 0, 4)
         subs_grid.setColumnStretch(4, 1)
         layout.addWidget(controls_subs)
+        # Reflow the settings into two independent, font-driven columns.
+        # No shared nine-column budget, and no hidden/overlapping controls.
+        for old_grid in (grid, subs_grid):
+            while old_grid.count():
+                child = old_grid.takeAt(0).widget()
+                if isinstance(child, QLabel) and child is not explainer:
+                    child.hide()
+                    child.deleteLater()
+            for column in range(9):
+                old_grid.setColumnStretch(column, 0)
+
+        def pair(*widgets):
+            row_layout = QHBoxLayout()
+            for widget in widgets:
+                row_layout.addWidget(widget)
+            return row_layout
+
+        def field(label_text, widget):
+            label = QLabel(label_text)
+            label.setBuddy(widget)
+            return pair(label, widget)
+
+        grid.addLayout(pair(add, folder, clear), 0, 0)
+        grid.addLayout(pair(self.plan_button, self.start_button), 0, 1)
+        grid.addLayout(field("&GB/hour", self.gbph), 1, 0)
+        grid.addLayout(pair(browse_output, self.output_dir), 1, 1)
+        grid.addLayout(field("Upscale &engine", self.engine_combo), 2, 0)
+        grid.addLayout(field("Upscale &profile", self.profile_combo), 2, 1)
+        grid.addLayout(field(DENOISE_COMBO_LABEL, self.denoise_combo), 3, 0)
+        grid.addWidget(self.resume_claim, 3, 1)
+        grid.addWidget(self.subtitle_ocr, 4, 0)
+        grid.addWidget(self.transcribe_subs, 4, 1)
+        grid.addWidget(self.replace_source, 5, 0)
+        grid.addWidget(self.suppress_srt, 5, 1)
+        for combo in (self.engine_combo, self.profile_combo, self.denoise_combo):
+            combo.setMinimumContentsLength(12)
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.gbph.setFixedWidth(90)
+        subs_grid.addLayout(pair(self.add_subs_button, self.subs_add_folder_button), 0, 0)
+        subs_grid.addWidget(self.start_subtitles_button, 0, 1)
+        subs_grid.addLayout(field("Transcription &device", self.subs_device_combo), 1, 0)
+        subs_grid.addLayout(pair(self.subs_remove_button, self.subs_clear_button), 1, 1)
+        subs_grid.addWidget(self.subs_replace_source, 2, 0)
+        subs_grid.addWidget(self.subs_suppress_srt, 2, 1)
+        subs_grid.addWidget(explainer, 3, 0, 1, 2)
+        subs_help = QLabel("Drop subtitle videos here. Options apply to files added next; "
+                           "Start submits all eligible staged files. Outputs stay beside each source.")
+        subs_help.setWordWrap(True)
+        self.subs_start_help = subs_help
+        subs_grid.addWidget(subs_help, 4, 0, 1, 2)
+        for mode_grid in (grid, subs_grid):
+            mode_grid.setColumnStretch(0, 1)
+            mode_grid.setColumnStretch(1, 1)
+        layout.removeWidget(controls_upscale)
+        layout.removeWidget(controls_subs)
+        # Keep the same settings widgets alive on independent workflow pages.
+        # Tab selection is presentation only: no planning, staging or submission
+        # signals are connected to currentChanged. Queue/results stay outside.
+        self.workflow_tabs = QTabWidget()
+        self.workflow_tabs.setObjectName("WorkflowTabs")
+        self.workflow_tabs.setAccessibleName("Video workflow")
+        workflow_bar = self.workflow_tabs.tabBar()
+        assert workflow_bar is not None
+        workflow_bar.setObjectName("WorkflowTabBar")
+        workflow_bar.setAccessibleName("Choose AI Upscale or Subtitles Only")
+        self.workflow_tabs.setMinimumHeight(150)
+        self.workflow_tabs.setMaximumHeight(330)
+        self.setup_scroll = QScrollArea()
+        self.subs_setup_scroll = QScrollArea()
+        for scroll, name, controls, help_label in (
+            (self.setup_scroll, "AI Upscale options", controls_upscale, helper),
+            (self.subs_setup_scroll, "Subtitles Only options", controls_subs, None),
+        ):
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            if help_label is not None:
+                page_layout.addWidget(help_label)
+            page_layout.addWidget(controls)
+            page_layout.addStretch(1)
+            scroll.setAccessibleName(name)
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(page)
+        self.workflow_tabs.addTab(self.setup_scroll, "AI Upscale")
+        self.workflow_tabs.addTab(self.subs_setup_scroll, "Subtitles Only")
+        layout.addWidget(self.workflow_tabs, 2)
+        self.message_label = QLabel("")
+        self.message_label.setWordWrap(True)
+        self.message_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.message_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        self.message_label.setAccessibleName("Action guidance or error")
+        self.message_label.hide()
+        layout.addWidget(self.message_label)
+        self.cancel_check_button = QPushButton("Cancel checking (not jobs)")
+        self.cancel_check_button.setEnabled(False)
+        self.cancel_check_button.clicked.connect(self.cancel_checking)
+        self.copy_message_button = QPushButton("Copy message")
+        self.copy_message_button.setEnabled(False)
+        self.copy_message_button.clicked.connect(self._copy_message)
+        guidance_actions = QHBoxLayout()
+        guidance_actions.addWidget(self.cancel_check_button)
+        guidance_actions.addWidget(self.copy_message_button)
+        guidance_actions.addStretch(1)
+        guidance_actions.addWidget(self.monitor_check)
+        layout.addLayout(guidance_actions)
         layout.addWidget(self.progress)
 
         # ---- run panel (hidden until the first Start; design §4.2) ----
@@ -1667,6 +2439,7 @@ class MainWindow(QMainWindow):
         run_layout.setVerticalSpacing(8)
         self.stage_label = QLabel("")
         self.stage_label.setObjectName("StageLabel")
+        self.stage_label.setWordWrap(True)
         self.activity_dots = ActivityDots()
         self.time_elapsed = QLabel("")
         self.time_elapsed.setObjectName("Muted")
@@ -1688,8 +2461,13 @@ class MainWindow(QMainWindow):
         run_layout.addWidget(self.stage_bar, 2, 1)
         run_layout.addWidget(QLabel("Overall queue"), 3, 0)
         run_layout.addWidget(self.overall_bar, 3, 1)
-        run_layout.addWidget(QLabel("Log (tail)"), 4, 0, 1, 3)
+        self.log_toggle = QCheckBox("Show runner log tail")
+        self.log_toggle.toggled.connect(self.run_log_tail.setVisible)
+        run_layout.addWidget(self.log_toggle, 4, 0, 1, 3)
         run_layout.addWidget(self.run_log_tail, 5, 0, 1, 3)
+        self.run_log_tail.hide()
+        run_layout.addWidget(self.cancel_button, 0, 3)
+        run_layout.addWidget(self.cancel_batch_button, 1, 3)
         # v0.4.5 (§2, D-tail): the scroll hooks. valueChanged tracks the
         # user-scroll override; rangeChanged keeps the cached maximum
         # fresh (setPlainText rebuilds the document, so the range
@@ -1703,10 +2481,35 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.run_panel)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.file_table)
+        self.details_splitter = splitter
+        self.queue_tabs = QTabWidget()
+        self.queue_tabs.addTab(self.file_table, "Current batch")
+        self.history_table = QTableWidget(0, 3)
+        self.history_table.setHorizontalHeaderLabels(["State", "File", "Error"])
+        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history_table.setAccessibleName("Recent jobs, read only")
+        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.history_table.itemSelectionChanged.connect(self._select_history)
+        self.queue_tabs.addTab(self.history_table, "Recent jobs (read only)")
+        self.queue_tabs.currentChanged.connect(self._queue_tab_changed)
+        splitter.addWidget(self.queue_tabs)
         splitter.addWidget(self.details)
         splitter.setSizes([760, 360])
         layout.addWidget(splitter, 1)
+        output_actions = QGridLayout()
+        self.output_action_buttons = []
+        for index, (title, callback) in enumerate((("Copy details", lambda: QApplication.clipboard().setText(self.details.toPlainText())),
+                                ("Copy source path", self._copy_source_path),
+                                ("Copy output path", self._copy_output_path),
+                                ("Reveal output", lambda: self._open_recorded_path("output_path")),
+                                ("Open manifest", lambda: self._open_recorded_path("manifest_path")),
+                                ("Open log", lambda: self._open_recorded_path("log_path")))):
+            button = QPushButton(title)
+            button.clicked.connect(callback)
+            self.output_action_buttons.append(button)
+            output_actions.addWidget(button, index // 3, index % 3)
+        layout.addLayout(output_actions)
         return root
 
     def _version_pill(self) -> QLabel:
@@ -1717,6 +2520,12 @@ class MainWindow(QMainWindow):
         return pill
 
     def _apply_style(self) -> None:
+        self._system_colours = self._settings().value("ui/system_palette", False, type=bool)
+        self._progress_chunk_color = None
+        if self._system_colours:
+            self.setStyleSheet("")
+            self.progress.setStyleSheet("")
+            return
         # v0.4.18 (WS4, D12): the QGroupBox title floats visibly off its
         # border line. MECHANICS: with `subcontrol-origin: margin` +
         # `subcontrol-position: top left` the title anchors to the TOP
@@ -1731,19 +2540,35 @@ class MainWindow(QMainWindow):
         # if outside the band adjust ONLY the margin-top below in ±2 px
         # steps and re-verify BOTH groups. Linux offscreen cannot
         # reproduce the metric; the committed value is 20 px.
+        # Styling the indicator replaces native painting, including the tick.
+        # Ship that mark explicitly; native unchecked outlines can disappear
+        # against our dark palette. System colours retain native rendering.
+        checkbox_tick = (
+            Path(__file__).resolve().parent / "ui" / "assets" / "checkbox-checked.png"
+        ).as_posix()
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #101214; color: #edf0ec; }
             QLabel { color: #d9ded7; }
-            #Title { font-size: 34px; font-weight: 700; letter-spacing: 0; }
-            #VersionBadge { background: #263036; border: 1px solid #3b4a52; border-radius: 9px; color: #b9c7ce; padding: 2px 8px; font-size: 11px; }
-            #TotalPill { color: #8fd0a8; font-size: 13px; font-weight: 600; }
-            #Muted { color: #98a196; font-size: 13px; }
-            #StageLabel { color: #e8ddc0; font-size: 15px; }
+            #Title { font-weight: 700; letter-spacing: 0; }
+            #VersionBadge { background: #263036; border: 1px solid #3b4a52; border-radius: 9px; color: #b9c7ce; padding: 2px 8px; }
+            #TotalPill { color: #8fd0a8; font-weight: 600; }
+            #Muted { color: #98a196; }
+            #StageLabel { color: #e8ddc0; font-weight: 600; }
             #RunPanel { background: #191d1f; border: 1px solid #2b3134; border-radius: 8px; }
             QGroupBox#Controls { background: #191d1f; border: 1px solid #2b3134; border-radius: 8px; margin-top: 20px; padding-top: 4px; font-weight: 600; }
             QGroupBox#Controls::title { subcontrol-origin: margin; subcontrol-position: top left; left: 12px; padding: 0 4px; color: #98a196; }
-            QPushButton { background: #242a2d; border: 1px solid #3a4246; border-radius: 6px; padding: 9px 14px; color: #edf0ec; }
+            QPushButton { background: #242a2d; border: 2px solid #657178; border-radius: 6px; padding: 6px 10px; color: #edf0ec; }
+            QPushButton:focus, QComboBox:focus, QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QTableWidget:focus { border: 2px solid #8fd0e8; }
+            QCheckBox { spacing: 6px; }
+            QCheckBox:disabled { color: #89969e; }
+            QCheckBox::indicator { width: 16px; height: 16px; border: 2px solid #a7b5bd; border-radius: 0px; background: #15191b; }
+            QCheckBox::indicator:unchecked { image: none; }
+            QCheckBox::indicator:checked { image: url("CHECKBOX_TICK_URL"); background: #8fd0e8; border-color: #b6e5f5; }
+            QCheckBox::indicator:enabled:hover { border-color: #ffffff; }
+            QCheckBox::indicator:enabled:focus { border-color: #f0b45c; }
+            QCheckBox::indicator:disabled { background: #191d1f; border-color: #75828b; }
+            QCheckBox::indicator:disabled:checked { background: #75828b; }
             QPushButton:hover { background: #30383c; border-color: #657178; }
             QPushButton:pressed { background: #1b2022; }
             QPushButton:disabled { color: #758079; border-color: #353d41; }
@@ -1760,10 +2585,17 @@ class MainWindow(QMainWindow):
             QHeaderView::section { background: #202629; color: #bfc8c0; border: 0; border-right: 1px solid #30383c; padding: 8px; font-weight: 700; }
             QTableWidget::item { padding: 8px; }
             QTableWidget::item:selected { background: #244750; color: #ffffff; }
-            QSplitter::handle { background: #252c2f; width: 2px; }
-            """
+            QSplitter::handle { background: #657178; width: 6px; }
+            QTabBar#WorkflowTabBar::tab { background: #242a2d; color: #bfc8c0; border: 2px solid #657178; padding: 9px 22px; font-weight: 700; }
+            QTabBar#WorkflowTabBar::tab:selected { background: #244750; color: #ffffff; border-color: #8fd0e8; }
+            QTabBar#WorkflowTabBar::tab:focus { border-color: #8fd0e8; }
+            #PrimaryButton:focus, #StartButton:focus { border: 2px solid #8fd0e8; }
+            """.replace("CHECKBOX_TICK_URL", checkbox_tick)
         )
         self.file_table.setAlternatingRowColors(True)
+        title_font = QFont(QApplication.font())
+        title_font.setPointSizeF(max(12.0, title_font.pointSizeF() * 1.8))
+        self.title_label.setFont(title_font)
         fixed = QFont("JetBrains Mono")
         fixed.setStyleHint(QFont.StyleHint.Monospace)
         self.details.setFont(fixed)
@@ -1774,6 +2606,9 @@ class MainWindow(QMainWindow):
         self.summary_note.setText(note)
 
     def _add_paths(self, paths: list[str]) -> None:
+        if len(set(self.files) | set(paths)) > MAX_FILES:
+            self._show_message(f"Add at most {MAX_FILES} upscale files at once. Nothing was added.")
+            return
         added = 0
         known = set(self.files)
         for path in paths:
@@ -1783,7 +2618,17 @@ class MainWindow(QMainWindow):
                 known.add(clean)
                 added += 1
         if added:
-            self._render_pending_files()
+            self._invalidate_plan()
+            if self.job_ids or self.client.active_job_count() > 0:
+                for path in self.files[-added:]:
+                    row = self.file_table.rowCount()
+                    self.file_table.insertRow(row)
+                    for column, text in enumerate(["pending", path, "", "", "", "", "", ""]):
+                        self.file_table.setItem(row, column, QTableWidgetItem(text))
+                    self._tag_row(row, kind="pending-upscale")
+                self._show_message("Files added for the next upscale plan. Submitted jobs are unchanged.")
+            else:
+                self._render_pending_files()
 
     def _render_pending_files(self) -> None:
         self.batch = None
@@ -1800,7 +2645,9 @@ class MainWindow(QMainWindow):
         for row, path in enumerate(self.files):
             for column, text in enumerate(["pending", path, "", "", "", "", "", ""]):
                 self.file_table.setItem(row, column, QTableWidgetItem(text))
-        self._set_summary(f"{len(self.files)} queued", "Run Plan Batch to inspect them.")
+            self._tag_row(row, kind="pending-upscale")
+        self._restore_staged_rows()
+        self._set_summary(f"{len(self.files)} pending upscale", "Run Plan Batch to inspect them.")
         self.details.setPlainText("\n".join(self.files))
 
     def add_files(self) -> None:
@@ -1820,16 +2667,7 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Choose a folder", str(Path.home()))
         if not folder:
             return
-        paths = collect_video_files(folder)
-        if len(paths) > MAX_FILES:
-            QMessageBox.warning(
-                self,
-                "VidLift",
-                f"That folder tree holds {len(paths)} videos (subfolders "
-                f"included); add at most {MAX_FILES} at once.",
-            )
-            return
-        self._add_paths(paths)
+        self._request_ingestion([folder], subtitles=False)
 
     def choose_output_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose an output folder", str(Path.home()))
@@ -1983,7 +2821,7 @@ class MainWindow(QMainWindow):
         paths = [str(path) for path in paths if str(path)]
         if not paths:
             return
-        self._enqueue_subs_paths(paths)
+        self._request_ingestion(paths, subtitles=True)
 
     def choose_subs_folder(self) -> None:
         """v0.4.18 (WS1): the Mode B folder entry — a directory picker
@@ -2005,27 +2843,123 @@ class MainWindow(QMainWindow):
         )
         if not folder:
             return
-        paths = collect_video_files(folder)
-        if len(paths) > MAX_FILES:
-            QMessageBox.warning(
-                self,
-                "VidLift",
-                f"That folder tree holds {len(paths)} videos (subfolders "
-                f"included); add at most {MAX_FILES} at once.",
-            )
-            return
-        if not paths:
-            return
-        self._enqueue_subs_paths(paths)
+        self._request_ingestion([folder], subtitles=True)
 
-    def _enqueue_subs_paths(self, paths: list[str]) -> None:
-        """v0.4.18 (WS1, row 4-A6): the post-picker tail of
-        choose_subs_files, extracted VERBATIM so both Mode B surfaces —
-        the file picker and the new folder picker — hand off through
-        the exact same conflict guard, enqueue surface (+ catch list),
-        row render, and slate bootstrap. One ingestion pipeline, no
-        forked copy to drift apart. The v0.4.15.1/v0.4.15.4/v0.4.17
-        comments moved with the code they narrate."""
+    def _enqueue_subs_paths(self, paths: list[str], *, verdicts: dict[str, str] | None = None,
+                            options: SubtitleOptions | None = None) -> None:
+        """Stage Mode B paths without creating registry work."""
+        options = options or SubtitleOptions(self.subs_replace_source.isChecked(),
+                                            self.subs_suppress_srt.isChecked(),
+                                            self.subs_device_combo.currentData())
+        known = {row["path"] for row in self._staged_subs}
+        incoming = {str(Path(raw).expanduser().resolve()) for raw in paths}
+        if len(known | incoming) > MAX_FILES:
+            QMessageBox.warning(self, "VidLift", f"Stage at most {MAX_FILES} subtitle files at once.")
+            return
+        try:
+            ffprobe = find_tools().ffprobe
+        except MissingToolError:
+            ffprobe = "ffprobe"
+        added = []
+        for raw in paths:
+            path = str(Path(raw).expanduser().resolve())
+            if path in known:
+                continue
+            known.add(path)
+            verdict = subs_plan_verdict(path, ffprobe=ffprobe) if verdicts is None else verdicts[path]
+            self._staged_subs.append({
+                "id": uuid.uuid4().hex,
+                "path": path, "verdict": verdict,
+                "replace_source": options.replace_source,
+                "suppress_srt": options.suppress_srt,
+                "options": options,
+                "uncertain": path in self._uncertain_subtitle_paths,
+                "error": ("Submission status remains unknown; retry is disabled. Inspect Recent jobs."
+                          if path in self._uncertain_subtitle_paths else ""),
+            })
+            added.append(path)
+        if added:
+            for staged in self._staged_subs:
+                if staged["path"] in added:
+                    self._append_staged_row(staged)
+        self._sync_staged_controls()
+        self._set_summary(f"{len(self._staged_subs)} subtitle file(s) staged. Click Start Subtitles to begin.", "No transcription is started while adding files.")
+
+    def start_subtitles(self, *, checked_verdicts: dict[str, str] | None = None,
+                        staged_ids: set[str] | None = None) -> None:
+        """Submit the current eligible staged rows once, in table order."""
+        if self._subs_submitting or self._ui_closed or self._preflights:
+            return
+        if self._subtitle_start_blocked():
+            return
+        eligible = [r for r in self._staged_subs
+                    if r["verdict"] in (SUBS_VERDICT_READY, SUBS_VERDICT_PROBE_ERROR)
+                    and not r.get("uncertain") and (staged_ids is None or r["id"] in staged_ids)]
+        if not eligible:
+            return
+        # Reserve before the modal review starts its nested event loop.
+        self._subs_submitting = True
+        self.start_subtitles_button.setEnabled(False)
+        self._subs_submission_notices = []
+        self._subs_submission_failed = False
+        try:
+            destructive = [r for r in eligible if r["replace_source"] or r["suppress_srt"]]
+            if destructive:
+                details = f"{len(eligible)} reviewed subtitle job(s); {len(destructive)} with deletion options.\n" + "\n".join(
+                    f"{r['path']} -> {subs_output_path(r['path'])}: " + ", ".join(x for x, enabled in (
+                        ("Replace original file on success (only after verified backend success)", r["replace_source"]),
+                        ("Delete .srt sidecar after embed (only on successful embed; keep on embed failure)", r["suppress_srt"]),
+                    ) if enabled) for r in eligible
+                )
+                if not self._confirm_options("Confirm subtitle options", details):
+                    return
+            # A modal review/preflight can outlive another submission.
+            if self._subtitle_start_blocked():
+                return
+            # One path per call prevents partial registry writes from
+            # masquerading as an entirely failed multi-file submission.
+            successful: set[str] = set()
+            batch_id = uuid.uuid4().hex
+            for row in eligible:
+                for index in range(self.file_table.rowCount() - 1, -1, -1):
+                    if self._row_meta(index).get("staged_id") == row["id"]:
+                        self._remove_display_rows([index])
+                        break
+                self._subs_submit_error = ""
+                self._subs_submit_uncertain = False
+                submitted = self._submit_subs_paths(
+                    [row["path"]], replace_source=row["replace_source"],
+                    suppress_srt=row["suppress_srt"], device=row["options"].device,
+                    checked_verdicts=checked_verdicts,
+                    row_id=row["id"],
+                    batch_id=batch_id,
+                )
+                successful.update(submitted)
+                if not submitted:
+                    row["error"] = self._subs_submit_error or "Not submitted; check eligibility and retry."
+                    row["uncertain"] = self._subs_submit_uncertain
+                    if row["uncertain"]:
+                        self._uncertain_subtitle_paths.add(row["path"])
+                    row["verdict"] = getattr(self, "_last_subs_verdicts", {}).get(row["path"], row["verdict"])
+                    self._append_staged_row(row)
+            self._staged_subs = [r for r in self._staged_subs if r["path"] not in successful]
+            if self._subs_submission_notices:
+                text = "\n".join(self._subs_submission_notices)
+                self._show_message(text)
+                notify = QMessageBox.warning if self._subs_submission_failed else QMessageBox.information
+                notify(self, "Subtitle submission review", text[:2000])
+        finally:
+            self._subs_submitting = False
+            self._sync_staged_controls()
+
+    def _submit_subs_paths(
+        self, paths: list[str], *, replace_source: bool | None = None,
+        suppress_srt: bool | None = None, device: str = "auto",
+        checked_verdicts: dict[str, str] | None = None,
+        row_id: str | None = None,
+        batch_id: str | None = None,
+    ) -> set[str]:
+        """Create registry jobs; return only paths actually enqueued."""
         # v0.4.19 (WS2): plan-time pre-flight BEFORE the conflict guard
         # — one probe per picked path (output-exists is probe-free;
         # find_tools failure degrades to the fail-open probe-error
@@ -2039,7 +2973,9 @@ class MainWindow(QMainWindow):
             ffprobe = "ffprobe"  # probe fails honestly → probe-error → ready
         verdicts: dict[str, str] = {}
         for path in paths:
-            verdicts[path] = subs_plan_verdict(path, ffprobe=ffprobe)
+            verdicts[path] = (subs_plan_verdict(path, ffprobe=ffprobe) if checked_verdicts is None
+                              else checked_verdicts[path])
+        self._last_subs_verdicts = verdicts
         ready = [
             path for path in paths
             if verdicts[path] in (SUBS_VERDICT_READY, SUBS_VERDICT_PROBE_ERROR)
@@ -2052,6 +2988,12 @@ class MainWindow(QMainWindow):
             path for path in paths
             if verdicts[path] == SUBS_VERDICT_BLOCKED_OUTPUT
         ]
+        if not ready:
+            self._subs_submit_error = (
+                "Output exists; it will not be overwritten." if blocked
+                else "Already has usable subtitles; not submitted."
+            )
+            return set()
         # v0.4.15.1: the ONLY blocking condition — a live subs job over
         # the same (READY) source. Pure read over queue_views(); a client
         # without that surface (older scripted harnesses) yields no
@@ -2063,52 +3005,68 @@ class MainWindow(QMainWindow):
             running, queued = self.client.queue_views()
         except AttributeError:
             running, queued = [], []
+        except (OSError, BridgeError) as exc:
+            self._subs_submit_error = f"Could not check the queue: {exc}. Retry when the queue is readable."
+            self._show_message(self._subs_submit_error)
+            return set()
         live_subs_paths = self._active_subs_paths(running or [], queued or [])
         conflicts = [path for path in ready if path in live_subs_paths]
         if conflicts:
             shown = ", ".join(Path(path).name for path in conflicts[:5])
             more = f" (+{len(conflicts) - 5} more)" if len(conflicts) > 5 else ""
-            QMessageBox.information(
-                self, "VidLift",
-                "Wait for the current batch to finish or cancel it first.\n"
-                f"Already queued for subtitles: {shown}{more}",
-            )
-            return
+            self._subs_submit_error = "Already queued for subtitles: " + shown + more
+            text = "Wait for the current batch to finish or cancel it first.\n" + self._subs_submit_error
+            if self._subs_submitting:
+                self._subs_submission_notices.append(text)
+            else:
+                QMessageBox.information(self, "Subtitle conflict", text)
+            return set()
         pending_ids: list[str] | None = None
         if self.job_ids:
             pending_ids = list(self.job_ids)
         fresh_ids: list[str] = []
-        try:
-            # v0.4.17: the checkbox state IS the submitted option — it
-            # rides the enqueue surface (client_local → registry
-            # options) so the executor's absent-defaults read lands on
-            # exactly what this pick asked for.
-            # v0.4.18 (opt-in suppress_srt, 5-E6): the same rule
-            # extended — the checkbox state IS the submitted option.
-            if ready:
-                fresh_ids = self.client.enqueue_subs(
-                    ready,
-                    replace_source=self.subs_replace_source.isChecked(),
-                    suppress_srt=self.subs_suppress_srt.isChecked(),
-                )
-        except (
-            BatchTooLarge,
-            FileNotFoundError,
-            BridgeError,
-            OSError,
-        ) as exc:
-            # v0.4.15.4 (F-13b): the identical exposure on the Mode B
-            # enqueue path (same catch list, same crash-abort class).
-            QMessageBox.warning(
-                self, "VidLift", f"could not record the batch: {exc}"
-            )
+        # Callers submit one reviewed row. The bridge distinguishes proven
+        # pre-write rejection, exact accepted identity, and unknown outcome.
+        if len(ready) != 1:
+            raise ValueError("Submit subtitle rows individually")
+        result = self._submit_gui_job("subs", ready[0], {
+            "replace_source": self.subs_replace_source.isChecked() if replace_source is None else replace_source,
+            "suppress_srt": self.subs_suppress_srt.isChecked() if suppress_srt is None else suppress_srt,
+            "device": device,
+            "batch_id": batch_id,
+        })
+        fresh_ids = list(result.job_ids)
+        if result.state != "accepted":
+            self._subs_submit_uncertain = result.state != "rejected"
+            self._subs_submit_error = f"could not record the batch: {result.error or 'no exact job receipt returned'}"
+            if self._subs_submit_uncertain:
+                self._subs_submit_error += "; submission status unknown. Inspect Recent jobs; retry is disabled."
+            text = self._subs_submit_error
+            if self._subs_submitting:
+                self._subs_submission_failed = True
+                self._subs_submission_notices.append(text)
+            else:
+                QMessageBox.warning(self, "Subtitle submission failed", text)
             if pending_ids is not None:
                 # the live batch's ids survive untouched — only stale
                 # (unknown/terminal) window ids are dropped
-                self.job_ids = MainWindow._live_window_ids(pending_ids, self.client)
+                self.job_ids = self._pending_submission_ids(pending_ids)
             else:
                 self.job_ids = []
-            return
+            if not fresh_ids:
+                return set()
+        elif result.error is not None:
+            notice = (
+                f"Job {fresh_ids[0]} was recorded, but executor notification failed: {result.error}. "
+                "Tracking that exact job; do not resubmit.")
+            if self._subs_submitting:
+                self._subs_submission_notices.append(notice)
+            else:
+                self._show_message(notice)
+        if not fresh_ids:
+            self._subs_submit_uncertain = True
+            self._subs_submit_error = "Submission status unknown: no job receipt returned. Automatic retry is disabled."
+            return set()
         # v0.4.19 (WS2): rows ALWAYS render (the partition: ready first,
         # then skip, then blocked — _begin_job_slate's job↔row mapping
         # is row_offset+index over the READY list; skip/blocked rows
@@ -2117,10 +3075,17 @@ class MainWindow(QMainWindow):
         ordered = ready + skipped + blocked
         self.file_table.setRowCount(seed + len(ordered))
         for offset, cells in enumerate(self._subs_file_rows(ordered, verdicts)):
+            if replace_source is not None and verdicts[ordered[offset]] != SUBS_VERDICT_SKIP_SUBTITLES:
+                cells[3] = "replace original → .mp4" if replace_source else "keep original"
             for column, text in enumerate(cells):
                 self.file_table.setItem(
                     seed + offset, column, QTableWidgetItem(text)
                 )
+            self._tag_row(seed + offset, kind="subtitles", row_id=row_id or uuid.uuid4().hex,
+                          options=SubtitleOptions(
+                self.subs_replace_source.isChecked() if replace_source is None else replace_source,
+                self.subs_suppress_srt.isChecked() if suppress_srt is None else suppress_srt,
+                device))
         if not fresh_ids:
             # nothing enqueued — the static skip/block rows still render
             # (and the summary below names why); no slate, no timer.
@@ -2131,13 +3096,13 @@ class MainWindow(QMainWindow):
                 "Skipped and blocked files are not enqueued; the "
                 "run-side guards remain the backstop.",
             )
-            return
+            return set()
         # v0.4.15.1: the window tracks ENQUEUED-BY-THIS-WINDOW ids with
         # a LIVE (non-terminal, snapshot-provable) state — stale ids
         # (the Eric false-positive class) are dropped from tracking, a
         # concurrent submission EXTENDS the live list, and the poll
         # loop keeps draining terminal ids per tick.
-        live_pending = MainWindow._live_window_ids(pending_ids or [], self.client)
+        live_pending = self._pending_submission_ids(pending_ids or [])
         self.job_ids = live_pending + [str(job_id) for job_id in fresh_ids]
         # v0.4.14 (Mode B): a subs batch reuses the SHARED table — its
         # rows append after any prior batch's rows (the table is the
@@ -2163,8 +3128,10 @@ class MainWindow(QMainWindow):
                 None
             ] * len(fresh)
             for index, job_id in enumerate(fresh):
-                self._batch_row_for_job[job_id] = len(live) + index
+                self._batch_row_for_job[job_id] = seed + index
+                self._tag_row(seed + index, job_id=job_id)
             self.run_summary = summarize_batch(self.run_counts)
+            self.progress.setFormat(_batch_format(self.run_summary))
         else:
             self._reset_batch_progress()
             self._begin_job_slate(self.job_ids, row_offset=seed)
@@ -2177,13 +3144,26 @@ class MainWindow(QMainWindow):
             ),
             "Transcribing audio and soft-muxing subtitles (no upscale).",
         )
+        return set(ready)
 
     def clear_files(self) -> None:
+        if self._preflights:
+            self.cancel_checking()
         if self.client.active_job_count() > 0:
-            QMessageBox.information(self, "VidLift", "Wait for the current upscale to finish or cancel it first.")
+            self.clear_staged_subtitles()
+            self.files = []
+            self._invalidate_plan()
+            self._show_message("Unsent files cleared. Submitted jobs and source media are unchanged.")
             return
+        if any(r["replace_source"] or r["suppress_srt"] for r in self._staged_subs):
+            if QMessageBox.question(self, "Clear staged subtitles", "Discard staged subtitle rows with destructive options?") != QMessageBox.StandardButton.Yes:
+                return
+        self._staged_subs.clear()
+        self.start_subtitles_button.setEnabled(False)
         self.files = []
         self.batch = None
+        self._planned_inputs = None
+        self._plan_dirty = False
         # v0.4.12 (item 1): the table is gone — a stale job_id->row map from
         # the previous batch must never map into a fresh one.
         self._batch_row_for_job = {}
@@ -2194,17 +3174,20 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.file_table.setRowCount(0)
         self.details.clear()
-        self._set_summary("No files planned yet", "Drop videos here or choose Add Files.")
+        self._set_summary("No files planned yet", "Drop videos into the selected workflow or use its Add button.")
 
     def plan_batch(self) -> None:
+        if self.job_ids or self.client.active_job_count() > 0:
+            self._show_message("Wait for submitted work to finish before planning the next upscale.")
+            return
         if not self.files:
             QMessageBox.information(self, "VidLift", "Add one or more video files first.")
             return
-        try:
-            gbph = float(self.gbph.text())
-        except ValueError:
-            QMessageBox.warning(self, "VidLift", "GB/hour must be a number.")
+        gbph = self._valid_size()
+        if gbph is None:
             return
+        self._plan_dirty = True
+        self.start_button.setEnabled(False)
         try:
             tools = find_tools()
         except MissingToolError as exc:
@@ -2217,8 +3200,13 @@ class MainWindow(QMainWindow):
                 reports.append(probe_and_classify(path, binary=tools.ffprobe))
             except (ProbeError, OSError) as exc:
                 failures.append(f"{path}: {exc}")
+        self._accept_plan_reports(reports, failures, self._current_plan_inputs())
+
+    def _accept_plan_reports(self, reports, failures: list[str], inputs: PlanInputs) -> None:
         if not reports:
-            QMessageBox.warning(self, "VidLift", "No files could be probed.\n\n" + "\n".join(failures[:5]))
+            self._render_pending_files()
+            self._show_failed_plan_rows(inputs, failures)
+            self._show_message("No files could be checked. " + "\n".join(failures))
             return
         try:
             # v0.4.15.3 (F-6): the checkbox rides the PLAN call — the
@@ -2227,18 +3215,45 @@ class MainWindow(QMainWindow):
             self.batch = build_batch_plan(
                 reports,
                 target="720p",
-                gb_per_hour=gbph,
-                output_dir=self.output_dir.text().strip() or None,
-                transcription_enabled=self.transcribe_subs.isChecked(),
+                gb_per_hour=inputs.gbph,
+                output_dir=inputs.output_dir or None,
+                transcription_enabled=inputs.transcribe,
             )
         except Exception as exc:
             QMessageBox.critical(self, "VidLift planning failed", str(exc))
             return
+        self._planned_inputs = inputs
+        self._plan_dirty = False
         self.render_batch(self.batch)
         if failures:
-            QMessageBox.warning(self, "VidLift", "Some files failed to probe.\n\n" + "\n".join(failures[:8]))
+            self._show_failed_plan_rows(inputs, failures)
+            self._show_message("Some files failed to check:\n" + "\n".join(failures))
+        else:
+            self._show_message("")
+
+    def _show_failed_plan_rows(self, inputs: PlanInputs, failures: list[str]) -> None:
+        for failure in failures:
+            path = next((path for path in inputs.paths if failure.startswith(path + ": ")), None)
+            if path is None:
+                continue
+            row = next((row for row in range(self.file_table.rowCount())
+                        if self.file_table.item(row, 1) is not None and
+                        self.file_table.item(row, 1).text() == path and
+                        self._row_meta(row).get("kind") == "pending-upscale"), None)
+            if row is None:
+                row = self.file_table.rowCount()
+                self.file_table.insertRow(row)
+                for col, value in enumerate(["check failed", path, "", "", "", "", "", failure]):
+                    self.file_table.setItem(row, col, QTableWidgetItem(value))
+            else:
+                self.file_table.item(row, 0).setText("check failed")
+                self.file_table.item(row, 7).setText(failure)
+            self._tag_row(row, kind="pending-upscale", plan_error=failure)
 
     def render_batch(self, batch: BatchPlan) -> None:
+        if self.job_ids or self.client.active_job_count() > 0:
+            self._render_detail_for_row()
+            return
         # v0.4.14 (Mode B): a plan render REPLACES the table (a plan is
         # its own batch view; subs history rows may only survive a
         # plan render on the NEXT subs append, never across a new plan —
@@ -2283,6 +3298,8 @@ class MainWindow(QMainWindow):
                 elif column == 0:
                     cell.setForeground(Qt.GlobalColor.yellow)
                 self.file_table.setItem(row, column, cell)
+            self._tag_row(row, kind="planned-upscale", plan=item)
+        self._restore_staged_rows()
         self.file_table.selectRow(0)
         self._set_summary(
             f"{batch.runnable_count}/{len(batch.files)} ready",
@@ -2308,6 +3325,10 @@ class MainWindow(QMainWindow):
         allowed = (
             self.batch.runnable_count > 0
             and not self.job_ids
+            and not self._plan_dirty
+            and not self._plan_checking
+            and not self._preflights
+            and not self._upscale_submitting
         )
         self.start_button.setEnabled(allowed)
 
@@ -2355,12 +3376,21 @@ class MainWindow(QMainWindow):
     # honest "(no data)" line instead of raising. Safe for queued (no snapshot data),
     # running mid-transition, cancelled, succeeded, failed, and lookup-failed rows.
     def _render_detail_for_row(self, row: int | None = None) -> None:
+        if self.queue_tabs.currentIndex() == 1:
+            return
         if row is None:
             rows = self.file_table.selectionModel().selectedRows()
             if not rows:
                 return
             row = rows[0].row()
-        if self.batch is None:
+        meta = self._row_meta(row)
+        if meta.get("kind") == "pending-upscale":
+            self._set_details_text("Pending upscale: " + self.file_table.item(row, 1).text()
+                                   + "\nRun Plan Batch before starting."
+                                   + ("\nCheck failed: " + meta["plan_error"] if meta.get("plan_error") else ""))
+            return
+        item = meta.get("plan")
+        if meta.get("kind") in ("staged-subtitles", "subtitles") or (self.batch is None and item is None):
             # v0.4.14 (Mode B): a subs slate has NO BatchPlan — the
             # detail body renders from the shared table row and then
             # FALLS THROUGH to the SAME LIVE overlay tail the plan
@@ -2371,14 +3401,33 @@ class MainWindow(QMainWindow):
         else:
             # Keep the v0.4.12 bounds guard: a row outside the plan renders
             # nothing rather than inventing data (§2.1 step 1).
-            if not (0 <= row < len(self.batch.files)):
-                return
-            item = self.batch.files[row]
+            if item is None:
+                if not (0 <= row < len(self.batch.files)):
+                    return
+                item = self.batch.files[row]
             text = detail_text(
                 item,
-                subtitle_ocr_enabled=self.subtitle_ocr.isChecked(),
-                upscale_profile=self.profile_choice,
+                subtitle_ocr_enabled=meta.get("submitted_options", {}).get("subtitle_ocr", self.subtitle_ocr.isChecked()),
+                upscale_profile=meta.get("submitted_options", {}).get("upscale_profile", self.profile_choice),
             )
+            submitted = meta.get("submitted_options")
+            effective = submitted or {
+                "replace_source": self.replace_source.isChecked(),
+                "suppress_srt": self.suppress_srt.isChecked(),
+                "denoise": self.denoise_mode,
+                "resume": self.resume_claim.isChecked(),
+            }
+            if meta.get("submission_error"):
+                text += "\nSubmission: " + meta["submission_error"]
+            if effective:
+                text += "\n\n" + ("Submitted options (frozen):" if submitted else "Run options (reviewed at Start):")
+                text += "\nSource file policy: " + ("replace only after verified success" if effective["replace_source"] else "keep original")
+                text += "\n" + SubtitleOptions(suppress_srt=effective["suppress_srt"]).sidecar_note
+                text += "\nRequested upscale engine: " + str(meta.get("submitted_engine", self.engine_choice))
+                text += "\nDenoise: " + str(effective.get("denoise", "off"))
+                text += "\nResume retained work: " + ("on" if effective.get("resume") else "off")
+            if self._plan_dirty and row not in self._batch_row_for_job.values():
+                text = "Settings changed. Plan again before starting.\n\n" + text
             # v0.4.9 (§1.4 D1), unchanged call — but now inside the _sync_details
             # slot boundary (belt-and-braces over scratch_note_for_source's own
             # OSError/JSONDecodeError guards: a Windows locked-file transient
@@ -2438,6 +3487,9 @@ class MainWindow(QMainWindow):
         device_display = _device_display(snapshot)
         if device_display is not None:
             lines.append(f"Device: {device_display}")
+        fallback_reason = (snapshot.get("transcription") or {}).get("fallback_reason")
+        if fallback_reason:
+            lines.append("Transcription fallback: " + str(fallback_reason)[:200])
         # v0.4.17 (fail-path, the failure-reason surfacing): the
         # payload's own `error` rides the overlay verbatim — the exact
         # string the record/registry carries (e.g. a probe
@@ -2483,6 +3535,13 @@ class MainWindow(QMainWindow):
             f"Subtitles: {subtitle_note or 'transcribed from the file' + chr(39) + 's own audio'}",
             f"Output: {output} (+ .srt sidecar)",
         ]
+        options = self._row_meta(row).get("options")
+        if isinstance(options, SubtitleOptions):
+            lines[-1] = f"Output: {output}"
+            lines.extend([f"Sidecar policy: {options.sidecar_note}",
+                          f"Requested device: {options.device_note}"])
+            if self._row_meta(row).get("kind") == "staged-subtitles":
+                lines.append("Staged only: no transcription job has been submitted.")
         # v0.4.17 workstream-2 (Karen K-2): column 3 of a subs row carries an
         # ACTION phrase ("replace original → .mp4" / "keep original"), not a
         # resolution — the "Resolution handling" heading was a v0.4.14
@@ -2510,7 +3569,21 @@ class MainWindow(QMainWindow):
         resets the user's scroll. Compare-before-write so a paused/idle
         running job does not repaint-kick the panel every second."""
         if self.details.toPlainText() != text:
+            previous = self.details.toPlainText()
+            cursor = self.details.textCursor()
+            anchor, position = cursor.anchor(), cursor.position()
+            scrollbar = self.details.verticalScrollBar()
+            scroll = scrollbar.value() if scrollbar is not None else 0
             self.details.setPlainText(text)
+            if previous.split("\n", 1)[0] == text.split("\n", 1)[0]:
+                if previous[min(anchor, position):max(anchor, position)] == text[min(anchor, position):max(anchor, position)]:
+                    from PyQt6.QtGui import QTextCursor
+                    cursor = self.details.textCursor()
+                    cursor.setPosition(min(anchor, len(text)))
+                    cursor.setPosition(min(position, len(text)), QTextCursor.MoveMode.KeepAnchor)
+                    self.details.setTextCursor(cursor)
+                if scrollbar is not None:
+                    scrollbar.setValue(scroll)
 
     def _refresh_details(self) -> None:
         if self.batch is None:
@@ -2538,7 +3611,7 @@ class MainWindow(QMainWindow):
     # submission time, so a second submission never aliases the first
     # batch's rows or slots.
     def _begin_job_slate(
-        self, job_ids: list[str], *, row_offset: int = 0
+        self, job_ids: list[str], *, row_offset: int = 0, row_map: dict[str, int] | None = None
     ) -> None:
         if not job_ids:
             return
@@ -2568,15 +3641,18 @@ class MainWindow(QMainWindow):
         # 0-based slate-parallel arrays (submission order), while cells
         # write at physical rows offset+index.
         self._batch_row_for_job: dict[str, int] = {
-            job_id: row_offset + index
+            job_id: row_map[job_id] if row_map is not None else row_offset + index
             for index, job_id in enumerate(self._batch_slots)
         }
+        for job, row in self._batch_row_for_job.items():
+            self._tag_row(row, job_id=job)
         if len(self._batch_row_for_job) != len(self._batch_slots):
             raise RuntimeError(
                 "batch row map seeding mismatch: "
                 f"{len(self._batch_row_for_job)} rows for "
                 f"{len(self._batch_slots)} job ids"
             )
+        self._degraded_jobs.clear()
         self.run_counts: list[str | None] = [None] * self.run_total
         self.run_summary = summarize_batch(self.run_counts)
         # v0.4.13 addendum (§3.2 BATCH_START): follow engages with
@@ -2637,18 +3713,28 @@ class MainWindow(QMainWindow):
         self._running_job_id = None
 
     def start_upscale(self) -> None:
+        if self._preflights or self._upscale_submitting or self._subs_submitting or self._ui_closed:
+            return
         if self.client.active_job_count() > 0 or self.job_ids:
             return
         if self.batch is None:
             return
         items = [item for item in self.batch.files if item.process_verdict == "ready"]
+        if any(item.report.path in self._uncertain_upscale_paths for item in items):
+            self._show_message("A previous submission is unresolved. Inspect Recent jobs before retrying these sources.")
+            return
         if not items:
             QMessageBox.information(self, "VidLift", "No files in this plan are ready to upscale.")
             return
-        try:
-            gbph = float(self.gbph.text())
-        except ValueError:
-            QMessageBox.warning(self, "VidLift", "GB/hour must be a number.")
+        if len(items) > MAX_FILES:
+            self._show_message(f"Submit at most {MAX_FILES} upscale files at once. Nothing was submitted.")
+            return
+        gbph = self._valid_size()
+        if gbph is None:
+            return
+        if self._plan_dirty or (self._planned_inputs is not None
+                                 and self._planned_inputs != self._current_plan_inputs()):
+            self._invalidate_plan()
             return
         options = {
             "target": "720p",
@@ -2676,27 +3762,58 @@ class MainWindow(QMainWindow):
             # sidecar v0.4.17 behavior), so a stale caller is safe.
             "suppress_srt": self.suppress_srt.isChecked(),
         }
+        engine = self.engine_choice
+        self._upscale_submitting = True
         try:
-            self.job_ids = self.client.enqueue_run(
-                [item.report.path for item in items],
-                options=options,
-                engine=self.engine_choice,
-            )
-        except (
-            BatchTooLarge,
-            FileNotFoundError,
-            BridgeError,
-            OSError,
-        ) as exc:
-            # v0.4.15.4 (F-13b): the enqueue writes jobs.json — a full or
-            # read-only state dir raises OSError, which used to escape
-            # the Qt slot (the documented crash-abort class on frozen
-            # builds). The client's contract intentionally surfaces IO
-            # as IO; this slot is the boundary where a dialog exists.
-            QMessageBox.warning(
-                self, "VidLift", f"could not record the batch: {exc}"
-            )
-            self.job_ids = []
+            if options["replace_source"] or options["suppress_srt"]:
+                effects = ", ".join(label for label, enabled in (
+                    ("Replace original file on success (only after verified backend success)", options["replace_source"]),
+                    ("Delete .srt sidecar after embed (only on successful embed; keep on embed failure)", options["suppress_srt"]),
+                ) if enabled)
+                if not self._confirm_options("Confirm upscale options", f"{len(items)} reviewed upscale job(s).\n" + "\n".join(
+                        f"{item.report.path} -> {item.output_path}: {effects}" for item in items)):
+                    return
+            # A review is a nested event loop: file/settings changes invalidate it.
+            if self._plan_dirty or self.batch is None or any(item not in self.batch.files for item in items):
+                self._show_message("The reviewed plan changed. Plan again before starting.")
+                return
+            self._submit_upscale_reviewed(items, options, engine)
+        finally:
+            self._upscale_submitting = False
+
+    def _submit_upscale_reviewed(self, items, options: dict, engine: str) -> None:
+        """Submit a frozen review, preserving accepted receipts on later errors."""
+        options = dict(options, batch_id=uuid.uuid4().hex)
+        accepted = []
+        self.job_ids = []
+        errors = []
+        for item in items:
+            result = self._submit_gui_job("run", item.report.path, options, engine)
+            ids = list(result.job_ids)
+            if result.state != "accepted" or result.error is not None:
+                cause = str(result.error or "no exact job receipt returned")
+                errors.append(f"{item.report.path}: {cause}" +
+                              ("; exact job recorded and tracked, do not resubmit" if ids else ""))
+                if result.state != "rejected" and not ids:
+                    self._uncertain_upscale_paths.add(item.report.path)
+                if not ids:
+                    for row in range(self.file_table.rowCount()):
+                        if self._row_meta(row).get("plan") == item:
+                            status = "submission unknown" if item.report.path in self._uncertain_upscale_paths else "not submitted"
+                            status_cell = self.file_table.item(row, 0)
+                            warning_cell = self.file_table.item(row, 7)
+                            if status_cell is not None:
+                                status_cell.setText(status)
+                            if warning_cell is not None:
+                                warning_cell.setText(cause)
+                            self._tag_row(row, submission_error=cause)
+            if ids:
+                self.job_ids.extend(ids)
+                accepted.extend([item] * len(ids))
+        if errors:
+            self._show_message("Some submissions failed or are unresolved:\n" + "\n".join(errors))
+            QMessageBox.warning(self, "Could not record all jobs", "\n".join(errors)[:2000])
+        if not self.job_ids:
             return
         self.engine_combo.setEnabled(False)
         self.engine_combo.setToolTip("Engine is fixed once a batch starts; cancel to change it.")
@@ -2709,7 +3826,14 @@ class MainWindow(QMainWindow):
         # both flows; the upscale tail keeps its engine/profile locks
         # between enqueue and the shared slate build. Plan rows start at
         # physical row 0 (render_batch rebuilt the table).
-        self._begin_job_slate(self.job_ids, row_offset=0)
+        row_map = {
+            job: next((row for row in range(self.file_table.rowCount())
+                       if self._row_meta(row).get("plan") == item), index)
+            for index, (job, item) in enumerate(zip(self.job_ids, accepted))
+        }
+        self._begin_job_slate(self.job_ids, row_map=row_map)
+        for job, row in self._batch_row_for_job.items():
+            self._tag_row(row, submitted_options=dict(options), submitted_engine=engine, job_id=job)
 
     def cancel_upscale(self) -> None:
         """Cancel the RUNNING job only (v0.4.15.4, F-13c): 'Current'
@@ -2762,6 +3886,7 @@ class MainWindow(QMainWindow):
         )
 
     def _sync_run_controls(self) -> None:
+        self._sync_staged_controls()
         # v0.4.15.4 (F-13c): "Cancel Current" is enabled iff THIS window
         # owns a RUNNING job (the tracked running id). The old
         # active_job_count() rule counted QUEUED work — a queued-only
@@ -2786,7 +3911,7 @@ class MainWindow(QMainWindow):
             self.start_button.setEnabled(False)
             self.plan_button.setEnabled(False)
         elif not self.job_ids:
-            self.plan_button.setEnabled(True)
+            self.plan_button.setEnabled(not self._preflights)
             self._update_start_enabled()
 
     # ---- 1 Hz tick: single writer for time labels (sibling port) ----
@@ -2806,7 +3931,11 @@ class MainWindow(QMainWindow):
     def _poll_jobs(self) -> None:
         """Read the shared registry once a second and re-render every
         row/stage widget from its snapshot (the GUI is a view)."""
-        snapshots = self.client.enqueue_snapshots(self.job_ids)
+        try:
+            snapshots = list(self.client.enqueue_snapshots(self.job_ids) or [])
+        except Exception as exc:
+            self._show_message(f"Job status unavailable: {exc}. Jobs remain tracked; checking again next tick.")
+            return
         still_active: list[str] = []
         terminal_notes: list[str] = []
         # v0.4.13 addendum ITEM 2 (§3.3-g): the RUNNING identity observed
@@ -2825,7 +3954,10 @@ class MainWindow(QMainWindow):
             self._log_rendered_key = rendered_key
             if rendered_key is not None:
                 self._log_force_pin_next = True
-        for index, (job_id, snapshot) in enumerate(zip(self.job_ids, snapshots)):
+        for index, job_id in enumerate(self.job_ids):
+            snapshot = snapshots[index] if index < len(snapshots) else None
+            if snapshot is not None and snapshot.get("job_id", job_id) != job_id:
+                snapshot = None
             # v0.4.12 (item 1): the cell row comes from the STABLE
             # job_id->row map seeded at start, never from this loop index —
             # terminal jobs drain from self.job_ids every tick, so surviving
@@ -3204,6 +4336,8 @@ class MainWindow(QMainWindow):
 
     def _consume_terminal_snapshot(self, row: int | None, snapshot: dict) -> None:
         state = snapshot.get("state") or "finished"
+        if state == "succeeded" and snapshot.get("engine_simulated") and snapshot.get("job_id"):
+            self._degraded_jobs.add(snapshot["job_id"])
         # v0.4.10-fix (D2): the truth slate is keyed by the STABLE job
         # identity (submission order), never by the shifting table row:
         # terminal jobs drain from self.job_ids each tick, so surviving
@@ -3281,6 +4415,9 @@ class MainWindow(QMainWindow):
         total = max(1, self.run_total)
         self.progress.setValue(min(summary.resolved, total))
         self.progress.setFormat(_batch_format(summary))
+        if getattr(self, "_system_colours", False):
+            self.progress.setStyleSheet("")
+            return
         color = self._batch_bar_palette(summary)
         if color != self._progress_chunk_color:
             self._progress_chunk_color = color
@@ -3820,41 +4957,168 @@ class MainWindow(QMainWindow):
         self.denoise_combo.setToolTip(DENOISE_TOOLTIP)
         self._render_recent_jobs()
         self._sync_run_controls()
-        if any("cancelled" in note for note in notes):
+        outcomes = getattr(self, "run_counts", []) or []
+        summary = summarize_batch(outcomes)
+        if summary.pending or not summary.total:
+            self._set_summary("Batch ended; some outcomes are unknown", _batch_format(summary))
+        elif "failed" in outcomes and "cancelled" in outcomes:
+            self._set_summary("Batch finished with cancellations and failures", _batch_format(summarize_batch(outcomes)))
+        elif "cancelled" in outcomes:
             self._set_summary("Batch cancelled", "Completed jobs are safe; see the row statuses.")
-        elif any("failed" in note for note in notes):
+        elif "failed" in outcomes:
             self._set_summary(
                 "Batch finished with failures",
                 "See the selected row and .vidlift-runs logs for details.",
             )
+        elif self._degraded_jobs:
+            self._set_summary("Batch completed with no-AI output", f"{len(self._degraded_jobs)} file(s) completed without AI upscale. Review per-file details.")
         else:
             self._set_summary("Batch finished successfully", "Outputs are beside each source (or the chosen output folder).")
 
     # -- recent-history surface (design §1.9: one registry, two readers) --
 
     def _render_recent_jobs(self) -> None:
+        selected_job = None
+        if hasattr(self, "history_table"):
+            selection = self.history_table.selectionModel()
+            rows = selection.selectedRows() if selection is not None else []
+            if rows:
+                cell = self.history_table.item(rows[0].row(), 0)
+                selected_job = cell.data(Qt.ItemDataRole.UserRole) if cell is not None else None
         try:
             history = self.client.history(limit=8)
         except Exception:
             history = []
         self._recent_rows = history
+        if hasattr(self, "history_table"):
+            blocked = self.history_table.blockSignals(True)
+            self.history_table.setRowCount(len(history))
+            for row, record in enumerate(history):
+                for col, key in enumerate(("state", "file_path", "error")):
+                    cell = QTableWidgetItem(str(record.get(key) or ""))
+                    if col == 0:
+                        cell.setData(Qt.ItemDataRole.UserRole, record.get("job_id"))
+                    cell.setToolTip(cell.text())
+                    self.history_table.setItem(row, col, cell)
+            selected_row = next((index for index, record in enumerate(history)
+                                 if selected_job is not None and record.get("job_id") == selected_job), None)
+            if selected_row is not None:
+                self.history_table.selectRow(selected_row)
+            else:
+                self.history_table.clearSelection()
+            self.history_table.blockSignals(blocked)
+            if self.queue_tabs.currentIndex() == 1:
+                if selected_row is not None:
+                    self._select_history()
+                else:
+                    self._set_details_text("RECENT JOB (read only)\n\nSelect a recorded job.")
+
+    def _select_history(self) -> None:
+        rows = self.history_table.selectionModel().selectedRows()
+        if rows and rows[0].row() < len(self._recent_rows):
+            record = self._recent_rows[rows[0].row()]
+            self._set_details_text("RECENT JOB (read only)\n\n" + "\n".join(
+                f"{key}: {value}" for key, value in record.items() if value is not None))
+
+    def _queue_tab_changed(self, index: int) -> None:
+        self._set_details_text("Select a recorded job." if index == 1 else "Select a current video row.")
+        if index == 1:
+            self._select_history()
+        else:
+            self._render_detail_for_row()
+
+    def _selected_record(self) -> dict:
+        if self.queue_tabs.currentIndex() == 1:
+            rows = self.history_table.selectionModel().selectedRows()
+            return self._recent_rows[rows[0].row()] if rows and rows[0].row() < len(self._recent_rows) else {}
+        rows = self.file_table.selectionModel().selectedRows()
+        if not rows:
+            return {}
+        row = rows[0].row()
+        job = next((job for job, position in self._batch_row_for_job.items() if position == row), None)
+        if job is not None:
+            try:
+                return self.client.status_snapshot(job) or {}
+            except Exception:
+                return {}
+        item = self.file_table.item(row, 1)
+        return {"file_path": item.text()} if item else {}
+
+    def _copy_source_path(self) -> None:
+        source = self._selected_record().get("file_path")
+        if source:
+            QApplication.clipboard().setText(str(source))
+
+    def _copy_table_cells(self, table: QTableWidget) -> None:
+        selected = table.selectedIndexes()
+        rows = sorted({index.row() for index in selected})
+        columns = sorted({index.column() for index in selected})
+        indices = {(index.row(), index.column()) for index in selected}
+        if indices:
+            QApplication.clipboard().setText("\n".join("\t".join(
+                table.item(row, col).text() if (row, col) in indices and table.item(row, col) else ""
+                for col in columns) for row in rows))
+
+    def _copy_output_path(self) -> None:
+        output = self._selected_record().get("output_path")
+        if output:
+            QApplication.clipboard().setText(str(output))
+        else:
+            self._show_message("No recorded output path is available. A planned destination is not a finished output.")
+
+    def _open_recorded_path(self, key: str) -> None:
+        # A plan is not proof that an output exists. No shell interpolation.
+        raw = self._selected_record().get(key)
+        if not raw and self.queue_tabs.currentIndex() == 1:
+            job = self._selected_record().get("job_id")
+            if job:
+                try:
+                    raw = (self.client.status_snapshot(job) or {}).get(key)
+                except Exception as exc:
+                    self._show_message(f"Recorded job details are unavailable: {exc}")
+                    return
+        try:
+            path = Path(raw).resolve() if raw and Path(raw).is_file() else None
+        except (OSError, RuntimeError) as exc:
+            self._show_message(f"Cannot access the recorded file: {exc}")
+            return
+        if path is None:
+            self._show_message("No existing recorded file is available for this action.")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent if key == "output_path" else path))):
+            self._show_message("The system could not open this local path.")
+
+    def _stage_subtitle_drop(self, paths: list[str]) -> None:
+        self._request_ingestion(paths, subtitles=True)
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         """Cancel through the unified path, then give the worker the
         same 30 s ffmpeg terminate window the sibling validated; a
         QThread/worker that ignores cancel for 30 s is the documented
         last-resort terminate case."""
+        if self._subs_submitting or self._upscale_submitting:
+            event.ignore()
+            self._show_message("Finish or dismiss the submission review before closing.")
+            return
+        if getattr(self, "_subs_model_installing", False):
+            event.ignore()
+            self._show_message("Subtitle model installation is still running. Wait for it to finish before closing.")
+            return
         had_active = bool(self.job_ids) or self.client.active_job_count() > 0
         if had_active:
             answer = QMessageBox.question(
                 self,
                 "Run in progress",
-                "An upscale is still running. Close anyway? (It will stop.)",
+                "Submitted video/subtitle jobs are queued or running. Closing requests a stop. "
+                "Unsent staged files will be discarded, not deleted. Close anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self.cancel_upscale()
+            for job_id in list(self.job_ids):
+                self.client.cancel(job_id)
             # Wait (bounded) for the registry to reach terminal states.
             deadline = time.monotonic() + _CLOSE_WAIT_RUN_MS / 1000
             while self.job_ids and time.monotonic() < deadline:
@@ -3866,6 +5130,18 @@ class MainWindow(QMainWindow):
                 ):
                     break
                 time.sleep(0.05)
+        elif self._staged_subs or self.files:
+            if QMessageBox.question(
+                    self, "Unsent video files", "Discard unsent staging and close? No media will be deleted.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        self._settings().setValue("ui/window_geometry", self.saveGeometry())
+        self._settings().setValue("ui/details_splitter", self.details_splitter.saveState())
+        self._ui_closed = True
+        for _inputs, cancel, _signals in self._preflights.values():
+            cancel.set()
         self.client.stop()
         # v0.4.10 (R1): stop the GPU meter's cadence before teardown —
         # no probe runs past app close; a hung child dies at its own
@@ -3887,44 +5163,21 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, event: QDropEvent) -> None:
         paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
-        expanded: list[str] = []
-        for path in paths:
-            candidate = Path(path)
-            if candidate.is_dir():
-                # v0.4.18 (WS1 drop parity, spec deviation 1): a dropped
-                # folder walks the SAME shared recursive collector the
-                # Add Folder buttons use — one ingestion traversal, one
-                # count policy (the F-13a parity principle). The old
-                # one-level iterdir() silently skipped every file a
-                # level down — pre-existing behavior, newly absurd next
-                # to recursive Add Folder; episodes directly inside a
-                # dropped show root still queue exactly as before.
-                expanded.extend(collect_video_files(candidate))
-            else:
-                expanded.append(str(candidate))
-        # v0.4.15.4 (F-13a): the drop path enforces the SAME MAX_FILES
-        # cap add_folder enforces — one batch-size policy, and the modal
-        # names the limit (a silent truncation would teach users to
-        # re-drop; the sibling's wording generalized to the drop case).
-        # v0.4.18: the walk is recursive now (WS1), so the wording names
-        # the tree ("subfolders included", S-6), matching the folder
-        # pickers' guard.
-        if len(expanded) > MAX_FILES:
-            QMessageBox.warning(
-                self,
-                "VidLift",
-                f"That drop holds {len(expanded)} videos (subfolders "
-                f"included); add at most {MAX_FILES} at once.",
-            )
-            return
-        self._add_paths(expanded)
+        self._request_ingestion(paths, subtitles=self.workflow_tabs.currentWidget() is self.subs_setup_scroll)
+        event.acceptProposedAction()
+
+    def raise_for_single_instance(self) -> None:
+        if not self._ui_closed:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
 
 
 def main(argv: list[str] | None = None) -> int:
     # QSettings canonical path BEFORE MainWindow (design §2 rule for
     # run_gui.py applies to every entry: direct `python -m` runs too).
     QApplication.setApplicationName("VidLift")
-    QApplication.setOrganizationName("YetiWurks")
+    QApplication.setOrganizationName(os.environ.get("VIDLIFT_SETTINGS_ORG") or "YetiWurks")
 
     def _shutdown() -> None:
         from .monitor import stop_server as _stop_monitor
@@ -3940,10 +5193,23 @@ def main(argv: list[str] | None = None) -> int:
         _stop_monitor()
 
     app = QApplication(list(argv or sys.argv[1:]))
+    from .ui.single_instance import SingleInstanceGuard
+    guard = SingleInstanceGuard()
+    if not guard.start(app):
+        if guard.status == "signalled":
+            return 0
+        if sys.stderr is not None:
+            print(guard.error, file=sys.stderr)
+        QMessageBox.critical(None, "VidLift cannot start", guard.error or "Local IPC ownership could not be established.")
+        return 1
     app.aboutToQuit.connect(_shutdown)
     window = MainWindow()
+    guard.on_raise = window.raise_for_single_instance
     window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        guard.close()
 
 
 if __name__ == "__main__":

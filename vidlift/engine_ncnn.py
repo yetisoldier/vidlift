@@ -63,6 +63,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import secrets
 import shlex
 import shutil
 import struct
@@ -73,6 +74,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1789,8 +1791,21 @@ class NcnnVulkanEngine(EngineAdapter):
                     f"for {held_seconds:.0f}s"
                 )
 
+        def _gpu_lock_unavailable(reason: str) -> None:
+            # v0.4.20 (ADR-3): the wait label distinguishes "waiting on a
+            # live owner pid N" from "lock unavailable (<reason>)" — the
+            # degrade-open decision names its cause, never a bare stall.
+            if self.on_step is not None:
+                self._step(
+                    f"GPU phase lock unavailable ({reason}) — continuing "
+                    "without cross-process GPU serialization"
+                )
+
         gpu_lock = _gpu_phase_lock()
-        lock_acquired = gpu_lock.acquire(on_wait=_gpu_wait_label)
+        lock_acquired = gpu_lock.acquire(
+            on_wait=_gpu_wait_label, on_unavailable=_gpu_lock_unavailable,
+            should_cancel=cancel,
+        )
         if not lock_acquired:
             # degrade-open (the design's honesty rule): the filesystem
             # refused atomic create (or the deadline expired), so the
@@ -2277,140 +2292,578 @@ def _source_stat(path: str | Path) -> dict:
         return {"size": None, "mtime_ns": None}
 
 
-class GpuPhaseLock:
+# ---- v0.4.20 (ADR-3 / S2): platform liveness + creation-time seams ----
+# Both are injectable so tests drive either platform's semantics from a
+# Linux host. The defaults below are the production implementations.
+
+def _posix_liveness_probe(pid: int) -> bool | None:
+    """kill(0) tri-state (F1): success=alive, ESRCH=dead, EPERM=unknown.
+
+    PermissionError means the process EXISTS but is not ours — that is
+    live-conservative evidence, NEVER death. Returning False here was
+    the F1 defect: a sweep could delete another user's live lock."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    except OSError:
+        return None
+
+
+def _windows_kernel32():
+    """Declare pointer-width-safe Win32 signatures before using HANDLEs."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.c_void_p] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    return kernel
+
+
+def _windows_liveness_probe(pid: int) -> bool | None:
+    """OpenProcess-based liveness (the Windows equivalent of kill-0).
+
+    Access-denied maps to None (alive/unknown), never dead — the same
+    F1 rule as POSIX EPERM."""
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_INVALID_PARAMETER = 87
+    try:
+        kernel32 = _windows_kernel32()
+    except (OSError, AttributeError):
+        # no WinDLL on this build — unknown, never death
+        return None
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+    )
+    if not handle:
+        # no such process vs access denied — only the former is death
+        return False if ctypes.get_last_error() == ERROR_INVALID_PARAMETER else None
+    try:
+        from ctypes import wintypes
+        status = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(status)):
+            return None
+        return status.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _default_liveness_probe(pid: int) -> bool | None:
+    """The production liveness probe: per-platform, tri-state.
+
+    ``True`` alive / ``False`` dead / ``None`` unknown-live-conservative.
+    Every caller treats ``None`` as "do not reclaim"."""
+    if os.name == "nt":
+        return _windows_liveness_probe(pid)
+    return _posix_liveness_probe(pid)
+
+
+def _default_process_creation_time(pid: int) -> dict:
+    """The process creation-time fact for PID-reuse detection.
+
+    Windows: GetProcessTimes' creation FILETIME (100 ns epochs since
+    1601). POSIX/dev platforms cannot supply a comparable fact — the
+    honest ``{"kind": "unavailable"}`` keeps liveness on probe semantics
+    and makes live-but-unverifiable holders never reclaimable before
+    the deadline (conservative, per D5: not false proof of death)."""
+    if os.name != "nt":
+        return {"kind": "unavailable"}
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", ctypes.c_uint32),
+                    ("dwHighDateTime", ctypes.c_uint32)]
+
+    try:
+        kernel32 = _windows_kernel32()
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return {"kind": "unavailable"}
+        try:
+            creation = _FILETIME()
+            exit_t = _FILETIME()
+            kernel_t = _FILETIME()
+            user_t = _FILETIME()
+            ok = kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation), ctypes.byref(exit_t),
+                ctypes.byref(kernel_t), ctypes.byref(user_t),
+            )
+            if not ok:
+                return {"kind": "unavailable"}
+            value = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            return {"kind": "windows_filetime", "value": int(value)}
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001 - any probe fault degrades to unavailable
+        return {"kind": "unavailable"}
+
+
+class _LegacyGpuPhaseLock:
     """v0.4.9 (design §2.2): the cross-process GPU-phase file lock.
 
-    One lock file ``<state_dir>/.gpu-phase.lock`` per MACHINE (the
-    state dir is machine-wide by construction — the same root the
-    benchmark cache and job registry use), acquired by the ENGINE at
+    Legacy, private per-user file protocol, retained for migration tests.
+    NOT machine-wide and NOT safe against non-cooperating replacement.
+    The old protocol was acquired by the ENGINE at
     the top of the upscale chunk loop and released after the chunk
     loop's concat/gates. Probe/probe-count/prepare/encode/OCR stay
     concurrent (CPU-only phases); a second process's upscale WAITS
     with a visible step label instead of time-sharing the GPU.
 
-    Advisory O_EXCL create + holder pid; a holder dead longer than the
-    stale window (or a lock file with no live holder) is swept. A
-    filesystem that refuses atomic create (some SMB/NTFS shares)
-    degrades OPEN: logged WARNING + unlocked execution, never a hang.
+    Advisory O_EXCL create + holder identity. v0.4.20 (ADR-3): the
+    record is versioned JSON (schema 2) carrying pid, created_at,
+    heartbeat_at, owner_token and the process creation-time fact; the
+    legacy v1 text format (pid/timestamp/token) stays readable — live
+    PID retained, dead PID reclaimable. Reclamation requires PROOF of
+    death: a tri-state liveness probe whose access-denied arm is
+    unknown-never-dead (F1), plus creation-time mismatch for PID reuse;
+    removal is rename-to-quarantine then unlink (F3 — no replace-then-
+    delete window). A filesystem that refuses atomic create degrades
+    OPEN: logged WARNING + unlocked execution, never a hang.
     """
 
     HEARTBEAT_SECONDS = 10.0
+    # Production acquisition is bounded: a stale/unreadable lock must not
+    # leave an upscale waiting forever. Callers may pass a shorter deadline.
+    DEFAULT_DEADLINE_SECONDS = 15 * 60
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._fd: int | None = None
+        self._owner_token: str | None = None
+        # Injectable platform seams (tests drive either platform's
+        # semantics from Linux; production defaults are the real probes).
+        self._liveness_probe = _default_liveness_probe
+        self._creation_time_fn = _default_process_creation_time
+        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_stop = threading.Event()
+        self._mutation_thread_lock = threading.RLock()
 
-    def _holder_alive(self, pid: int) -> bool:
+    @contextmanager
+    def _mutation(self, timeout=2.0):
+        """Serialize create/check/rename/restore across cooperating processes.
+
+        The sidecar inode is persistent. Never unlink it: doing so permits
+        two contenders to lock different inodes. This is advisory, not a
+        security boundary against actors replacing the mutex inode itself.
+        """
+        from .file_mutex import FileMutex
+        with self._mutation_thread_lock:
+            mutex = FileMutex(self.path.with_name(self.path.name + ".mutation"))
+            try:
+                acquired = mutex.acquire(timeout)
+            except OSError:
+                acquired = False
+            try:
+                yield acquired
+            finally:
+                mutex.release()
+
+    # ---- record I/O -------------------------------------------------
+
+    def _write_record(self, token: str) -> None:
+        """Write the v2 JSON record through our exclusive fd."""
+        assert self._fd is not None
+        now = time.time()
+        record = {
+            "schema_version": self.SCHEMA_VERSION,
+            "pid": os.getpid(),
+            "created_at": now,
+            "heartbeat_at": now,
+            "owner_token": token,
+            "creation_time": self._creation_time_fn(os.getpid()),
+        }
         try:
-            os.kill(pid, 0)
-            return True
-        except (OSError, ProcessLookupError):
+            data = memoryview(json.dumps(record).encode("utf-8"))
+            while data:
+                try:
+                    written = os.write(self._fd, data)
+                except InterruptedError:
+                    continue
+                if written <= 0:
+                    raise OSError("zero-progress record write")
+                data = data[written:]
+            os.fsync(self._fd)
+        except OSError:
+            raise  # an unwritten record is not successful ownership
+
+    def _read_record(self, path: Path | None = None) -> dict | None:
+        """Parse the on-disk record (v2 JSON or legacy v1 text).
+
+        Returns a normalized dict with keys schema_version, pid,
+        created_at, heartbeat_at, owner_token, creation_time — or None
+        when malformed/unreadable (the conservative-retain signal; the
+        wait loop times out and reports ``unreadable_lock``, never a
+        destructive guess)."""
+        try:
+            raw = (path or self.path).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return None
+        if not raw:
+            return None
+        if raw.startswith("{"):
+            try:
+                data = json.loads(raw)
+            except (ValueError, TypeError):
+                return None
+            if not isinstance(data, dict):
+                return None
+            pid = data.get("pid")
+            token = data.get("owner_token")
+            if data.get("schema_version") != 2 or not isinstance(pid, int) \
+                    or isinstance(pid, bool) or pid <= 0 \
+                    or not isinstance(token, str) or len(token) != 32 \
+                    or any(c not in "0123456789abcdef" for c in token):
+                return None
+            creation_time = data.get("creation_time")
+            if not isinstance(creation_time, dict):
+                return None
+            if creation_time.get("kind") not in {"unavailable", "windows_filetime"}:
+                return None
+            if creation_time["kind"] == "windows_filetime" and (
+                not isinstance(creation_time.get("value"), int)
+                or isinstance(creation_time.get("value"), bool)
+                or creation_time["value"] < 0
+            ):
+                return None
+            for key in ("created_at", "heartbeat_at"):
+                value = data.get(key)
+                if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+                    return None
+
+            return {
+                "schema_version": 2,
+                "pid": pid,
+                "created_at": float(data["created_at"]),
+                "heartbeat_at": float(data["heartbeat_at"]),
+                "owner_token": token,
+                "creation_time": creation_time,
+            }
+        # legacy v1: "pid\ntimestamp\n[token]" (token optional)
+        lines = raw.splitlines()
+        try:
+            pid = int(lines[0])
+            if pid <= 0:
+                return None
+        except (ValueError, IndexError):
+            return None
+        token = lines[2].strip() if len(lines) >= 3 and lines[2].strip() else None
+        try:
+            created_at = float(lines[1])
+            if not math.isfinite(created_at):
+                return None
+        except (ValueError, IndexError):
+            return None
+        return {
+            "schema_version": 1,
+            "pid": pid,
+            "created_at": created_at,
+            "heartbeat_at": created_at,
+            "owner_token": token,
+            "creation_time": {"kind": "unavailable"},
+        }
+
+    def _read_holder_pid(self) -> int | None:
+        record = self._read_record()
+        return record["pid"] if record else None
+
+    # ---- liveness / reclamation -------------------------------------
+
+    def _holder_alive(self, pid: int) -> bool | None:
+        """Tri-state holder liveness (F1). ``None`` = unknown — every
+        caller treats it as "do not reclaim"."""
+        try:
+            return self._liveness_probe(pid)
+        except ProcessLookupError:
             return False
+        except OSError:
+            return None
+
+    def _pid_reused(self, record: dict) -> bool:
+        """True only on PROOF of PID reuse: the holder is alive AND both
+        the recorded and live creation times are available (same kind)
+        AND they differ. Any unverifiable arm returns False — a live
+        but unverifiable holder is never reclaimed before the deadline."""
+        if self._holder_alive(record["pid"]) is not True:
+            return False
+        recorded = record.get("creation_time") or {}
+        if recorded.get("kind") in (None, "unavailable"):
+            return False
+        live = self._creation_time_fn(record["pid"])
+        if live.get("kind") != recorded.get("kind"):
+            return False
+        if live.get("value") is None or recorded.get("value") is None:
+            return False
+        return live["value"] != recorded["value"]
+
+    def _read_quarantined_record(self, quarantine: Path) -> dict | None:
+        return self._read_record(path=quarantine)
+
+    def _quarantine_remove(
+        self, expected_token: str | None, expected_pid: int | None = None
+    ) -> bool:
+        with self._mutation() as acquired:
+            if not acquired:
+                return False
+            return self._quarantine_remove_guarded(expected_token, expected_pid)
+
+    def _quarantine_remove_guarded(
+        self, expected_token: str | None, expected_pid: int | None = None, *, expected_record=None
+    ) -> bool:
+        """Remove the lock via rename-to-quarantine then unlink (F3).
+
+        The rename closes the replace-then-delete window of a plain
+        unlink; post-rename identity verification closes the rest — if
+        a new owner acquired between our check and removal, the
+        quarantined copy carries THEIR token/pid: it is restored to the
+        lock path (best effort) and we stop. Returns True when the path
+        is clear afterwards; False when someone else owns it."""
+        for _ in range(2):
+            quarantine = self.path.with_name(
+                f"{self.path.name}.quarantine-{os.getpid()}-"
+                f"{secrets.token_hex(4)}"
+            )
+            try:
+                self.path.rename(quarantine)
+            except FileNotFoundError:
+                # gone between check and rename — re-read decides
+                record = self._read_record()
+                if record is None:
+                    return True  # path clear, nobody owns it
+                if expected_token is not None \
+                        and record["owner_token"] == expected_token:
+                    continue  # our token still matches — retry once
+                return False  # a different owner acquired — stop
+            except OSError:
+                return False
+            moved = self._read_quarantined_record(quarantine)
+            if moved is None or (expected_record is not None and moved != expected_record) or (
+                (expected_token is not None
+                 and moved["owner_token"] != expected_token)
+                or (expected_token is None
+                    and expected_pid is not None
+                    and moved["pid"] != expected_pid)
+            ):
+                # a different owner's record was at the path — restore it
+                try:
+                    # Atomic no-clobber restore. If a non-cooperating C
+                    # created a record in the gap, retain C AND quarantined B.
+                    os.link(quarantine, self.path)
+                except OSError:
+                    return False  # preserve displaced record for diagnosis
+                quarantine.unlink(missing_ok=True)
+                return False
+            try:
+                os.unlink(quarantine)
+            except OSError:
+                pass  # best-effort; the name is out of the lock path
+            return True
+        return False
 
     def _sweep_stale(self) -> bool:
-        """Remove the lock file when its holder is provably gone.
-        Returns True when the path is clear afterwards. Read errors
-        conservatively leave the file (the wait loop times out
-        eventually; never a destructive guess)."""
+        with self._mutation() as acquired:
+            return self._sweep_stale_guarded() if acquired else False
+
+    def _sweep_stale_guarded(self) -> bool:
+        """Remove the lock when its holder is PROVABLY gone (dead PID or
+        proven PID reuse). Unreadable records and live/unknown holders
+        are conservatively left — the wait loop times out eventually;
+        never a destructive guess."""
+        record = self._read_record()
+        if record is None:
+            return False  # unreadable holder info: not provably stale
+        alive = self._holder_alive(record["pid"])
+        if alive is False or (alive is True and self._pid_reused(record)):
+            return self._quarantine_remove_guarded(
+                record.get("owner_token"), record["pid"], expected_record=record
+            )
+        return False
+
+    # ---- heartbeat ---------------------------------------------------
+
+    def _touch_heartbeat(self) -> None:
+        with self._mutation() as acquired:
+            if acquired:
+                self._touch_heartbeat_guarded()
+
+    def _touch_heartbeat_guarded(self) -> None:
+        """Renew ``heartbeat_at`` while holding — only when the on-disk
+        token is still ours (a replaced record belongs to someone else).
+        Rewrites through our own exclusive fd (same inode; a transient
+        partial read by another process degrades to conservative-retain,
+        which can never reclaim a live holder)."""
+        if self._fd is None or self._owner_token is None:
+            return
+        record = self._read_record()
+        if record is None or record["owner_token"] != self._owner_token:
+            return
         try:
-            raw = self.path.read_text(encoding="utf-8").strip()
-            pid = int(raw.split("\n")[0])
-        except (OSError, ValueError, IndexError):
-            # unreadable holder info: not provably stale
-            return False
-        if self._holder_alive(pid):
-            return False
-        try:
-            self.path.unlink()
-            return True
+            data = dict(record)
+            data["heartbeat_at"] = time.time()
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            os.ftruncate(self._fd, 0)
+            os.write(self._fd, json.dumps(data).encode("utf-8"))
         except OSError:
-            return False
+            pass
+
+    def _start_heartbeat(self) -> None:
+        self._heartbeat_stop.clear()
+
+        def _loop() -> None:
+            while not self._heartbeat_stop.wait(self.HEARTBEAT_SECONDS):
+                self._touch_heartbeat()
+
+        self._heartbeat_thread = threading.Thread(
+            target=_loop, name="gpu-phase-lock-heartbeat", daemon=True
+        )
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        thread, self._heartbeat_thread = self._heartbeat_thread, None
+        if thread is not None:
+            self._heartbeat_stop.set()
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+
+    # ---- acquire / release -------------------------------------------
 
     def acquire(
         self,
         *,
         on_wait=None,
         deadline_seconds: float | None = None,
+        on_unavailable=None,
     ) -> bool:
         """Acquire the lock, polling with the heartbeat cadence.
 
         ``on_wait(holder_pid, held_seconds)`` is the visibility seam —
-        the engine passes its step label so the wait is surfaced ("...")",
-        never a silent stall. ``deadline_seconds`` (None = wait
-        indefinitely, the production shape; tests pass finite bounds)
-        bounds the total wait. Returns True when acquired; False only
-        when a deadline elapsed (and the caller degrades open with its
-        WARNING)."""
-        from .benchmark import state_dir
+        the engine passes its step label so the wait is surfaced, never
+        a silent stall. ``deadline_seconds`` defaults to a finite bound;
+        tests/callers may pass a shorter bound.
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        v0.4.20 (ADR-3): ``on_unavailable(reason)`` fires when bounded
+        waiting ends without acquisition — reason is one of
+        ``"create_refused"``, ``"unreadable_lock"``,
+        ``"deadline_exceeded_live_owner"`` — so callers can distinguish
+        "timed out on a live owner" from filesystem/record faults.
+        Default None preserves the bool-only contract."""
+        if deadline_seconds is None:
+            deadline_seconds = self.DEFAULT_DEADLINE_SECONDS
+        if not math.isfinite(deadline_seconds) or deadline_seconds < 0:
+            raise ValueError("GPU phase-lock deadline must be finite and nonnegative")
         started = time.monotonic()
-        next_heartbeat = 0.0
+        self.last_unavailable = None
+
+        def unavailable(reason):
+            self.last_unavailable = reason
+            if on_unavailable is not None:
+                on_unavailable(reason)
+            return False
+
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return unavailable("create_refused")
         while True:
-            try:
-                fd = os.open(
-                    str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY
-                )
-            except FileExistsError:
-                pass
-            except OSError:
-                # the filesystem refuses atomic create (some SMB/NTFS
-                # shares): degrade OPEN, never a hang
-                self._fd = None
-                return False
-            else:
+            remaining = max(0.0, deadline_seconds - (time.monotonic() - started))
+            with self._mutation(timeout=min(2.0, remaining)) as guarded:
+                if not guarded:
+                    return unavailable("create_refused")
+                # A displaced, unrestored owner is unknown ownership. Do not
+                # create a rival while a quarantine record requires recovery.
+                if any(self.path.parent.glob(self.path.name + ".quarantine-*")):
+                    return unavailable("unreadable_lock")
                 try:
-                    os.write(
-                        fd,
-                        f"{os.getpid()}\n{time.time()}\n".encode("utf-8"),
-                    )
+                    fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    fd = None
                 except OSError:
-                    pass
-                self._fd = fd
-                return True
-            # lock held: stale check, then visible wait
-            if self._sweep_stale():
+                    return unavailable("create_refused")
+                if fd is not None:
+                    self._fd = fd
+                    created = os.fstat(fd)
+                    self._owner_token = secrets.token_hex(16)
+                    try:
+                        self._write_record(self._owner_token)
+                    except OSError:
+                        reason = "create_refused"
+                        try:
+                            current = self.path.lstat()
+                            if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                                self.path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            reason = "record_cleanup_failed"
+                        finally:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                reason = "record_cleanup_failed"
+                            self._fd = None
+                            self._owner_token = None
+                        return unavailable(reason)
+                    self._start_heartbeat()
+                    return True
+                swept = self._sweep_stale_guarded()
+                record = self._read_record()
+            if swept and time.monotonic() - started < deadline_seconds:
                 continue
+            unavailable_cause = (
+                "unreadable_lock" if record is None
+                else "deadline_exceeded_live_owner"
+            )
             if on_wait is not None:
-                holder_pid = self._read_holder_pid()
+                holder_pid = record["pid"] if record else None
                 on_wait(holder_pid, time.monotonic() - started)
             if (
                 deadline_seconds is not None
                 and time.monotonic() - started >= deadline_seconds
             ):
-                return False
-            if deadline_seconds is None:
-                time.sleep(self.HEARTBEAT_SECONDS)
-            else:
-                # never overshoot a bounded wait by a full heartbeat
-                remaining = deadline_seconds - (
-                    time.monotonic() - started
-                )
-                time.sleep(max(0.0, min(self.HEARTBEAT_SECONDS, remaining)))
-
-    def _read_holder_pid(self) -> int | None:
-        try:
-            raw = self.path.read_text(encoding="utf-8").strip()
-            return int(raw.split("\n")[0])
-        except (OSError, ValueError, IndexError):
-            return None
+                return unavailable(unavailable_cause)
+            remaining = deadline_seconds - (time.monotonic() - started)
+            time.sleep(max(0.0, min(0.1, remaining)))
 
     def release(self) -> None:
-        """Release idempotently; an OSError on unlink is swallowed
-        (the sweep and age rules clean it up; never fatal to the run)."""
+        """Release idempotently; an OSError on removal is swallowed
+        (the sweep and age rules clean it up; never fatal to the run).
+        v0.4.20: stops+joins the heartbeat thread first, then removes
+        via rename-to-quarantine only when our token still owns the
+        record — a replaced lock survives (F3)."""
+        self._stop_heartbeat()
         if self._fd is not None:
             try:
                 os.close(self._fd)
             except OSError:
                 pass
             self._fd = None
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
+        token, self._owner_token = self._owner_token, None
+        if token is not None:
+            with self._mutation() as acquired:
+                if acquired:
+                    record = self._read_record()
+                    if record is not None and record["owner_token"] == token:
+                        self._quarantine_remove_guarded(token, record["pid"], expected_record=record)
 
     def __enter__(self):
-        self.acquire()
+        if not self.acquire():
+            raise RuntimeError("GPU phase lock unavailable")
         return self
 
     def __exit__(self, *exc_info):
@@ -2418,10 +2871,174 @@ class GpuPhaseLock:
         return False
 
 
+class GpuPhaseLock:
+    """v3 lifetime kernel ownership; private records are diagnostics only.
+
+    The namespace is independent of state_dir. Missing POSIX provisioning or
+    Windows namespace denial is visible fail-open, never per-user exclusion.
+    No automatic legacy migration, quarantine rename or foreign-record repair.
+    """
+
+    DEFAULT_DEADLINE_SECONDS = 15 * 60
+    HEARTBEAT_SECONDS = 10.0
+    _read_record = _LegacyGpuPhaseLock._read_record
+
+    def __init__(self, path: Path, *, backend=None):
+        from .gpu_arbitration import MachineGpuMutex
+        self.path = Path(path)
+        if backend is None:
+            # State roots are per-user and may not exist on first run.
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The private record is diagnostic only. The production backend
+        # must be independent of user state roots, even when unavailable.
+        self._backend = backend if backend is not None else MachineGpuMutex()
+        self._owner_token = None
+        self._identity = None
+        self._held = False
+        self._heartbeat_thread = None
+        self._heartbeat_stop = threading.Event()
+        self.last_unavailable = None
+        self.diagnostics = []
+        self.scope = "machine_cooperating_v3_only"
+
+    def _publish_record(self, record, *, initial=False):
+        import tempfile
+        from .file_mutex import FileMutex
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        mutex = FileMutex(self.path.with_name(self.path.name + ".mutation"))
+        temp = None
+        try:
+            if not mutex.acquire(0.2):
+                raise OSError("metadata mutex unavailable")
+            if initial:
+                if os.path.lexists(self.path):
+                    self.diagnostics.append("legacy_coexistence_unknown")
+                    return
+            elif self._identity is None or not self._owns_record():
+                return
+            fd, temp = tempfile.mkstemp(prefix=".gpu-record-", dir=self.path.parent)
+            try:
+                data = memoryview(json.dumps(record).encode("utf-8"))
+                while data:
+                    try:
+                        count = os.write(fd, data)
+                    except InterruptedError:
+                        continue
+                    if count <= 0:
+                        raise OSError("zero-progress metadata write")
+                    data = data[count:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            if initial:
+                # No-clobber publication: a late foreign record is not replaced.
+                os.link(temp, self.path)
+            else:
+                if not self._owns_record():
+                    return
+                # Cooperating metadata protocol only, not CAS against outsiders.
+                os.replace(temp, self.path)
+            st = self.path.lstat()
+            self._identity = (st.st_dev, st.st_ino)
+        finally:
+            if temp is not None:
+                try:
+                    os.unlink(temp)
+                except FileNotFoundError:
+                    pass
+            mutex.release()
+
+    def _owns_record(self):
+        try:
+            st = self.path.lstat()
+            record = self._read_record()
+            return ((st.st_dev, st.st_ino) == self._identity and record is not None
+                    and record.get("owner_token") == self._owner_token)
+        except OSError:
+            return False
+
+    def _touch_heartbeat(self):
+        if not self._held or self._identity is None:
+            return
+        record = self._read_record()
+        if record is not None:
+            record["heartbeat_at"] = time.time()
+            try:
+                self._publish_record(record)
+            except OSError:
+                if "metadata_unavailable" not in self.diagnostics:
+                    self.diagnostics.append("metadata_unavailable")
+
+    def acquire(self, *, on_wait=None, deadline_seconds=None, on_unavailable=None,
+                should_cancel=None):
+        if self._held:
+            raise RuntimeError("recursive GPU phase acquisition")
+        if deadline_seconds is None:
+            deadline_seconds = self.DEFAULT_DEADLINE_SECONDS
+        if not math.isfinite(deadline_seconds) or deadline_seconds < 0:
+            raise ValueError("GPU phase-lock deadline must be finite and nonnegative")
+        self.last_unavailable = None
+        outcome = self._backend.acquire(deadline_seconds, on_wait, should_cancel)
+        if not outcome.acquired:
+            self.last_unavailable = outcome.reason_code
+            if outcome.reason_code == "cancelled":
+                raise EngineCancelled("cancelled while waiting for GPU coordination")
+            if on_unavailable:
+                on_unavailable(outcome.reason_code)
+            return False
+        self._held = True
+        self._owner_token = secrets.token_hex(16)
+        self.diagnostics = ["legacy_coexistence_unknown"]
+        if outcome.reason_code:
+            self.diagnostics.append(outcome.reason_code)
+        now = time.time()
+        try:
+            self._publish_record({"schema_version": 2, "pid": os.getpid(),
+                "owner_token": self._owner_token, "created_at": now, "heartbeat_at": now,
+                "creation_time": _default_process_creation_time(os.getpid())}, initial=True)
+        except OSError:
+            self.diagnostics.append("metadata_unavailable")
+        self._heartbeat_stop.clear()
+        def heartbeat():
+            while not self._heartbeat_stop.wait(self.HEARTBEAT_SECONDS):
+                self._touch_heartbeat()
+        self._heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+        self._heartbeat_thread.start()
+        return True
+
+    def release(self):
+        if not self._held:
+            return
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join()
+            self._heartbeat_thread = None
+        try:
+            from .file_mutex import FileMutex
+            mutex = FileMutex(self.path.with_name(self.path.name + ".mutation"))
+            try:
+                if mutex.acquire(0.2) and self._owns_record():
+                    self.path.unlink()
+            finally:
+                mutex.release()
+        except OSError:
+            self.diagnostics.append("record_cleanup_failed")
+        finally:
+            self._backend.release()
+            self._held = False
+            self._owner_token = self._identity = None
+
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError("GPU phase lock unavailable")
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
 def _gpu_phase_lock() -> GpuPhaseLock:
-    """The machine-wide GPU-phase lock path (design D3: per state-dir,
-    NOT per log_root — the GUI and an MCP server on the same host
-    serialize against each other)."""
+    """Machine v3 backend plus private per-user diagnostic metadata."""
     from .benchmark import state_dir
 
     return GpuPhaseLock(state_dir() / ".gpu-phase.lock")

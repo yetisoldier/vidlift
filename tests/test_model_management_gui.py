@@ -162,7 +162,7 @@ def test_g1_pill_not_installed_with_install_button(window, tmp_path, monkeypatch
     )
     assert window.subs_model_button.isVisibleTo(window)
     assert window.subs_model_button.isEnabled()
-    assert window.subs_model_button.text() == "Install"
+    assert window.subs_model_button.text() == "Install subtitle model"
 
 
 def test_g2_pill_installed_hides_button(window, tmp_path, monkeypatch):

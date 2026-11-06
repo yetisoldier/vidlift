@@ -25,6 +25,10 @@
 
 ## Deferred
 
+- Read-only source directories with a separate writable Mode A output directory.
+  Current media preparation requires writable source-side staging and locks,
+  even without replacement or SRT suppression. Read-only-source support is a
+  future compatibility improvement, not a blocker for this release.
 - watch folders
 - automatic metadata lookup
 - media-library management

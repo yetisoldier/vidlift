@@ -7,10 +7,9 @@ Bob spec §12 file D:
      `top:` branch rejected) and the `::title` rule keeps its
      `subcontrol-position: top left` + `left: 12px` — with NO negative
      `top:` anywhere in the sheet.
-  36 F-1 exhaustiveness (D13): the Mode B grid holds EXACTLY five
-     items — the picker pair, the options pair, the explainer —
-     count == 5, membership exact, cells exact
-     ((0,0)/(0,1)/(0,2)/(0,3)/(0,4), all 1x1).
+  36 F-1 exhaustiveness: the responsive Mode B grid holds exactly eight
+     layout items. Picker/actions/device sublayouts retain exhaustive
+     leaf-widget membership, exact cells and the scope/options guidance.
   37 both new checkboxes: default OFF, persisted round-trip on a fresh
      window, four-key isolation (suppress_srt / subs_suppress_srt are
      cross-isolated from BOTH replace keys), tooltips contain the
@@ -59,13 +58,20 @@ SUBS_GRID_MEMBERS = (
     "subs_add_folder_button",
     "subs_replace_source",
     "subs_suppress_srt",
+    "start_subtitles_button",
+    "subs_device_combo",
+    "subs_remove_button",
+    "subs_clear_button",
 )
 SUBS_GRID_CELLS = [
     (0, 0, 1, 1),
     (0, 1, 1, 1),
-    (0, 2, 1, 1),
-    (0, 3, 1, 1),
-    (0, 4, 1, 1),  # the explainer
+    (1, 0, 1, 1),
+    (1, 1, 1, 1),
+    (2, 0, 1, 1),
+    (2, 1, 1, 1),
+    (3, 0, 1, 2),  # scope explainer
+    (4, 0, 1, 2),  # snapshot/output guidance
 ]
 
 
@@ -90,7 +96,7 @@ def test_35_qss_margin_growth_title_rule_intact(qapp, monkeypatch, tmp_path):
 
 
 # ------------------------------------------------------------------- 36
-def test_36_f1_exhaustive_five_item_pin(qapp, monkeypatch, tmp_path):
+def test_36_f1_exhaustive_mode_b_membership_pin(qapp, monkeypatch, tmp_path):
     """D13 (spec deviation 5 recorded): the note's `== 3` cannot survive
     this release's own additions — the pin asserts the release's real
     final set with EXACT membership and cells."""
@@ -98,14 +104,22 @@ def test_36_f1_exhaustive_five_item_pin(qapp, monkeypatch, tmp_path):
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     subs_grid = win.add_subs_button.parentWidget().layout()
-    assert subs_grid.count() == 5
+    assert subs_grid.count() == len(SUBS_GRID_CELLS)
 
-    widgets = [subs_grid.itemAt(i).widget() for i in range(subs_grid.count())]
+    def leaves(layout):
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            if item.widget() is not None:
+                yield item.widget()
+            elif item.layout() is not None:
+                yield from leaves(item.layout())
+
+    widgets = list(leaves(subs_grid))
     expected_attrs = {getattr(win, name) for name in SUBS_GRID_MEMBERS}
     labels = [w for w in widgets if isinstance(w, QLabel)]
     attr_widgets = [w for w in widgets if w not in labels]
-    assert len(labels) == 1  # exactly one explainer label
-    explainer = labels[0]
+    assert len(labels) == 3  # Device field label, scope and snapshot guidance.
+    explainer = next(label for label in labels if label.text().startswith("Adds subtitles"))
     assert set(attr_widgets) == expected_attrs
     # the explainer is the v0.4.17 scope text (unchanged contract)
     assert explainer.text() == (
@@ -113,10 +127,7 @@ def test_36_f1_exhaustive_five_item_pin(qapp, monkeypatch, tmp_path):
         "are copied (no upscale, no re-encode)."
     )
     # cells: exact row/col/spans for each widget
-    for widget, cell in zip(widgets, SUBS_GRID_CELLS):
-        assert subs_grid.getItemPosition(
-            widgets.index(widget)
-        ) == cell, (widget, cell)
+    assert [subs_grid.getItemPosition(i) for i in range(subs_grid.count())] == SUBS_GRID_CELLS
     next(gen, None)
 
 
@@ -200,7 +211,10 @@ def test_38_options_source_fences():
     start_src = inspect.getsource(MainWindow.start_upscale)
     assert '"suppress_srt": self.suppress_srt.isChecked()' in start_src
     enq_src = inspect.getsource(MainWindow._enqueue_subs_paths)
-    assert "suppress_srt=self.subs_suppress_srt.isChecked()" in enq_src
+    assert "self.subs_suppress_srt.isChecked()" in enq_src
+    assert '"suppress_srt": options.suppress_srt' in enq_src
+    start_subs_src = inspect.getsource(MainWindow.start_subtitles)
+    assert 'suppress_srt=row["suppress_srt"]' in start_subs_src
     # no cross-wiring: each fence names only its own checkbox
     assert "subs_suppress_srt" not in start_src
     assert "self.suppress_srt.isChecked" not in enq_src.replace(

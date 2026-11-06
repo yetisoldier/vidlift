@@ -463,32 +463,27 @@ def sidecar_srt_path(output_path: str) -> str:
     return os.path.splitext(output_path)[0] + ".srt"
 
 
-def remove_srt_sidecar(srt_path: str, *, log_line=None) -> bool:
-    """v0.4.18 (opt-in sidecar suppression): best-effort removal of an
-    .srt sidecar AFTER the soft-mux/embed succeeded.
+def remove_srt_sidecar(srt_path: str, *, log_line=None, ownership=None) -> bool:
+    """Compatibility disposal of a recorded private file only.
 
-    Returns True when no sidecar remains (removed, or already absent —
-    FileNotFoundError is success), False when another OSError kept it;
-    a failure logs a WARNING through ``log_line`` (the
-    cleanup_run_artifacts channel style) and is NEVER fatal — the
-    sidecar simply stays beside the output and the caller reports the
-    honest post-call truth. Only ever called on paths the current job
-    itself wrote this run (transcription/OCR outputs, the
-    adopted-sidecar COPY); a user's original sidecar file is never a
-    candidate.
+    Pipelines suppress by withholding publication, not public-path deletion.
+    No ownership, an incumbent, an adopted original or an identity change is
+    a refusal. This is not a hostile same-user private-directory boundary.
     """
+    from .media_transaction import fingerprint
+    if ownership is None or not ownership.owns(srt_path) or ownership.owned_srt != os.path.abspath(srt_path):
+        return False
     try:
-        os.remove(srt_path)
+        if fingerprint(srt_path) != ownership.srt_fingerprint:
+            return False
+        os.unlink(srt_path)
+        return True
     except FileNotFoundError:
-        pass
+        return True
     except OSError as exc:
         if log_line is not None:
-            log_line(
-                f"WARNING suppress-srt: could not remove {srt_path}: {exc}"
-            )
-            return False
+            log_line(f"WARNING suppress-srt: could not remove {srt_path}: {exc}")
         return False
-    return True
 
 
 # ---- seconv lane (Windows; port of b2m's two-pass flow) --------------------
@@ -1176,6 +1171,11 @@ def mux_srt_into_mp4(
     language: str = "und",
     ffmpeg: str,
     runner: Runner,
+    ownership=None,
+    ffprobe="ffprobe",
+    probe_runner=None,
+    verifier=None,
+    cancel=None,
 ) -> str:
     """Embed srt_path as a soft mov_text track in video_path.
 
@@ -1186,12 +1186,21 @@ def mux_srt_into_mp4(
     mov_text is the only subtitle codec MP4 supports and the one every
     player reads from .mp4. Through the runner seam here.
     """
-    tmp = video_path + ".muxing.mp4"  # sibling: same fs -> atomic replace
-    if os.path.exists(tmp):
-        try:
-            os.remove(tmp)  # stale temp from a killed run
-        except OSError:
-            pass
+    from .media_transaction import fingerprint, observe_cancel
+    from .probe import probe_file, ProbeError
+    from .subs_job import verify_mux, SubsJobError
+    import tempfile
+    if ownership is None or not ownership.owns(video_path):
+        raise SubtitleOcrError("subtitle mux requires an owned private encode")
+    observe_cancel(cancel)
+    original = fingerprint(video_path, cancel)
+    kwargs = {"runner": probe_runner} if probe_runner is not None else {}
+    try:
+        expected = probe_file(video_path, binary=ffprobe, **kwargs)
+    except (ProbeError, OSError) as exc:
+        raise SubtitleOcrError(f"pre-mux probe failed; verified encode retained: {exc}") from exc
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(video_path), prefix=".vidlift-mux-", suffix=".muxing.mp4")
+    os.close(fd)
     cmd = [
         ffmpeg, "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
         "-i", video_path, "-i", srt_path,
@@ -1210,8 +1219,14 @@ def mux_srt_into_mp4(
             f"subtitle muxing failed: {(err or '').strip()[:300]}"
         )
     try:
+        verify_mux(tmp, ffprobe=ffprobe, probe_runner=probe_runner, expected_media=expected)
+        if verifier is not None and not verifier(tmp).ok:
+            raise SubtitleOcrError("post-mux geometry/decode verification failed")
+        observe_cancel(cancel)
+        if fingerprint(video_path) != original or not ownership.owns(video_path):
+            raise SubtitleOcrError("owned pre-mux encode changed")
         os.replace(tmp, video_path)
-    except OSError as exc:
+    except (OSError, SubsJobError) as exc:
         try:
             os.remove(tmp)
         except OSError:

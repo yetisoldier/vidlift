@@ -1,4 +1,8 @@
-"""v0.4.15.1 — the 'Add Subtitles…' guard fix (Eric's live bug).
+"""v0.4.15.1 guard regressions, adapted for explicit staged Start.
+
+Current UI decision: Add remains independent while any serial batch runs,
+but public Start waits for terminal draining. The historical append contract
+below survives only in the bridge/internal per-row handoff, not public Start.
 
 Eric hit this at 2026-11-02 12:12 CST: with files loaded and planned
 (verdict rows on the table) and NOTHING running (GPU 1%, zero jobs in
@@ -47,6 +51,7 @@ from pathlib import Path
 import time
 
 import pytest
+from _gui_checks import wait_for_checks
 
 pytest.importorskip("PyQt6")
 
@@ -90,6 +95,8 @@ def test_picker_opens_with_stale_slate_and_zero_active_jobs(
     # The Eric state: the window believes it owns batch ids while the
     # registry reports nothing active (stale/undrained slate).
     win.job_ids = ["VJ9"]
+    # No staged row exists in the scripted registry; this test only checks
+    # that the picker is not blocked by stale window state.
     assert client.active_job_count() == 0
 
     import vidlift.gui as gui_mod
@@ -114,6 +121,7 @@ def test_picker_opens_with_stale_slate_and_zero_active_jobs(
     monkeypatch.setattr(QMessageBox, "information", staticmethod(fake_information))
 
     win.add_subs_button.click()
+    wait_for_checks(win)
 
     assert captured["opened"], (
         "picker must open when nothing is running — the planned-files "
@@ -124,13 +132,12 @@ def test_picker_opens_with_stale_slate_and_zero_active_jobs(
     )
 
 
-def test_subs_enqueue_during_running_upscale_batch_appends(
+def test_internal_subs_enqueue_during_running_upscale_batch_appends(
     qapp, monkeypatch, tmp_path
 ):
-    """§2 (Bob's independence decision): with an upscale batch LIVE
-    (active jobs > 0), 'Add Subtitles…' must still open and enqueue;
-    the picked files append into the STILL-LIVE upscale slate without
-    resetting its slots/run_counts/row map."""
+    """Retain internal serial-append compatibility for an already-started
+    multi-row submission. Public Start now waits for the active batch.
+    """
     plans = [_plan_for(tmp_path, name) for name in ("live-a.avi", "live-b.avi")]
     client = _ScriptedClient()
     client.make_job(plans[0].report.path, [{"state": "queued"}])
@@ -155,6 +162,11 @@ def test_subs_enqueue_during_running_upscale_batch_appends(
     assert client.active_job_count() == 2  # upscale batch is live
 
     win.add_subs_button.click()
+    wait_for_checks(win)
+    assert not win.start_subtitles_button.isEnabled()
+    # Emulate the per-row staged-to-submitted handoff in the internal seam.
+    win.clear_staged_subtitles()
+    win._submit_subs_paths([str(subs_file)])  # internal seam, not public Start
     assert client.last_enqueued_kinds[-1] == "subs"
     assert "VJ3" in win.job_ids
     # appended into the LIVE slate: slots extended in submission order,
@@ -195,6 +207,8 @@ def test_same_source_subs_conflict_blocks_with_dialog(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
     win._tick_elapsed()
     win._tick_elapsed()
     assert "transcribing" in win.stage_label.text()
@@ -215,7 +229,12 @@ def test_same_source_subs_conflict_blocks_with_dialog(
     monkeypatch.setattr(QMessageBox, "information", staticmethod(fake_information))
 
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
     assert captured["opened"], "picker must open; the conflict check is on its result"
+    assert not win.start_subtitles_button.isEnabled()
+    # A race after the Start guard must still hit the same-source recheck.
+    win._submit_subs_paths([str(file_a)])
     assert captured["blocked"], "same-source conflict must show the block dialog"
     assert "Wait for the current batch" in captured["blocked_text"]
     assert win.job_ids == ["VJ1"]  # nothing new enqueued
@@ -223,12 +242,10 @@ def test_same_source_subs_conflict_blocks_with_dialog(
     next(gen, None)
 
 
-def test_second_subs_batch_allowed_when_files_differ(
+def test_second_subs_batch_waits_even_when_files_differ(
     qapp, monkeypatch, tmp_path
 ):
-    """§3b (Bob's standing rule): concurrent subs batches are allowed —
-    the executor serializes them — so a live subs batch must NOT block
-    a second batch of DIFFERENT files."""
+    """Adding stays independent; public Start waits for terminal draining."""
     file_a = tmp_path / "batch1-a.mkv"
     file_a.write_bytes(b"x")
     file_b = tmp_path / "batch2-b.mkv"
@@ -248,9 +265,23 @@ def test_second_subs_batch_allowed_when_files_differ(
     gen = _window(qapp, monkeypatch, tmp_path, client)
     win = next(gen)
     win.add_subs_button.click()
+    wait_for_checks(win)
+    win.start_subtitles()  # staged Add is submitted only on explicit Start
     assert win.job_ids == ["VJ1"]
     win.add_subs_button.click()  # second batch, different file — allowed
-    assert win.job_ids == ["VJ1", "VJ2"]
+    wait_for_checks(win)
+    win.start_subtitles()
+    assert win.job_ids == ["VJ1"]
+    assert client.submitted == ["VJ1"]
+    assert [r["path"] for r in win._staged_subs] == [str(file_b)]
+    assert not win.start_subtitles_button.isEnabled()
+    client.script_tail("VJ1", [{"state": "succeeded"}])
+    win._tick_elapsed()
+    win._tick_elapsed()
+    assert not win.job_ids
+    assert win.start_subtitles_button.isEnabled()
+    win.start_subtitles()
+    assert win.job_ids == ["VJ2"]
     assert client.last_enqueued_kinds == ["subs"]  # the LAST call's kinds
     next(gen, None)
 
@@ -292,6 +323,8 @@ def test_enqueue_failure_mid_concurrent_submission_keeps_live_slate(
     monkeypatch.setattr(QMessageBox, "warning", staticmethod(fake_warning))
 
     win.add_subs_button.click()  # picker opens; enqueue raises FileNotFoundError
+    wait_for_checks(win)
+    win._submit_subs_paths([str(ghost)])  # internal failure cannot orphan a live slate
     assert warned["shown"], "the failure must surface to the user"
     # the live upscale slate survives untouched
     assert win.job_ids == ["VJ1", "VJ2"]

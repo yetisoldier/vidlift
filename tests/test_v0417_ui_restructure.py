@@ -38,6 +38,7 @@ import inspect
 import os
 
 import pytest
+from _gui_checks import wait_for_checks
 
 pytest.importorskip("PyQt6")
 
@@ -50,6 +51,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMessageBox,
     QTableWidgetItem,
+    QScrollArea,
+    QTabWidget,
 )
 
 from vidlift.gui import MainWindow
@@ -120,11 +123,23 @@ def _all_laid_out_widgets(win) -> set:
             item = layout.itemAt(index)
             widget = item.widget()
             if widget is not None and widget not in seen:
-                seen.add(widget)
-                walk(widget.layout())  # the group grids live here
+                visit(widget)
             sub = item.layout()
             if sub is not None:
                 walk(sub)
+
+    def visit(widget):
+        seen.add(widget)
+        walk(widget.layout())
+        if isinstance(widget, QScrollArea):
+            content = widget.widget()
+            if content is not None:
+                walk(content.layout())
+        if isinstance(widget, QTabWidget):
+            for index in range(widget.count()):
+                page = widget.widget(index)
+                if page is not None and page not in seen:
+                    visit(page)
 
     walk(root)
     return seen
@@ -157,6 +172,7 @@ def test_every_attribute_control_is_laid_out_including_explainer(
         "subs_add_folder_button",  # v0.4.18 (WS1): the Mode B folder twin
         "subs_replace_source",
         "subs_suppress_srt",  # v0.4.18 (WS2): the Mode B suppress checkbox
+        "subs_device_combo", "subs_remove_button", "subs_clear_button", "start_subtitles_button",
     ):
         assert getattr(win, name) in laid_out
     # the §6.3 explainer exists as a parented label with the exact text
@@ -167,19 +183,29 @@ def test_every_attribute_control_is_laid_out_including_explainer(
 
 # ------------------------------------------------------------------- T2
 def _paint_delta(qapp, win, widget) -> int:
-    """The §0.1 probe: grab the widget's parent group, hide the widget,
-    grab again, count differing pixels inside the widget's geometry."""
-    parent = widget.parentWidget()
+    """Compare actual viewport pixels without a hide-induced layout/scroll jump."""
+    from PyQt6.QtCore import QRect, QPoint
+    from _gui_checks import reveal_workflow_widget
     win.show()
     qapp.processEvents()
+    parent = reveal_workflow_widget(win, widget)
+    qapp.processEvents()
+    assert not widget.visibleRegion().isEmpty()
+    policy = widget.sizePolicy()
+    previous = policy.retainSizeWhenHidden()
+    policy.setRetainSizeWhenHidden(True)
+    widget.setSizePolicy(policy)
     before = parent.grab().toImage()
     if before.isNull():
         pytest.skip("offscreen platform cannot rasterize; T1/T4 still hold")
-    geo = widget.geometry()
+    geo = QRect(widget.mapTo(parent, QPoint()), widget.size()).intersected(parent.rect())
+    assert not geo.isEmpty()
     widget.hide()
     qapp.processEvents()
     after = parent.grab().toImage()
     widget.show()
+    policy.setRetainSizeWhenHidden(previous)
+    widget.setSizePolicy(policy)
     qapp.processEvents()
     delta = 0
     for y in range(geo.top(), geo.bottom() + 1):
@@ -235,7 +261,7 @@ def test_group_separation_two_titled_surfaces(qapp, monkeypatch, tmp_path):
     assert win.subs_add_folder_button.parentWidget() is subs
     assert win.subs_suppress_srt.parentWidget() is subs
     assert win.resume_claim.parentWidget() is upscale
-    assert win.monitor_check.parentWidget() is upscale
+    assert not win.workflow_tabs.isAncestorOf(win.monitor_check)
     titles = {group.title() for group in win.findChildren(QGroupBox)}
     assert titles >= {"Upscale", "Add subtitles (no upscale)"}
     next(gen, None)
@@ -253,24 +279,29 @@ def test_cell_map_and_zero_overlap_on_both_grids(qapp, monkeypatch, tmp_path):
     subs_grid = win.add_subs_button.parentWidget().layout()
 
     def _pos(layout, widget):
+        def contains(lay):
+            return any(lay.itemAt(i).widget() is widget or
+                       (lay.itemAt(i).layout() is not None and contains(lay.itemAt(i).layout()))
+                       for i in range(lay.count()))
         for index in range(layout.count()):
-            if layout.itemAt(index).widget() is widget:
+            entry = layout.itemAt(index)
+            if entry.widget() is widget or (entry.layout() is not None and contains(entry.layout())):
                 return layout.getItemPosition(index)
         raise AssertionError("widget missing from grid")
 
     assert _pos(subs_grid, win.add_subs_button) == (0, 0, 1, 1)
     # v0.4.18 (§12 File E): the subs cell map re-pinned for the 4-A9
     # re-tile — replace moved (0,1) → (0,2); the new folder button +
-    # suppress checkbox occupy (0,1)/(0,3); the explainer (0,4).
-    assert _pos(subs_grid, win.subs_add_folder_button) == (0, 1, 1, 1)
-    assert _pos(subs_grid, win.subs_replace_source) == (0, 2, 1, 1)
-    assert _pos(subs_grid, win.subs_suppress_srt) == (0, 3, 1, 1)
-    assert _pos(upscale_grid, win.transcribe_subs) == (3, 3, 1, 3)
+    # Start, replace, suppress, and explainer occupy (0,2) through (0,5).
+    assert _pos(subs_grid, win.subs_add_folder_button) == (0, 0, 1, 1)
+    assert _pos(subs_grid, win.subs_replace_source) == (2, 0, 1, 1)
+    assert _pos(subs_grid, win.subs_suppress_srt) == (2, 1, 1, 1)
+    assert _pos(upscale_grid, win.transcribe_subs) == (4, 1, 1, 1)
     # v0.4.18: the Mode A suppress checkbox's verified-free cell
-    assert _pos(upscale_grid, win.suppress_srt) == (3, 6, 1, 3)
-    assert _pos(upscale_grid, win.resume_claim) == (2, 7, 1, 2)
-    assert _pos(upscale_grid, win.monitor_check) == (2, 0, 1, 4)
-    assert _pos(upscale_grid, win.replace_source) == (1, 5, 1, 2)
+    assert _pos(upscale_grid, win.suppress_srt) == (5, 1, 1, 1)
+    assert _pos(upscale_grid, win.resume_claim) == (3, 1, 1, 1)
+    assert not win.workflow_tabs.isAncestorOf(win.monitor_check)
+    assert _pos(upscale_grid, win.replace_source) == (5, 0, 1, 1)
 
     for layout in (upscale_grid, subs_grid):
         rects = _grid_items(layout)
@@ -371,7 +402,7 @@ def test_resume_lives_in_upscale_group_row2(qapp, monkeypatch, tmp_path):
         for index in range(grid.count())
         if grid.itemAt(index).widget() is win.resume_claim
     ]
-    assert positions == [(2, 7, 1, 2)]
+    assert positions == [(3, 1, 1, 1)]
     next(gen, None)
 
 
@@ -397,6 +428,7 @@ def test_subs_detail_source_fate_lines_k2(qapp, monkeypatch, tmp_path):
             staticmethod(lambda *a, **k: ([str(media)], "")),
         )
         _win.add_subs_button.click()
+        wait_for_checks(_win)
         _win.file_table.selectRow(0)
         text = _win.details.toPlainText()
         next(_gen, None)
@@ -456,8 +488,10 @@ def test_wiring_fences_reads_not_rewired():
     # _enqueue_subs_paths — the enqueue line MOVED, the fence follows;
     # the assertion text is extended with suppress_srt (File D-38).
     subs_src = inspect.getsource(MainWindow._enqueue_subs_paths)
-    assert "replace_source=self.subs_replace_source.isChecked()" in subs_src
-    assert "suppress_srt=self.subs_suppress_srt.isChecked()" in subs_src
+    assert "SubtitleOptions(self.subs_replace_source.isChecked()" in subs_src
+    assert "self.subs_suppress_srt.isChecked()" in subs_src
+    assert '"replace_source": options.replace_source' in subs_src
+    assert '"suppress_srt": options.suppress_srt' in subs_src
     assert "self.replace_source.isChecked()" not in subs_src
 
 

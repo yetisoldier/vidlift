@@ -50,12 +50,17 @@ def test_explicit_argument_still_wins(tmp_path):
     )
 
 
-def test_gpu_phase_lock_never_touches_the_user_profile(tmp_path):
+def test_gpu_phase_lock_never_touches_the_user_profile(tmp_path, monkeypatch):
     """The old suite's 50 create/unlink cycles on
     ``~/.vidlift/.gpu-phase.lock`` were its ONLY real-root writes; the
     lock now rides the isolated root: acquire + release leaves nothing
     behind and the lock file lives under tmp."""
     os.environ.pop("VIDLIFT_STATE_DIR", None)
+    from vidlift import gpu_arbitration
+    # Exercise the kernel backend on a private inode, never /run/lock.
+    real_mutex = gpu_arbitration.MachineGpuMutex
+    monkeypatch.setattr(gpu_arbitration, "MachineGpuMutex",
+                        lambda: real_mutex(test_path=tmp_path / "machine-test.lock"))
     lock = _gpu_phase_lock()
     assert ".gpu-phase.lock" in lock.path.name
     assert lock.path.parent != Path.home() / ".vidlift"
