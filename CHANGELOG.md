@@ -2,6 +2,25 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.21.0] - 2026-11-06
+
+### Fixed
+- Windows GPU mutex ACL checks now normalize generic read, write, execute, and all-access
+  rights before validating a valid mutex ACL.
+- If the GPU mutex namespace is unavailable, Auto falls back to CPU. Explicit
+  CUDA refuses to proceed without coordination; contention and unknown
+  coordination failures fail closed rather than starting unsynchronized GPU
+  work.
+
+### Validation and limits
+- Independent native Windows tests: **20 passed in 0.48 seconds** for the exact
+  source, covering mutex ACL handling and coordination failure behavior.
+- Final focused Linux regression, version-stamp and packaging checks: **136
+  passed, 14 skipped**. The skipped native ACL cases passed separately on Windows.
+- The standard released installer still does not bundle CUDA/cuDNN. This change
+  does not claim portable GPU verification; CUDA packaging/legal gates remain
+  in force. Frozen CUDA execution is not certified by these source tests.
+
 ## [0.4.20.0] - 2026-11-06
 
 Combined workflow, transcription and replacement release. The standard installer

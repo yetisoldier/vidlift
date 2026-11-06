@@ -346,9 +346,17 @@ def run_subs_job(
             lock_acquired = acquire(on_wait=_wait_label)
     if gpu_lock is not None and not lock_acquired:
         reason = getattr(gpu_lock, "last_unavailable", None) or "unknown"
-        raise SubsJobError(
-            f"GPU coordination unavailable ({reason}); refusing unsynchronized GPU work"
-        )
+        if device_pin == "auto" and reason == "namespace_unavailable":
+            # Auto promises GPU only when safely coordinated. Preserve the
+            # requested setting for status while forcing the engine to CPU.
+            _step("GPU coordination unavailable; auto selected CPU")
+            if on_device is not None:
+                on_device("cpu", "auto")
+            device_pin = "cpu"
+        else:
+            raise SubsJobError(
+                f"GPU coordination unavailable ({reason}); refusing unsynchronized GPU work"
+            )
     try:
         transcribed = transcribe_source_to_srt(
             source_path,

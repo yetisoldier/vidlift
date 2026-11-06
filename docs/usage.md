@@ -286,6 +286,20 @@ Update the graphics driver. Real-ESRGAN requires a working Vulkan-capable GPU.
 Remote desktop and virtual machines can hide Vulkan support even when the
 physical GPU supports it.
 
+### Windows transcription says GPU coordination is unavailable
+
+On Windows, VidLift checks the GPU mutex ACL before using the shared
+transcription GPU. Windows generic rights are normalized to their concrete
+read, write, execute, and all-access rights before the ACL is checked; a valid mutex ACL
+is accepted after this normalization. If the mutex namespace itself is
+unavailable, **Auto** selects CPU and reports that fallback. An explicit
+**CUDA** selection refuses to run without coordination. Contention and
+unrecognized coordination errors fail closed rather than starting GPU work
+without the lock. See the [release notes](../CHANGELOG.md#04210---2026-11-06).
+
+The standard released installer still does not bundle CUDA/cuDNN. This mutex
+handling does not certify CUDA, GPU transcription, or a portable GPU build.
+
 ### A file is skipped
 
 Open the row in the desktop planner or run **vidlift-cli probe FILE**. Common

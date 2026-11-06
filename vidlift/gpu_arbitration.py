@@ -118,14 +118,63 @@ class MachineGpuMutex:
             if a.GetSecurityInfo(self._handle, 6, 4, None, None, c.byref(actual_acl), None, c.byref(actual_sd)):
                 raise OSError("mutex DACL unavailable")
             present, defaulted, expected_acl = w.BOOL(), w.BOOL(), c.c_void_p()
-            if not a.GetSecurityDescriptorDacl(expected, c.byref(present), c.byref(expected_acl), c.byref(defaulted)):
+            if not a.GetSecurityDescriptorDacl(expected, c.byref(present), c.byref(expected_acl), c.byref(defaulted)) or not present.value:
                 raise OSError("expected DACL invalid")
-            def acl_bytes(pointer):
-                if not pointer.value:
-                    raise OSError("NULL DACL refused")
-                size = c.c_ushort.from_address(pointer.value + 2).value
-                return c.string_at(pointer, size)
-            if acl_bytes(actual_acl) != acl_bytes(expected_acl):
+            a.IsValidAcl.argtypes = [c.c_void_p]
+            a.IsValidAcl.restype = w.BOOL
+            a.IsValidSid.argtypes = [c.c_void_p]
+            a.IsValidSid.restype = w.BOOL
+            def acl_semantics(pointer):
+                if not pointer.value or not a.IsValidAcl(pointer):
+                    raise OSError("NULL or invalid DACL refused")
+                # Compare ACE meaning, not ACL serialization: Windows may
+                # rewrite ACL revision/padding while preserving its ACEs.
+                class ACL_HEADER(c.Structure):
+                    _fields_ = [("revision", c.c_ubyte), ("sbz1", c.c_ubyte),
+                                ("size", w.WORD), ("count", w.WORD),
+                                ("sbz2", w.WORD)]
+                class ACE_HEADER(c.Structure):
+                    _fields_ = [("kind", c.c_ubyte), ("flags", c.c_ubyte),
+                                ("size", w.WORD)]
+                acl = c.cast(pointer, c.POINTER(ACL_HEADER)).contents
+                # Access masks in an object DACL can be stored either as
+                # generic bits (from the SDDL) or as the object-specific
+                # rights Windows writes back. Normalize both through the
+                # mutex GENERIC_MAPPING before comparison.
+                class GENERIC_MAPPING(c.Structure):
+                    _fields_ = [("read", w.DWORD), ("write", w.DWORD),
+                                ("execute", w.DWORD), ("all", w.DWORD)]
+                # Mutant object mapping: READ_CONTROL | QUERY_STATE,
+                # READ_CONTROL, READ_CONTROL | SYNCHRONIZE, ALL_ACCESS.
+                mapping = GENERIC_MAPPING(0x00020001, 0x00020000,
+                                          0x00120000, 0x001F0001)
+                a.MapGenericMask.argtypes = [c.POINTER(w.DWORD), c.POINTER(GENERIC_MAPPING)]
+                a.MapGenericMask.restype = None
+                entries = []
+                for index in range(acl.count):
+                    ace_ptr = c.c_void_p()
+                    if not a.GetAce(pointer, index, c.byref(ace_ptr)) or not ace_ptr.value:
+                        raise OSError("mutex ACE unavailable")
+                    header = c.cast(ace_ptr, c.POINTER(ACE_HEADER)).contents
+                    # Only allow ordinary allow ACEs; reject callback/object,
+                    # deny, inherited, and all other forms.
+                    if header.kind != 0 or header.flags != 0 or header.size < 16:
+                        raise OSError("unsupported mutex ACE")
+                    # Copy the mask: MapGenericMask mutates its argument;
+                    # validation must not rewrite either security descriptor.
+                    mask = w.DWORD(w.DWORD.from_address(ace_ptr.value + 4).value)
+                    a.MapGenericMask(c.byref(mask), c.byref(mapping))
+                    sid_ptr = ace_ptr.value + 8
+                    subauth_count = c.c_ubyte.from_address(sid_ptr + 1).value
+                    sid_size = 8 + 4 * subauth_count
+                    if sid_size + 8 != header.size or not a.IsValidSid(sid_ptr):
+                        raise OSError("malformed mutex ACE")
+                    sid = c.string_at(sid_ptr, sid_size)
+                    entries.append((header.kind, header.flags, mask.value, sid))
+                return tuple(entries)
+            a.GetAce.argtypes = [c.c_void_p, w.DWORD, c.POINTER(c.c_void_p)]
+            a.GetAce.restype = w.BOOL
+            if acl_semantics(actual_acl) != acl_semantics(expected_acl):
                 raise OSError("existing mutex DACL incompatible")
         finally:
             for allocation in (actual_sd, expected):

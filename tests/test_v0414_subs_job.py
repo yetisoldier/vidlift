@@ -19,6 +19,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -393,6 +394,60 @@ def test_bitmap_subs_source_completes_and_allowlist_maps(tmp_path, no_lock):
 
 
 # --------------------------------------------- D4 (v0.4.15.3): device fact
+@pytest.mark.usefixtures("engine_on")
+@pytest.mark.parametrize(("pin", "reason", "succeeds"), [
+    ("auto", "namespace_unavailable", True),
+    ("cuda", "namespace_unavailable", False),
+    ("auto", "deadline_exceeded_live_owner", False),
+    ("cuda", "deadline_exceeded_live_owner", False),
+    ("auto", "unknown", False),
+    ("cpu", "namespace_unavailable", True),
+])
+def test_coordination_failure_never_runs_unlocked_cuda(tmp_path, monkeypatch, pin, reason, succeeds):
+    import vidlift.transcribe as transcribe_mod
+
+    src = tmp_path / "coordination.avi"
+    src.write_bytes(b"source-bytes")
+    _seed_model_state(tmp_path / "state")
+    built, events, steps = [], [], []
+
+    def construct(model_path, *, device="auto", **kwargs):
+        built.append(device)
+        assert device == "cpu"
+        return FakeEngine(model_path)
+
+    class Unavailable:
+        last_unavailable = reason
+
+        def acquire(self, on_wait=None, should_cancel=None):
+            return False
+
+        def release(self):
+            pytest.fail("must not release an unowned lock")
+
+    monkeypatch.setattr(transcribe_mod, "make_whisper_engine", construct)
+    runner = FakeRunner(_probe_payload())
+    kwargs: dict[str, Any] = dict(ffmpeg="ffmpeg", probe_runner=runner, runner=runner,
+                  device_pin=pin, state_root=str(tmp_path / "state"),
+                  workdir=str(tmp_path / "wd"), gpu_lock_factory=Unavailable,
+                  on_device=lambda *event: events.append(event), on_step=steps.append)
+    if succeeds:
+        result = run_subs_job(str(src), **kwargs)
+        assert result.device == "cpu"
+        assert Path(result.output_path).read_bytes() == b"muxed-out"
+        assert built == ["cpu"]
+        if pin == "auto":
+            assert ("cpu", "auto") in events
+            assert "GPU coordination unavailable; auto selected CPU" in steps
+    else:
+        with pytest.raises(SubsJobError, match="refusing unsynchronized GPU work"):
+            run_subs_job(str(src), **kwargs)
+        assert not built
+        assert not events
+        assert not (tmp_path / "coordination.subs.mp4").exists()
+    assert src.read_bytes() == b"source-bytes"
+
+
 @pytest.mark.usefixtures("engine_on", "no_lock")
 def test_default_factory_cpu_pin_reports_device_cpu(tmp_path, monkeypatch):
     """D4: the core that ran the engine is the honest source of the

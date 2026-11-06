@@ -263,6 +263,7 @@ In the main window, you can toggle **Enable subtitle OCR**. When enabled, VidLif
 | Transcription stops with a timeout | Worker did not make progress | Inspect the reported device/fallback reason and run log; the supervised worker is stopped before returning. |
 | Transcription fails immediately on a fresh install | Missing VAD assets (v0.4.16.1) | Update to v0.4.16.2. If the issue persists, run `vidlift-cli --selftest` to verify the install. |
 | "Resume retained work" is missing or unclickable | Layout overlap (pre-v0.4.17) | Update to v0.4.17.0; a layout overlap that hid the checkbox has been fixed. |
+| Transcription reports GPU coordination unavailable | Windows mutex permissions cannot be safely verified | Auto selects CPU only when the mutex namespace is unavailable; explicit CUDA refuses, and contention or unknown errors fail closed. See [GPU coordination troubleshooting](docs/usage.md#windows-transcription-says-gpu-coordination-is-unavailable). |
 
 ### Transcription Asset Failure
 If you are using v0.4.16.1, transcription will fail because the required Silero VAD model was not bundled. Update to v0.4.16.2 to resolve this.
