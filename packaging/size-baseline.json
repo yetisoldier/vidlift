@@ -1,8 +1,10 @@
 {
   "schema_version": 1,
-  "expanded_install_bytes": null,
-  "reference_artifact": null,
+  "expanded_install_bytes": 1025196994,
+  "reference_artifact": "https://github.com/yetisoldier/vidlift/releases/download/v0.4.19.0/VidLift-0.4.19.0-Windows-x64-Setup.exe",
+  "installer_sha256": "00398b7e8f6b17256b1417de5f3dbb693ffdf61d60bcdb2918608c16d9bc1549",
+  "measurement_run": "https://github.com/yetisoldier/vidlift/actions/runs/42277568887",
   "installer_limit_bytes": 2000000000,
   "expanded_growth_limit_bytes": 1800000000,
-  "note": "Pending measured, product-reviewed prior artifact. Never infer or auto-update this baseline. Missing baseline blocks the gate unless an explicit product override with approval reference is supplied. GB thresholds use decimal bytes."
+  "note": "Release-engineer reviewed actual isolated prior installation measured before update in the referenced Windows run; installer hash verified before installation. Never infer or auto-update this baseline. Missing baseline blocks the gate unless an explicit product override with approval reference is supplied. GB thresholds use decimal bytes."
 }

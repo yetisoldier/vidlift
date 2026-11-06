@@ -61,9 +61,15 @@ def test_size_cli_persists_failure_evidence_and_outputs(size_inputs, tmp_path, m
     installer, tree, _ = size_inputs
     outputs = tmp_path / "github-output"
     summary = tmp_path / "summary.json"
+    # Missing-baseline behavior is a fixture, not a requirement that the
+    # production release baseline remain unmeasured forever.
+    missing_baseline = tmp_path / "missing-baseline.json"
+    baseline_data = json.loads((ROOT / "packaging/size-baseline.json").read_text())
+    baseline_data.update(expanded_install_bytes=None, reference_artifact=None)
+    missing_baseline.write_text(json.dumps(baseline_data))
     monkeypatch.setenv("GITHUB_OUTPUT", str(outputs))
     assert gates.main(["--output", str(summary), "size", "--installer", str(installer),
-        "--install-tree", str(tree), "--baseline", str(ROOT / "packaging/size-baseline.json")]) == 1
+        "--install-tree", str(tree), "--baseline", str(missing_baseline)]) == 1
     assert json.loads(summary.read_text())["issues"] == ["reviewed_size_baseline_missing"]
     assert "expanded_install_bytes=" in outputs.read_text()
 
