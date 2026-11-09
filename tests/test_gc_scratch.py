@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from vidlift.engine_ncnn import CHUNK_STATE_FILENAME, _workdir_for
-from vidlift.run import gc_stale_scratch, prune_plan
+from vidlift.run import gc_stale_scratch, prune_plan, scratch_note_for_source
 
 from tests.test_resume_claim import build_retained_scratch, make_media
 
@@ -141,3 +141,28 @@ def test_g5_dry_run_reports_and_deletes_nothing(tmp_path):
     assert (
         log_root / "Show.20261020-080000.engine-work"
     ).exists()
+
+
+def test_scratch_note_for_source_returns_note_without_nameerror(tmp_path):
+    """v0.4.23.0 regression (Hermes brief): `scratch_note_for_source`
+    called `_workdir_for` without the lazy engine_ncnn import, so the
+    GUI's Resume-note poll raised `NameError: name '_workdir_for' is
+    not defined` whenever the source had a matching `.prepared.mkv` and
+    the Resume checkbox was OFF. PyQt6 escalates a slot exception to
+    abort(), which on Windows is the 0xc0000409 fast-fail. run.py and
+    engine_ncnn.py form an import cycle, so the import must stay lazy
+    inside the try block — this is the test that would have caught it.
+    """
+    source = make_media(tmp_path, "Show.avi")
+    # scratch_note_for_source keys on source.parent / ".vidlift-runs"
+    # (the GUI layout), not the GC's arbitrary log_root.
+    log_root = tmp_path / ".vidlift-runs"
+    log_root.mkdir()
+    run_id = "Show.20261027-201001"
+    build_retained_scratch(log_root, run_id=run_id, source=source)
+    note = scratch_note_for_source(source)
+    assert note == (
+        "Retained partial work exists for this file "
+        f"({run_id}; 1 set(s) retained) — enable "
+        "Resume to claim it."
+    )

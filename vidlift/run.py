@@ -1659,6 +1659,8 @@ def scratch_note_for_source(path: str | Path) -> str | None:
     stem = source.stem
     candidates = []
     try:
+        from .engine_ncnn import _workdir_for  # lazy (import cycle)
+
         for entry in root.iterdir():
             run_id = _run_id_from_scratch_name(entry.name)
             if (
