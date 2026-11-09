@@ -2,6 +2,14 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.23.0] - 2026-11-09
+
+### Fixed
+- **Crash on start:** Fixed a `NameError` in the `scratch_note_for_source` helper (missing lazy import of `_workdir_for`) that caused the app to quit unexpectedly when starting an upscale on a source with retained partial work while "Resume retained work" was OFF.
+
+### Added
+- **Resizable columns:** The batch table's columns can now be resized by dragging the column edges.
+
 ## [0.4.22.0] - 2026-11-08
 
 This release supersedes 0.4.20.0 and 0.4.21.0: it restores job execution to
