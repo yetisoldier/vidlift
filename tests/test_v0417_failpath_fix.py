@@ -57,7 +57,6 @@ import urllib.request
 from pathlib import Path
 
 import pytest
-from _gui_checks import wait_for_checks
 
 from vidlift.mcp_bridge import (
     BridgeServices,
@@ -293,95 +292,6 @@ def _row_state(win, filename: str) -> str:
     raise AssertionError(f"no row displays {filename!r}")
 
 
-def test_subs_probe_failure_lands_failed_on_details_overlay_and_bars(
-    qapp, monkeypatch, tmp_path
-):
-    """PRIMARY (Eric's repro, defect 1 + the GUI half of defect 2): the
-    Mode-B run fails at probe. The batch bar + row landed failed on
-    v0.4.16.0 already; this pins the FULL landing on every surface —
-    the details body says Verdict: failed, the live overlay says
-    State: failed (no stale running line, no terminal stutter) with the
-    probe error verbatim, and both bars stop animating (busy pulse
-    ended, stale 'active work' labels cleared) instead of pulsing over
-    a finished failed batch."""
-    path = tmp_path / "saturday.avi"
-    path.write_bytes(b"x")
-    client = _ScriptedClient()
-    client.make_job(
-        str(path),
-        [
-            {"state": "queued"},
-            {"state": "running", "current_phase": "probe"},
-            {
-                "state": "failed",
-                "current_phase": "probe",
-                "error": _PROBE_ERROR,
-            },
-        ],
-        kind="subs",
-    )
-
-    import vidlift.gui as gui_mod
-
-    monkeypatch.setattr(
-        gui_mod.QFileDialog, "getOpenFileNames",
-        staticmethod(lambda *a, **k: ([str(path)], "")),
-    )
-
-    gen = _window(qapp, monkeypatch, tmp_path, client)
-    win = next(gen)
-    win.add_subs_button.click()
-    wait_for_checks(win)
-    win.start_subtitles()  # staged Add is submitted only on explicit Start
-    assert win.job_ids == ["VJ1"]
-
-    # Tick 1: queued — the slate pulses like a real run start.
-    win._tick_elapsed()
-    assert _row_state(win, "saturday.avi") == "queued"
-    assert win.stage_bar._busy and win.overall_bar._busy
-
-    # Tick 2: running at probe — the stage line names the phase and the
-    # pulse labels name it too (the states the pre-fix code froze).
-    win._tick_elapsed()
-    assert "probe" in win.stage_label.text()
-    assert win.stage_bar.eta_label.text() == "probing ..."
-    assert win.overall_bar._busy
-
-    # Tick 3: the probe fails; the batch drains.
-    win._tick_elapsed()
-    assert win.job_ids == []
-    assert _row_state(win, "saturday.avi") == "failed"
-
-    # the bars STOP: no busy pulse, no stale active-work label —
-    # determinate idle instead of an infinite "probing ..."/"queue
-    # active ..." animation over a finished batch
-    assert win.stage_bar._busy is False
-    assert win.overall_bar._busy is False
-    assert win.stage_bar.eta_label.text() == ""
-    assert win.overall_bar.eta_label.text() == ""
-    assert win.stage_bar.bar.maximum() != 0  # out of the 0..0 pulse
-    assert win.overall_bar.bar.maximum() != 0
-    # the rest of the landing (already correct pre-fix, pinned here so
-    # the whole terminal truth story lives in one test)
-    assert win.progress.format() == "0/1 succeeded, 1 failed"
-    assert win.activity_dots._timer.isActive() is False
-    assert win._run_started_at is None
-    assert "Batch finished with failures" in win.summary_count.text()
-
-    # the DETAILS panel landed failed too: body re-rendered from the
-    # failed verdict cell, live overlay terminal + the failure reason
-    details = win.details.toPlainText()
-    assert "Verdict: failed" in details
-    assert "Verdict: running" not in details
-    assert "State: failed" in details
-    assert "running" not in details.split("── LIVE")[1].splitlines()[1], (
-        f"stale running text in the live overlay:\n{details}"
-    )
-    assert "failed — failed" not in details  # no terminal stutter
-    assert f"Error: {_PROBE_ERROR}" in details
-    next(gen, None)
-
-
 def test_upscale_probe_failure_details_surface_error(qapp, monkeypatch, tmp_path):
     """Mode A variant (defect 2): a plan-batch run job failing at probe
     lands the same overlay truth — State: failed + the verbatim error —
@@ -469,49 +379,4 @@ def test_batch_end_keeps_measured_truth_but_ends_the_pulse(
     assert "Verdict: failed" not in win.details.toPlainText() or (
         "Error:" in win.details.toPlainText()
     )  # error surfaces over the plan body when the row is selected
-    next(gen, None)
-
-
-def test_queued_cancel_batch_settles_bars_too(qapp, monkeypatch, tmp_path):
-    """The cancel path (v0.4.16.0's fix) stays intact AND settles: a
-    queued-only batch cancelled before any claim ends with all rows
-    'cancelled', the batch bar honest, and the bars OUT of the pulse
-    they had been in since the slate start ('starting ...'/'queue
-    active ...' labels cleared — no finished cancel keeps animating)."""
-    first = tmp_path / "queued-one.mkv"
-    second = tmp_path / "queued-two.mkv"
-    for path in (first, second):
-        path.write_bytes(b"x")
-    client = _ScriptedClient()
-    client.make_job(str(first), [{"state": "queued"}], kind="subs")
-    client.make_job(str(second), [{"state": "queued"}], kind="subs")
-
-    import vidlift.gui as gui_mod
-
-    monkeypatch.setattr(
-        gui_mod.QFileDialog, "getOpenFileNames",
-        staticmethod(lambda *a, **k: ([str(first), str(second)], "")),
-    )
-
-    gen = _window(qapp, monkeypatch, tmp_path, client)
-    win = next(gen)
-    win.add_subs_button.click()
-    wait_for_checks(win)
-    win.start_subtitles()  # staged Add is submitted only on explicit Start
-    assert win.cancel_batch_button.isEnabled()
-    win.cancel_batch_button.click()
-    for _ in range(4):
-        win._tick_elapsed()
-        if not win.job_ids:
-            break
-    assert win.job_ids == []
-    assert _row_state(win, "queued-one.mkv") == "cancelled"
-    assert _row_state(win, "queued-two.mkv") == "cancelled"
-    assert win.progress.format() == "0/2 succeeded, 2 cancelled"
-    # the cancelled batch stopped animating as well — the same settle
-    # contract the failed batch now carries (pulse-only batch ends)
-    assert win.stage_bar._busy is False
-    assert win.overall_bar._busy is False
-    assert win.stage_bar.eta_label.text() == ""
-    assert win.overall_bar.eta_label.text() == ""
     next(gen, None)

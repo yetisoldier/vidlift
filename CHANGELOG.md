@@ -2,66 +2,52 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
-## [0.4.21.0] - 2026-11-06
+## [0.4.22.0] - 2026-11-08
 
-### Fixed
-- Windows GPU mutex ACL checks now normalize generic read, write, execute, and all-access
-  rights before validating a valid mutex ACL.
-- If the GPU mutex namespace is unavailable, Auto falls back to CPU. Explicit
-  CUDA refuses to proceed without coordination; contention and unknown
-  coordination failures fail closed rather than starting unsynchronized GPU
-  work.
+This release supersedes 0.4.20.0 and 0.4.21.0: it restores job execution to
+byte-identical 0.4.19 semantics on top of the new interface work, and defers
+the remainder of the 0.4.20/0.4.21 scope. Do not republish under either prior
+number; upgrades from 0.4.19.x and 0.4.20/21 flow through 0.4.22.0.
 
-### Validation and limits
-- Independent native Windows tests: **20 passed in 0.48 seconds** for the exact
-  source, covering mutex ACL handling and coordination failure behavior.
-- Final focused Linux regression, version-stamp and packaging checks: **136
-  passed, 14 skipped**. The skipped native ACL cases passed separately on Windows.
-- The standard released installer still does not bundle CUDA/cuDNN. This change
-  does not claim portable GPU verification; CUDA packaging/legal gates remain
-  in force. Frozen CUDA execution is not certified by these source tests.
+### Added
+- **Workflow tabs + staged review GUI:** the desktop app's controls split into
+  **AI Upscale** and **Subtitles Only** tabs; subtitles are staged first (with
+  a per-row plan-time verdict) and submitted through a review dialog
+  ("Start reviewed jobs" / "Go back", Go back as the default; Escape never
+  submits), with preflight progress and cancellation during checking.
+- **Per-row subtitle options** at review: replace original on success, delete
+  the `.srt` sidecar after a successful embed, and a requested device
+  (Auto / CUDA / CPU) wired through the bridge enqueue surface.
+- **GPU cross-process coordination hardening:** the machine-wide GPU phase
+  lock gains a v3 cooperating-process mutex with Windows-native ACL
+  restrictions (the fix for the cross-process GPU exclusion defect). Strict
+  CPU pins never take the lock; `auto` runs on CPU when coordination is
+  unavailable, and an uncoordinated CUDA request refuses GPU work rather than
+  racing another process. Scope is honest-but-limited: the lock excludes
+  cooperating v3 peers only.
+- Accessibility improvements: visible checkbox indicators (with the checked
+  asset), contrast/system-palette handling, and screen-reader labels across
+  the reworked surfaces.
+- Wheel packaging fix: `vidlift.ui` and `vidlift.mcp_bridge` subpackages (and
+  the GUI asset) are now actually shipped in wheels.
 
-## [0.4.20.0] - 2026-11-06
+### Removed
+- The unpublished 0.4.20/0.4.21 scope beyond the above: CUDA runtime
+  bundling and its release gates, the transcription watchdog and batch
+  identity, single-instance enforcement, registry transactions/receipts, and
+  the media transaction journal — all deferred with explicit revive triggers
+  (see docs/roadmap.md, "Deferred-scope backlog"). The removed machinery is
+  preserved in the v0.4.20.0/v0.4.21.0 tags.
 
-Combined workflow, transcription and replacement release. The standard installer
-does not bundle NVIDIA CUDA/cuDNN runtime binaries; GPU transcription is not
-certified by this release. Missing runtime support is reported with CPU fallback.
-
-### Changed
-- Separate **AI Upscale** and **Subtitles Only** workflow tabs retain independent
-  options and share queue/results. Tab switching does not plan or submit jobs.
-  Subtitles-only files are staged for review before **Start Subtitles**.
-- Checkboxes have explicit empty-square and checked-tick indicators, including
-  disabled states; the tick asset is included as package data.
-- Built-in transcription uses a supervised child process with cancellation and
-  bounded init/decode/absolute timeouts. Eligible pre-progress CUDA failures
-  retry once on CPU; failures after progress do not silently restart. CUDA
-  failure caching is scoped to the submitted batch; a new batch probes again.
-- Media publication verifies candidates, checks source identity/content, avoids
-  clobbering unrelated files and retains journals/recovery material. Opt-in
-  replacement retains an independent original backup and captured source.
-  Sidecar suppression withholds the public SRT only after verified embedding;
-  private recovery copies remain. See the [storage and recovery guide](docs/usage.md#replacement-sidecars-and-recovery-storage).
-
-### Fixed
-- Windows replacement no longer refuses the platform unconditionally: local
-  capture/publication checks gate it. Pathname/handle timestamp differences on
-  Windows no longer falsely reject stable files; mutation checks remain active.
-- Replacement faults after verification retain the verified output and report
-  warnings/recovery paths rather than claiming the requested replacement worked.
-
-### Validation and limits
-- Independent focused Linux validation: **438 passed**. A fresh canonical
-  isolated full suite after release stamping records **1606 passed, 2 skipped**; the skips
-  remain Windows-only GPU-meter checks, not GPU proof.
-- Native Windows CPython 3.12/3.13 generated-fixture checks cover replacement,
-  suppression, collision/sharing failures and source/candidate mutation controls.
-  This is source-level evidence, not AI quality, GPU, frozen executable,
-  installer or power-loss certification. Windows directory-entry power-loss
-  durability is not guaranteed.
-- Backups, captures, candidates and journals remain indefinitely, with extra
-  disk usage and no automatic recovery replay. Read-only-source support with a
-  separate output folder is explicitly deferred, not a release blocker.
+### Unchanged
+- Job execution semantics are unchanged from 0.4.19.x: the probe → guard →
+  transcribe → remux/publish pipeline, cancellation, scratch cleanup, sidecar
+  discipline, plan-time skip verdicts, recursive Add Folder, and the CLI
+  device line all behave exactly as 0.4.19 (plus the GPU coordination block
+  above). Known 0.4.19-era limitations re-attested: non-atomic output
+  publication/sidecar overwrite on the replace/suppress paths, and the
+  startup-sweep asymmetry (a GUI start closes orphaned queued jobs as failed;
+  an MCP server start resumes them) — both documented pre-existing behavior.
 
 ## [0.4.19.0] - 2026-11-04
 

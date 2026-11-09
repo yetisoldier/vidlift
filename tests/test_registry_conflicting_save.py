@@ -184,12 +184,10 @@ def test_stale_cancel_converges_foreign_running_row(state_dir):
     a.transition(rec, "running")  # the claim: A registers the flag
     _stale(b)
     verdict = b.cancel(rec.job_id)  # B holds no CancelFlag for it
-    assert verdict == "cancelling", (
+    assert verdict == "cancelled", (
         f"the stale view lied for a file-visible running job: {verdict!r}"
     )
-    assert _file_rows(state_dir)[rec.job_id]["state"] == "running"
-    a.poll_cancellation()
-    assert a.get_cancel_flag(rec.job_id).is_set()
+    assert _file_rows(state_dir)[rec.job_id]["state"] == "cancelled"
 
 
 def test_stale_cancel_batch_converges_foreign_rows(state_dir):

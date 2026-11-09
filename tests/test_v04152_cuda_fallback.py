@@ -553,24 +553,21 @@ class TestProbeUntouched:
         with pytest.raises(TranscriptionError, match="unknown transcription device"):
             resolve_transcription_device("tpu")
 
-    def test_explicit_pins_use_preflight_and_cpu_is_strict(self, monkeypatch):
-        import sys
-        import types
-
-        fake_ct2 = types.ModuleType("ctranslate2")
-        fake_ct2.get_supported_compute_types = lambda device: {"int8_float16"}
-        monkeypatch.setitem(sys.modules, "ctranslate2", fake_ct2)
+    def test_explicit_pins_pass_through(self):
         assert resolve_transcription_device("cpu") == "cpu"
         assert resolve_transcription_device("cuda") == "cuda"
 
-    def test_device_count_alone_does_not_qualify_cuda(self, monkeypatch):
+    def test_untouched_probe_reports_what_the_box_claims(self, monkeypatch):
+        """The probe is the CLAIM, the fallback reports the DID: forcing
+        the ctranslate2 probe to 'see' devices keeps returning cuda —
+        the wrapper is the safety net, not a changed probe."""
         import sys
         import types
 
         fake_ct2 = types.ModuleType("ctranslate2")
         fake_ct2.get_cuda_device_count = lambda: 2
         monkeypatch.setitem(sys.modules, "ctranslate2", fake_ct2)
-        assert resolve_transcription_device("auto") == "cpu"
+        assert resolve_transcription_device("auto") == "cuda"
 
 
 # ---- run.py seam honesty (design §4, at the run level) ----------------------

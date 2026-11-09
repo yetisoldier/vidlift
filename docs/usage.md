@@ -36,11 +36,7 @@ The two hexadecimal hashes must match exactly.
 
 ## 2. Plan files in the desktop app
 
-Launch VidLift and select **AI Upscale** or **Subtitles Only**. Each tab keeps
-its own options; both share the queue, details and results. Changing tabs does
-not plan, stage or submit files. Checked options display a tick; unchecked
-options display an empty square, with checked state still visible when disabled.
-The screenshots below show an earlier layout; use the current tab labels.
+Launch VidLift. The opening screen is intentionally simple:
 
 ![VidLift home screen](images/vidlift-home.png)
 
@@ -70,11 +66,10 @@ does not change the 720p output geometry.
 Select **Output Folder** if every planned MP4 should go to one destination.
 Leave it empty to place each output beside its source.
 
-### Run the AI Upscale pre-flight plan
+### Run the pre-flight plan
 Choose whether **Enable subtitle OCR** should remain on, then select **Plan Batch**.
 
-Replacement and sidecar suppression are separate, opt-in settings in each tab.
-See [replacement, sidecars and recovery storage](#replacement-sidecars-and-recovery-storage).
+If you are using the **Add subtitles (no upscale)** mode, you can also choose whether to **Replace original on success**. When enabled, VidLift deletes the source file and renames the output to the source's name with an `.mp4` extension after a successful pass.
 
 ![VidLift planned batch](images/vidlift-planned-batch.png)
 
@@ -96,78 +91,11 @@ and estimated size.
 
 Select **Start Upscale** to process every ready item serially. The progress bar
 shows the completed count and current file. Select **Cancel Current** to stop
-the active file. Built-in transcription runs in a supervised child process so
-cancel and timeout handling can stop a stuck engine. Model preparation and
-GPU-lock waits also observe cancellation. Once media publication starts, late
-cancellation is deferred to a safe checkpoint; it does not undo a committed output.
-
-### Subtitles Only
-
-1. Select **Subtitles Only** and choose the transcription device, replacement
-   and sidecar options before adding files. Options are captured when files are added.
-2. Use **Add Subtitles…**, **Add Folder** (recursive), or drop videos onto this
-   workflow. Files are checked and staged, not immediately submitted.
-3. Review the rows. Already-usable embedded text subtitles are skipped; an
-   existing subtitles output is blocked. Bitmap tracks and external SRT files
-   do not count as embedded text for this skip. CLI **--force** overrides only
-   the subtitle-presence check, never an output collision.
-4. Use **Remove selected staged** or **Clear staged subtitles** to correct the
-   selection, then **Start Subtitles** to submit eligible staged files.
-
-This workflow transcribes the file's audio and copies video/audio into
-**{stem}.subs.mp4**, embedding toggleable text subtitles. It does not upscale,
-re-encode video/audio, or perform bitmap OCR. The source must contain audio and
-its copied streams must be MP4-compatible; unsupported remuxes fail rather than
-silently re-encoding. Existing bitmap subtitles and other non-mapped streams
-are not carried into this output. A transcription/remux failure fails this job
-and retains available diagnostic/subtitle material.
-
-### Replacement, sidecars and recovery storage
-
-- Both **Replace original on success** and **Suppress .srt sidecar on success**
-  default off and are independent in each workflow.
-- Without replacement, AI Upscale normally publishes **{stem}.720p.mp4** in the
-  chosen output folder or beside the source. Subtitles Only publishes
-  **{stem}.subs.mp4** beside the source, irrespective of the upscale output folder.
-- With replacement, AI Upscale publishes MP4 bytes at the exact original
-  pathname, even if its extension is not **.mp4**. Subtitles Only instead uses
-  **{stem}.mp4** beside the source. On successful replacement the old source
-  pathname is retired, but original bytes are retained in recovery storage.
-  Failed upscale transcription prevents source retirement.
-- A verified candidate and source identity/content checks precede replacement.
-  An independent original backup is made before capture. An unrelated target is
-  never intentionally overwritten. Sharing violations, changed sources or late
-  collisions can retain output at a fallback or private path with warnings.
-  Read the actual output path and recovery notes, not just the job's success
-  state: a verified fallback is not confirmation that replacement succeeded.
-- Suppression withholds the public SRT only after embedding and publication
-  have been verified. It does not burn subtitles into the picture or remove
-  private subtitle evidence. Failed embedding keeps an available SRT as fallback.
-  Existing sidecars are not overwritten; if publication is refused, the result
-  reports the retained private SRT path.
-- Private **.vidlift-media-*** directories beside sources retain candidates,
-  subtitle material and **journal.json**; replacement also retains
-  **original.backup** and, when captured, **original.captured**. Cross-device
-  output staging can create **.vidlift-media-output-*** beside the destination.
-  These are separate from ordinary scratch cleanup and remain indefinitely.
-  Budget for an additional full independent original copy plus retained original
-  and output/staging material, not just the final MP4. Suppression and replacement
-  are not disk-reclamation features; retained links may share storage, so there
-  is no fixed disk-space multiplier.
-- Inspect output and recovery paths before manually removing recovery material.
-  There is no automatic journal replay or recovery cleanup. An incomplete
-  transaction affecting the same paths can block another attempt pending inspection.
-
-Sources must be in writable directories even when a separate output folder is
-selected and replacement is off. Read-only-source support is explicitly deferred,
-not a blocker for this release. Local stable file identity, locking and hard-link
-publication support are required. Replacement refuses hardlinked sources;
-symlink/reparse paths and unsafe parent directories can also be refused.
-
-On Windows, disposable local capture/publication checks run before processing.
-Directory-entry durability through power loss is not guaranteed. Native
-source-level fixture validation is not certification of GPU/model quality,
-frozen executables, installers or crash/power-loss recovery for this cycle.
+the active file safely; files not yet started remain untouched. Cancellation is
+now observed during pre-transcription steps (model resolution, download, load,
+and language detection) in both modes. Note: a process blocked inside a hung
+native call still requires quitting the app, and waiting on the GPU phase lock
+is not cancellable.
 
 ## 3. Run one file from PowerShell
 
@@ -267,11 +195,7 @@ The run record is stored in a **.vidlift-runs** folder and includes:
 When **Enable subtitle OCR** is on and OCR produces a subtitle, VidLift writes
 an SRT beside the MP4 and embeds a soft subtitle track where supported. Turning
 OCR off skips bitmap subtitle conversion while preserving ordinary text subtitle
-handling. OCR failures do not discard a successfully completed video. Sidecar
-suppression and retained private material follow the
-[storage rules above](#replacement-sidecars-and-recovery-storage).
-
-<a id="troubleshooting"></a>
+handling. OCR failures do not discard a successfully completed video.
 
 ## 7. Troubleshooting
 
@@ -285,20 +209,6 @@ release page and verify its SHA-256 checksum before selecting **Run anyway**.
 Update the graphics driver. Real-ESRGAN requires a working Vulkan-capable GPU.
 Remote desktop and virtual machines can hide Vulkan support even when the
 physical GPU supports it.
-
-### Windows transcription says GPU coordination is unavailable
-
-On Windows, VidLift checks the GPU mutex ACL before using the shared
-transcription GPU. Windows generic rights are normalized to their concrete
-read, write, execute, and all-access rights before the ACL is checked; a valid mutex ACL
-is accepted after this normalization. If the mutex namespace itself is
-unavailable, **Auto** selects CPU and reports that fallback. An explicit
-**CUDA** selection refuses to run without coordination. Contention and
-unrecognized coordination errors fail closed rather than starting GPU work
-without the lock. See the [release notes](../CHANGELOG.md#04210---2026-11-06).
-
-The standard released installer still does not bundle CUDA/cuDNN. This mutex
-handling does not certify CUDA, GPU transcription, or a portable GPU build.
 
 ### A file is skipped
 
@@ -319,13 +229,6 @@ Adjust **GB/hour**. For example:
 Check the latest log in **.vidlift-runs**. Heartbeat lines and a changing
 last-activity time indicate useful work. AI upscale and final verification can
 each take a long time.
-
-The built-in transcription worker has init, progress-sensitive decode and
-absolute time limits. An eligible CUDA failure before any segments are emitted
-can retry once on CPU; device-independent errors and failures after progress do
-not silently restart. The reported fallback reason explains CPU use. A CUDA
-failure can be reused within the same batch, but a new batch probes again.
-These safeguards are not a universal bound on every download or external tool.
 
 ### The job shows running after it failed
 

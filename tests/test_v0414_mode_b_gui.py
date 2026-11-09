@@ -150,7 +150,7 @@ class _ScriptedClient:
         return list(chosen)
 
     def enqueue_subs(
-        self, paths, *, replace_source=False, suppress_srt=False, device="auto", batch_id=None
+        self, paths, *, replace_source=False, suppress_srt=False, device="auto"
     ):
         """The Mode B surface: kind-checked ids in pick order.
 
@@ -1210,36 +1210,3 @@ def test_ws3_failed_enqueue_keeps_staged_row(qapp, monkeypatch, tmp_path):
     # An arbitrary BridgeError cannot prove that no job was recorded.
     assert win._staged_subs[0]["uncertain"]
     assert not win.start_subtitles_button.isEnabled()
-
-
-def test_ws3_mixed_option_snapshots_submit_separately(qapp, monkeypatch, tmp_path):
-    files = [tmp_path / "first.mkv", tmp_path / "second.mkv"]
-    for path in files:
-        path.write_bytes(b"x")
-    client = _ScriptedClient()
-    client.make_job(str(files[0]), [{"state": "queued"}], kind="subs")
-    client.make_job(str(files[1]), [{"state": "queued"}], kind="subs")
-    import vidlift.gui as gui_mod
-    monkeypatch.setattr(gui_mod, "subs_plan_verdict", lambda *a, **k: "ready")
-    monkeypatch.setattr(gui_mod.QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
-    gen = _window(qapp, monkeypatch, tmp_path, client)
-    win = next(gen)
-    win.subs_replace_source.setChecked(True)
-    win._enqueue_subs_paths([str(files[0])])
-    win.subs_replace_source.setChecked(False)
-    win.subs_suppress_srt.setChecked(True)
-    win._enqueue_subs_paths([str(files[1])])
-    calls = []
-    original = client.enqueue_subs
-    def record(paths, **options):
-        calls.append((list(paths), options.copy()))
-        return original(paths, **options)
-    monkeypatch.setattr(client, "enqueue_subs", record)
-    win.start_subtitles()
-    batch = calls[0][1]["batch_id"]
-    assert batch and calls[1][1]["batch_id"] == batch
-    assert calls == [
-        ([str(files[0].resolve())], {"replace_source": True, "suppress_srt": False, "device": "auto", "batch_id": batch}),
-        ([str(files[1].resolve())], {"replace_source": False, "suppress_srt": True, "device": "auto", "batch_id": batch}),
-    ]
-    assert win._staged_subs == []

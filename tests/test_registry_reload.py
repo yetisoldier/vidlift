@@ -14,7 +14,7 @@ import json
 import pytest
 
 from vidlift.mcp_bridge.jobs import CancelFlag
-from vidlift.mcp_bridge.registry import Registry, RegistryError
+from vidlift.mcp_bridge.registry import Registry
 
 
 @pytest.fixture
@@ -105,12 +105,10 @@ def test_reload_preserves_live_state_box(state_dir):
     assert seen.get_live("state_box")["state"] == "sentinel"
 
 
-def test_reload_corruption_refuses_reads_and_writes_without_losing_memory(state_dir):
-    """Authoritative receipt truth cannot fall back to stale executable rows.
-
-    Keep previous memory for diagnosis, but refuse both reads and writes
-    until the corrupt file is reconciled. Never recreate an empty registry.
-    """
+def test_reload_failure_is_soft(state_dir, capsys):
+    """Test 18: a corrupt file between an mtime bump and a read is a
+    soft failure — the reader keeps the in-memory view and logs; no
+    raise (the hard raise stays at startup load())."""
     a = Registry(state_dir)
     record = a.enqueue(kind="run", paths=["/x/movie.avi"], options={})
     baseline = a._loaded_mtime
@@ -119,15 +117,11 @@ def test_reload_corruption_refuses_reads_and_writes_without_losing_memory(state_
     registry_path = state_dir / "jobs.json"
     registry_path.write_text("{corrupt json", encoding="utf-8")
     a._loaded_mtime = -12345.0  # guarantees a "changed" mtime branch
-    before = registry_path.read_bytes()
-    with pytest.raises(RegistryError, match="preserve the registry"):
-        a.get(record.job_id)
-    assert a._jobs[record.job_id] is record
-    assert record.paths == ["/x/movie.avi"]
-    with pytest.raises(RegistryError, match="preserve the registry"):
-        a.enqueue(kind="run", paths=["/x/second.avi"], options={})
-    assert registry_path.read_bytes() == before
-    assert list(a._jobs) == [record.job_id]
+    seen = a.get(record.job_id)
+    assert seen is not None  # in-memory view preserved
+    assert seen.paths == ["/x/movie.avi"]
+    out = capsys.readouterr().out
+    assert "registry reload failed" in out
     assert baseline is not None  # (sanity: the fixture had a real mtime)
 
 

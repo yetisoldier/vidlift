@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import time
-import uuid
 from pathlib import Path
 
 from ..benchmark import STUB_NOTE, estimate_eta, load_estimates
@@ -334,9 +333,7 @@ def tool_benchmark(services: BridgeServices, args: dict) -> dict:
 
 def tool_run(services: BridgeServices, args: dict) -> dict:
     """run (Section 4.4): enqueue, return immediately, never block."""
-    options = dict(args.get("options") or {})
-    if options.get("batch_id") is None:
-        options["batch_id"] = uuid.uuid4().hex
+    options = args.get("options") or {}
     jobs: list[dict] = []
     for path in args["paths"]:
         if not os.path.isfile(path):
@@ -482,16 +479,6 @@ def _transcription_echo(record, state, manifest) -> dict:
         if getattr(record, "state", None) == "running" and snapshot:
             live_progress = snapshot.get("progress") or {}
     live_device = live_progress.get("transcription_device") or None
-    fallback = live_progress.get("transcription_fallback_reason")
-    if not fallback:
-        persisted = getattr(record, "progress_snapshot", None) or {}
-        fallback = (persisted.get("progress") or {}).get("transcription_fallback_reason")
-    if not fallback:
-        notes = (record.result or {}).get("notes", [])
-        fallback = next((note for note in notes if isinstance(note, str) and
-                         ("fell back to cpu" in note.lower() or "cached " in note.lower())), None)
-    if fallback:
-        echo["fallback_reason"] = str(fallback).replace("\n", " ")[:200]
     live_requested = (
         live_progress.get("transcription_device_requested") or None
     )
@@ -677,17 +664,8 @@ def _status_payload(services: BridgeServices, record) -> dict:
             payload["current_phase"] = "done"
         elif run.get("error_phase"):
             payload["current_phase"] = run["error_phase"]
-    if record.kind in {"benchmark", "subs"} and record.result is not None:
+    if record.kind == "benchmark" and record.result is not None:
         payload["result"] = record.result
-    # Derive age from the timestamp actually displayed, after the live/mirror
-    # overlay. Registry reads can refresh the durable row between beats; its
-    # timestamp must not make a fresh in-process heartbeat appear stale.
-    activity = payload["last_activity_at"]
-    payload["activity_age_seconds"] = (
-        max(0.0, time.time() - float(activity))
-        if record.state not in {"succeeded", "failed", "cancelled"} and activity is not None
-        else None
-    )
     return payload
 
 
@@ -799,13 +777,6 @@ def tool_transcribe(services: BridgeServices, args: dict) -> dict:
     lang = args.get("lang") or ""
     model = args.get("model") or None
     device = args.get("device") or "auto"
-    if device not in {"auto", "cuda", "cpu"}:
-        raise InvalidInput("device", "device must be one of auto|cuda|cpu")
-    batch_id = args.get("batch_id")
-    if batch_id is not None and not isinstance(batch_id, str):
-        raise InvalidInput("batch_id", "batch_id must be a string")
-    if batch_id is None:
-        batch_id = uuid.uuid4().hex
     force = bool(args.get("force", False))
     # v0.4.17 (opt-in replace-source): absent -> False (the
     # absent-defaults rule; pre-0.4.17 callers are behavior-identical).
@@ -861,7 +832,6 @@ def tool_transcribe(services: BridgeServices, args: dict) -> dict:
                 "force": force,
                 "replace_source": replace_source,
                 "suppress_srt": suppress_srt,
-                "batch_id": batch_id,
             },
         )
         services.executor.notify_new_work()

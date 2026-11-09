@@ -69,16 +69,6 @@ class ModeARunner(FakeRunner):
     def __call__(self, binary: str, args: list[str]) -> tuple[int, str, str]:
         argv = list(args)
         joined = " ".join(argv)
-        if "-show_streams" in argv and "-show_format" not in argv:
-            import json
-            w, h = self.output_geometry
-            subs = json.loads(self.payload)["streams"]
-            embedded = any(s.get("codec_type") == "subtitle" and s.get("codec_name") in {"srt", "subrip", "mov_text", "ass", "ssa", "webvtt"} for s in subs)
-            streams = [{"codec_type": "video", "width": w, "height": h}]
-            if embedded or argv[-1].endswith(".muxing.mp4") or (Path(argv[-1]).is_file() and Path(argv[-1]).read_bytes() == b"muxed-stub"):
-                streams.append({"codec_type": "subtitle", "codec_name": "mov_text"})
-            self.commands.append((binary, tuple(argv)))
-            return 0, json.dumps({"streams": streams}), ""
         if "pcm_s16le" in joined:
             # record WITHOUT falling through to super (which would
             # append it a second time)
@@ -102,10 +92,7 @@ class _NoLock:
         self.acquired = False
         self.released = False
 
-    def acquire(self, on_wait=None, should_cancel=None):
-        if should_cancel is not None and should_cancel():
-            from vidlift.run import EngineCancelled
-            raise EngineCancelled("cancelled acquiring test lock")
+    def acquire(self, on_wait=None):
         self.acquired = True
         return True
 
@@ -321,9 +308,7 @@ def test_31_ocr_branch_suppression_and_kit_retention(
     assert "sidecar_path" not in subs
     assert _mux_cmd_in(runner)  # the mux ran before the removal
     assert not sidecar.exists()
-    import json
-    journal = Path(result.state.media_transaction["journal_path"])
-    kit = Path(json.loads(journal.read_text())["candidate"] + ".ocr")
+    kit = out.parent / (out.name + ".ocr")  # the fake kit's own path
     assert kit.is_dir()
     assert any(p.name == "kit.txt" for p in kit.iterdir())
 
@@ -384,13 +369,11 @@ def test_33_suppress_removal_oserror_success_with_truthful_path(
     sidecar = out.with_suffix(".srt")
     subs = result.state.subtitles
     assert result.ok
-    # Withholding a private sidecar has no public removal syscall to fail.
-    # Even a broken legacy deletion adapter cannot break suppression.
-    assert not sidecar.exists()
-    assert "sidecar_path" not in subs
-    assert subs["sidecar_suppressed"] is True
+    assert sidecar.is_file()
+    assert subs["sidecar_path"] == str(sidecar)
+    assert "sidecar_suppressed" not in subs
     log_text = "\n".join(result.state.log.tail(100)) if result.state.log else ""
-    assert "WARNING suppress-srt: could not remove" not in log_text
+    assert "WARNING suppress-srt: could not remove" in log_text
 
 
 # ---------------------------------------------------------------- CLI (34)

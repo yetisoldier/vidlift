@@ -68,9 +68,9 @@ Options:
 - **--realesrgan PATH:** override the bundled ncnn executable
 - **--realesrgan-models PATH:** override the bundled model directory
 - **--no-transcribe:** disables Mode A audio transcription / subtitle transcription for that run or plan
-- **--suppress-srt:** withhold the public SRT after verified embedding and
-  publication; keep available subtitles on failed embedding (default: keep).
-  Private subtitle recovery material remains retained.
+- **--suppress-srt:** after subtitles are embedded in the verified output, delete the
+  redundant .srt sidecar; a fail-open embed keeps the sidecar as the fallback
+  (default: keep the sidecar)
 
 Engine behavior:
 
@@ -111,26 +111,22 @@ Options:
 - **--force:** transcribe even when a usable text subtitle track already exists.
   Note: `--force` does NOT bypass the check for existing output files; if the
   output already exists, the job is still blocked.
-- **--suppress-srt:** withhold the public SRT after verified embedding and
-  publication, retaining private subtitle evidence. A mux failure retains an
-  available SRT as fallback (default: keep the sidecar).
-- **--replace-source:** after a verified pass, publish at **{stem}.mp4** beside
-  the source and retire the original pathname. Original backup/capture bytes
-  remain in private recovery storage; unrelated targets are not overwritten
+- **--suppress-srt:** after the subtitle track is muxed into the MP4, delete the redundant
+  `.srt` sidecar (on a mux failure the sidecar is kept as the fallback; default: keep the sidecar)
+- **--replace-source:** after a verified pass, delete the source video and rename
+  the output to the source's name with an `.mp4` extension (e.g. `movie.avi` →
+  `movie.mp4`). If a file of that name already exists, both files are kept
   (default: off).
 - **--ffmpeg PATH / --ffprobe PATH:** override the bundled binaries
 
 Folder adds and file drops in the GUI walk the folder tree recursively
 (subfolders included), so a whole show queues at once; outputs still land
-beside each source file. Ordinary default transcription scratch may be cleaned
-after success, but private media candidates, backups and journals remain
-indefinitely. Failures and cancellations retain diagnostics.
+beside each source file. The `{stem}.subs-work` scratch directory is removed
+automatically after a successful job (failures and cancels keep it for
+diagnosis).
 
-A replacement refusal after verification can still return **0** with warnings
-and a retained verified output, possibly at a private path. This is not proof
-that replacement succeeded; preparation or verification errors can still fail
-the job. See [replacement and recovery limits](usage.md#replacement-sidecars-and-recovery-storage)
-for disk implications, writable-source requirements and Windows durability limits.
+A refused replace (for example, a name collision) still exits **0** — it is a
+successful job with a warning, never a failure.
 
 ## Benchmark
 

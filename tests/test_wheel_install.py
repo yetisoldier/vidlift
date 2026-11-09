@@ -34,12 +34,20 @@ def test_noneditable_wheel_contains_runtime_packages(tmp_path):
     script = f"""
 import sys, importlib, importlib.metadata, pathlib, json
 sys.path[:0] = {[str(target)] + dependency_paths!r}
-modules = ['vidlift', 'vidlift.ui.review', 'vidlift.ui.single_instance',
-           'vidlift.mcp_bridge.client_local', 'vidlift.cuda_runtime',
+modules = ['vidlift', 'vidlift.ui', 'vidlift.ui.widgets', 'vidlift.ui.gpu_meter',
+           'vidlift.ui.drop_area', 'vidlift.ui.preflight', 'vidlift.ui.review',
+           'vidlift.ui.view_state', 'vidlift.mcp_bridge',
+           'vidlift.mcp_bridge.client_local', 'vidlift.mcp_bridge.registry',
            'vidlift.gpu_arbitration']
 for name in modules:
     module = importlib.import_module(name)
     assert pathlib.Path(module.__file__).is_relative_to({str(target)!r}), module.__file__
+# v0.4.22.0 scope restore (spec §5-H.3): the cut modules must not ride the wheel.
+cut_modules = ['vidlift.cuda_runtime', 'vidlift.transcription_watchdog',
+               'vidlift.media_transaction', 'vidlift.safe_files',
+               'vidlift.ui.single_instance', 'vidlift.mcp_bridge.registry_transactions']
+for name in cut_modules:
+    assert importlib.util.find_spec(name) is None, name + " must not be shipped"
 entries = list(importlib.metadata.distribution('vidlift').entry_points)
 assert {{e.name for e in entries}} == {{'vidlift', 'vidlift-cli', 'vidlift-gui'}}
 for entry in entries:

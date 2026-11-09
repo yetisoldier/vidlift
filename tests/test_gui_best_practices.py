@@ -390,34 +390,6 @@ def test_uncorrelated_active_subtitle_is_not_adopted_after_enqueue_error(ui, tmp
     assert win.file_table.item(0, 1).text() == path
 
 
-def test_partial_upscale_submission_tracks_successes_without_row_aliasing(ui, tmp_path, monkeypatch):
-    import dataclasses
-    win, client = ui
-    plans = []
-    for name in ("first.mkv", "bad.mkv", "last.mkv"):
-        plan = _plan_for(tmp_path)
-        path = media(tmp_path, name)
-        plans.append(dataclasses.replace(plan, report=dataclasses.replace(plan.report, path=path)))
-    win.batch = BatchPlan(plans)
-    win.render_batch(win.batch)
-    calls = []
-    from vidlift.mcp_bridge.client_local import GuiSubmissionResult
-    def submit(kind, path, **options):
-        calls.append(path)
-        if path == plans[1].report.path:
-            return GuiSubmissionResult("rejected", error=FileNotFoundError("synthetic vanished source"))
-        return GuiSubmissionResult("accepted", (client.make_job(path, [{"state": "queued"}], kind="run"),))
-    monkeypatch.setattr(client, "submit_gui_job", submit, raising=False)
-    win.start_upscale()
-    assert calls == [p.report.path for p in plans]
-    assert len(win.job_ids) == 2
-    assert sorted(win._batch_row_for_job.values()) == [0, 2]
-    assert win.file_table.item(1, 0).text() == "not submitted"
-    for job, row in win._batch_row_for_job.items():
-        assert win._row_meta(row)["plan"].report.path == client.jobs[job]["file_path"]
-    assert "synthetic vanished source" in win.message_label.text()
-
-
 def test_history_refresh_follows_job_identity_not_row_number(ui, monkeypatch):
     win, client = ui
     old = {"job_id": "old-fixture", "file_path": "old synthetic.mkv", "state": "failed"}

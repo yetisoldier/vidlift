@@ -42,30 +42,14 @@ required.
 **You'll need:** Windows 11, Vulkan-capable GPU $\cdot$ **Time:** ~2 minutes
 
 1. Download and run the **Setup.exe** from the [latest release](https://github.com/yetisoldier/vidlift/releases/latest).
-2. Launch **VidLift** from the Start menu and choose **AI Upscale**.
-3. Drag a video file into the window or use **Add Files**.
+2. Launch **VidLift** from the Start menu. ✅ *You should see the main window with "Add Files" options.*
+3. Drag a video file into the window. ✅ *The file should appear in the list with "Ready" status.*
 4. Select **Plan Batch**. ✅ *You should see the output geometry and estimated size.*
 5. Select **Start Upscale**.
 
 Stuck? → [Troubleshooting](#-troubleshooting)
 
-For transcription without upscaling, choose **Subtitles Only**, set its options,
-add files with **Add Subtitles…** or **Add Folder**, then select **Start Subtitles**.
-Adding files stages them for review; switching tabs never starts work. Both tabs
-share the queue and results. Checkboxes show an empty square when off and a
-visible tick when on, including when disabled during a run.
-
-See [workflow controls](docs/ui.md#controls) and
-[replacement, sidecars and recovery storage](docs/usage.md#replacement-sidecars-and-recovery-storage)
-before enabling replacement or sidecar suppression.
-
-The standard installer does not bundle NVIDIA CUDA/cuDNN runtime binaries.
-GPU transcription is not certified by this release; unavailable CUDA support
-is reported with CPU fallback. Vulkan upscaling is a separate engine.
-
 ## Plan a batch
-
-Screenshots below show an earlier layout; the current app uses workflow tabs.
 
 Open VidLift, then drag video files into the window or select **Add Files**
 or **Add Folder** (folder adds include every subfolder, so a whole show
@@ -83,11 +67,11 @@ subtitles, and estimated size.
 ![VidLift planned batch](docs/images/vidlift-planned-batch.png)
 
 Select **Start Upscale** to process every ready file serially. VidLift shows the
-current file and completed count while keeping the window responsive.
-Select **Cancel Current** to request cancellation. The built-in transcription
-engine runs in a supervised child process with cancellation and timeout handling;
-GPU-lock waits also observe cancellation. Publication defers late cancellation
-to a safe checkpoint. See the [user guide](docs/usage.md#the-job-appears-stuck).
+current file and completed count while keeping the window responsive. Select
+**Cancel Current** to stop safely. Cancellation is now observed during pre-transcription
+steps (model resolution, download, load, and language detection) in both modes.
+Note: a process blocked inside a hung native call still requires quitting the app,
+and waiting on the GPU phase lock is not cancellable.
 
 ## Run an upscale
 
@@ -109,21 +93,24 @@ VidLift performs:
 7. subtitle pass-through or OCR when possible
 
 ## 📡 Remote monitoring
- 
+
 The desktop app serves a small read-only status API while it runs
 (LAN monitoring, on by default; the checkbox in the controls area
 turns it off). Every response is read-only — the server has no write
 verbs and no write surface; it can never enqueue or cancel anything.
- 
+
 ```bash
-curl http://<host>:8765/health                          # token-free liveness: {"ok": true, "busy": ...}
-curl "http://<host>:8765/status?token=<token>"         # live queue: api_version 1 + one payload per active job
-curl "http://<host>:8765/history?token=<token>"        # finished jobs, newest first
+curl http://ninjabase2:8765/health                          # token-free liveness: {"ok": true, "busy": ...}
+curl "http://ninjabase2:8765/status?token=<token>"         # live queue: api_version 1 + one payload per active job
+curl "http://ninjabase2:8765/history?token=<token>"        # finished jobs, newest first
 ```
- 
-Authentication: Configure the monitor token in VidLift settings and include it with each request.
-  the app's settings file under `[monitor] token=` (QSettings). Treat it as a
-  secret and share it only with trusted monitoring clients.
+
+- Token: `Authorization: Bearer <token>` or `?token=<token>`.
+  The default token is baked into the app
+  (`vidlift/monitor.py::MONITOR_TOKEN_DEFAULT`); override it in
+  `%APPDATA%\YetiWurks\VidLift\VidLift.conf` under `[monitor] token=`
+  (QSettings). The token is a secret-ish value — give it to your
+  agent's config on the remote machine, never to a web page.
 - The server binds `0.0.0.0:8765` by default (overridable via
   `monitor/host` / `monitor/port`); if the port is reserved (Windows
   Hyper-V/WSL port exclusions), the next free port is used and
@@ -153,19 +140,16 @@ Authentication: Configure the monitor token in VidLift settings and include it w
   - **Device Indicator:** The status payload now includes the resolved
     transcription device (e.g., `GPU (CUDA)`, `CPU`, or `CPU (GPU unavailable)`)
     and the requested device, serving live facts while a job is running.
- 
-## 🎙️ Audio transcription subtitles
 
-VidLift can create subtitles from a video's own audio when transcription is enabled and no usable text subtitle is selected. It uses the `faster-whisper` medium model; the model is downloaded on demand, verified against a SHA-256 pin, and stored in VidLift's per-user state directory. The first download requires network access. Transcription itself uses the locally installed model.
+## 🎙️ Transcription Model Management
 
-The **AI Upscale** tab exposes **Transcribe missing subtitles**. **Subtitles Only**
-transcribes audio and copies video/audio streams into an MP4 without upscaling;
-streams must be MP4-compatible. Existing usable embedded text subtitles are
-skipped and existing outputs are blocked. Transcription failure can leave an
-upscale completed without generated subtitles, but fails a subtitles-only job.
+VidLift uses the `faster-whisper` medium model for audio transcription. To ensure a smooth first-run experience:
 
-Model installation is available through the GUI. The monitor/status API reports model and job state; it is not a remote model-install control.
- 
+- **One-Click Install:** If the model is missing, the GUI provides an **Install** button. This runs as a background task to avoid freezing the interface or blocking the job queue.
+- **Honest Progress:** Model download progress is published in real-time to the GUI and the `/status` API. This prevents "silent stalls" where a long download might otherwise look like a hung application.
+- **Integrity Guaranteed:** Every model download is verified via a SHA-256 pin before use.
+- **GUI-Only Action:** Model installation is a GUI-only feature; the remote monitoring API remains strictly read-only.
+
 ## ⚙️ How it works
 
 VidLift automates a complex multi-stage pipeline so you don't have to:
@@ -188,7 +172,7 @@ fighting for the same GPU.
 
 Example request to Jarvis:
 
-> Queue every supported video in <video-folder> through VidLift and
+> Queue every supported video in D:\Videos\To Upscale through VidLift and
 > report when the batch finishes.
 
 The native CLI currently starts one file per command. The desktop GUI and MCP
@@ -196,24 +180,18 @@ interface both process bulk queues serially so jobs do not compete for the GPU.
 
 ## What you receive
 
-For each successful upscale, VidLift writes:
+For each successful job, VidLift writes:
 
 - a verified 720p HEVC MP4
-- an SRT sidecar when a subtitle was selected or recovered, unless
-  **Suppress .srt sidecar on success** withholds the public sidecar after a
-  verified embed; private subtitle recovery material remains retained
+- an SRT sidecar when a subtitle was selected or recovered (opt-in: the
+  "Suppress .srt sidecar on success" option deletes it after a successful
+  embed — a failed embed always keeps it as the fallback)
 - a run log with commands, phases, and heartbeat activity
 - a JSON manifest with the input, plan, engine, timing, outputs, and
   verification result
 
 Run records are stored in **.vidlift-runs** beside the source unless a different
 log directory is supplied.
-
-Replacement is opt-in and retains an independent original backup, captured
-source and verified candidate in private recovery storage. It is not a disk-space
-reclamation option. Inspect the actual output path and warnings: a verified
-fallback output does not mean replacement succeeded. Recovery material is not
-automatically deleted or replayed.
 
 ## ✍️ Subtitle Recovery (OCR)
 
@@ -240,6 +218,7 @@ In the main window, you can toggle **Enable subtitle OCR**. When enabled, VidLif
 
 - [User guide](docs/usage.md)
 - [Desktop interface](docs/ui.md)
+- [Workflow tabs and staged review](docs/ui.md#workflow-tabs-and-staged-review) — the Subtitles Only / AI Upscale tabs, staged rows, and the Start reviewed jobs dialog
 - [Command-line reference](docs/cli.md)
 - [Troubleshooting](docs/usage.md#troubleshooting)
 - [Development](docs/development.md)
@@ -260,10 +239,9 @@ In the main window, you can toggle **Enable subtitle OCR**. When enabled, VidLif
 | App crashes on start | Missing Vulkan runtime | Install the latest Vulkan SDK or GPU driver. |
 | Output size is too large | High bitrate setting | Check the "Plan" screen; try a different engine if available. |
 | A run appears stuck on "running" after it failed | Stale UI state (pre-v0.4.16.1) | Update to v0.4.16.1; failures now settle correctly on all surfaces and report the reason. |
-| Transcription stops with a timeout | Worker did not make progress | Inspect the reported device/fallback reason and run log; the supervised worker is stopped before returning. |
+| "Cancel Current" does nothing during model load | Hung native call | If the app is blocked inside a native CUDA/model call, it cannot be interrupted; quit the app and restart. |
 | Transcription fails immediately on a fresh install | Missing VAD assets (v0.4.16.1) | Update to v0.4.16.2. If the issue persists, run `vidlift-cli --selftest` to verify the install. |
 | "Resume retained work" is missing or unclickable | Layout overlap (pre-v0.4.17) | Update to v0.4.17.0; a layout overlap that hid the checkbox has been fixed. |
-| Transcription reports GPU coordination unavailable | Windows mutex permissions cannot be safely verified | Auto selects CPU only when the mutex namespace is unavailable; explicit CUDA refuses, and contention or unknown errors fail closed. See [GPU coordination troubleshooting](docs/usage.md#windows-transcription-says-gpu-coordination-is-unavailable). |
 
 ### Transcription Asset Failure
 If you are using v0.4.16.1, transcription will fail because the required Silero VAD model was not bundled. Update to v0.4.16.2 to resolve this.
@@ -287,12 +265,5 @@ Full guide → [docs/usage.md#troubleshooting](docs/usage.md#troubleshooting)
 - Chapters are not preserved.
 - OCR is best effort and fails open so a subtitle problem does not discard a
   completed video.
-- Source directories must be writable even with a separate output folder;
-  read-only-source support is deferred, not a blocker for this release.
-- Local filesystem identity, locking and hard-link publication support are
-  required. Replacement refuses ambiguous hardlinked sources and unsafe paths.
-- Windows directory-entry durability through power loss is not guaranteed.
-  Native source-level replacement checks are not GPU, frozen-build or installer
-  certification for this combined cycle.
 
 Copyright © 2026 YetiWurks LLC. All rights reserved.

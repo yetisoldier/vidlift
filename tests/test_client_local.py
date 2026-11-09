@@ -20,7 +20,6 @@ from vidlift.mcp_bridge.client_local import (
 )
 from vidlift.mcp_bridge.server import build_services
 from vidlift.mcp_bridge.tools import _status_payload
-from _registry_checks import seed_exited_registry
 
 
 def test_build_services_returns_registry_and_executor(tmp_path, monkeypatch):
@@ -48,17 +47,17 @@ def test_build_services_runs_the_restart_sweep(tmp_path, monkeypatch):
     # binding restart error on the NEXT construction — the same sweep
     # the MCP server has always run (design §5 restart discipline).
     monkeypatch.delenv("VIDLIFT_STATE_DIR", raising=False)
-    from vidlift.mcp_bridge.registry import RESTART_ERROR
+    from vidlift.mcp_bridge.registry import RESTART_ERROR, Registry
 
-    registry = seed_exited_registry(tmp_path, [
-        {"path": "/nowhere/movie.avi", "state": "running"}])
-    record = registry.running()[0]
+    registry = Registry(tmp_path)
+    record = registry.enqueue(kind="run", paths=["/nowhere/movie.avi"], options={})
+    registry.transition(record, "running")
+    registry.save()
 
     services = build_services(tmp_path)
     swept = services.registry.get(record.job_id)
     assert swept.state == "failed"
     assert swept.error == RESTART_ERROR
-    assert services.registry.require(record.job_id).ok is False
 
 
 def test_client_local_enqueue_run_creates_jobs_in_order(tmp_path, monkeypatch):

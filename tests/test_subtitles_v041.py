@@ -807,21 +807,9 @@ class TestS11DiagnosisKit:
 
 class TestS12Mux:
     def _mp4(self, tmp_path):
-        from vidlift.media_transaction import prepare_media_operation
-        source = tmp_path / "original.avi"
-        source.write_bytes(b"original")
-        self.operation = prepare_media_operation(source, tmp_path / "movie.mp4", replace_source=False, suppress_srt=False)
-        mp4 = self.operation.directory / "movie.mp4"
+        mp4 = tmp_path / "movie.mp4"
         mp4.write_bytes(b"THE-FINISHED-ENCODE")
         return mp4
-
-    def _probe(self, binary, args):
-        import json
-        streams = [{"index": 0, "codec_type": "video", "codec_name": "hevc", "width": 1280, "height": 720},
-                   {"index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2}]
-        if args[-1].endswith(".muxing.mp4"):
-            streams.append({"index": 2, "codec_type": "subtitle", "codec_name": "mov_text"})
-        return 0, json.dumps({"streams": streams, "format": {"format_name": "mp4", "duration": "5"}}), ""
 
     def test_temp_then_replace_on_success(self, tmp_path):
         mp4 = self._mp4(tmp_path)
@@ -830,13 +818,13 @@ class TestS12Mux:
 
         def runner(binary, args):
             tmp_out = Path(args[-1])
-            assert tmp_out.parent == mp4.parent and tmp_out.name.startswith(".vidlift-mux-")
+            assert tmp_out.name == "movie.mp4.muxing.mp4"  # sibling temp
             tmp_out.write_bytes(b"MUXED")
             return 0, "", ""
 
         S.mux_srt_into_mp4(
             str(mp4), str(srt), language="eng",
-            ffmpeg="ffmpeg", runner=runner, ownership=self.operation, probe_runner=self._probe,
+            ffmpeg="ffmpeg", runner=runner,
         )
         assert mp4.read_bytes() == b"MUXED"
         assert not (tmp_path / "movie.mp4.muxing.mp4").exists()
@@ -853,7 +841,7 @@ class TestS12Mux:
         with pytest.raises(S.SubtitleOcrError, match="muxing failed"):
             S.mux_srt_into_mp4(
                 str(mp4), str(srt), language="eng",
-                ffmpeg="ffmpeg", runner=runner, ownership=self.operation, probe_runner=self._probe,
+                ffmpeg="ffmpeg", runner=runner,
             )
         assert mp4.read_bytes() == before  # bit-identical
         assert not (tmp_path / "movie.mp4.muxing.mp4").exists()
@@ -871,7 +859,7 @@ class TestS12Mux:
 
         S.mux_srt_into_mp4(
             str(mp4), str(srt), language="ger",
-            ffmpeg="ffmpeg", runner=runner, ownership=self.operation, probe_runner=self._probe,
+            ffmpeg="ffmpeg", runner=runner,
         )
         assert "-metadata:s:s:0" in argv_seen
         # v0.4.14 validation fix (M1): 'ger' is a REAL ISO 639-2 code

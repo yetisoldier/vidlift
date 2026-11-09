@@ -70,7 +70,6 @@ _OPTIONS_RUN = {
     # Absent -> config DENOISE_DEFAULT ("off"); pre-0.4.15 callers are
     # behavior-identical (the absent-defaults rule).
     "denoise": {"type": "string"},
-    "batch_id": {"type": "string"},
     # v0.4.18 (opt-in sidecar suppression, D6): absent -> False (the
     # absent-defaults rule); when True the redundant .srt sidecar is
     # removed ONLY after the subtitle track is embedded/muxed
@@ -135,7 +134,6 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "lang": {"type": "string"},
             "model": {"type": "string"},
             "device": {"type": "string", "enum": ["auto", "cuda", "cpu"]},
-            "batch_id": {"type": "string"},
             "force": {"type": "boolean"},
             # v0.4.17 (opt-in Mode B replace-source): absent -> False (the
             # absent-defaults rule); when True, a verified success deletes

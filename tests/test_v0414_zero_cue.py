@@ -16,8 +16,6 @@ from pathlib import Path
 
 import pytest
 
-from test_v0414_subs_job import no_lock
-
 from vidlift.transcribe import (
     LanguageGuess,
     TranscriptSegment,
@@ -228,7 +226,7 @@ class _SubsRunner(_OkRunner):
 
 
 @pytest.mark.usefixtures("_no_engine_env")
-def test_mode_b_zero_cue_job_fails_named(tmp_path, monkeypatch, no_lock):
+def test_mode_b_zero_cue_job_fails_named(tmp_path, monkeypatch):
     """Karen's M2, Mode B: a zero-cue transcription lands the job FAILED
     with the NAMED reason (previously a raw ffmpeg parse error from
     muxing a BOM-only SRT). Exercises the real executor path that

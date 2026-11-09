@@ -99,6 +99,6 @@ def write_srt(cues: list[Cue]) -> str:
 
 
 def write_srt_file(path: str, cues: list[Cue]) -> None:
-    """Publish a new SRT atomically; existing user sidecars are never replaced."""
-    from .safe_files import write_new_bytes
-    write_new_bytes(path, write_srt(cues).encode("utf-8-sig"))
+    """Write an SRT file players and media servers load automatically."""
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        fh.write(write_srt(cues))

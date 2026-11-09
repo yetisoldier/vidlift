@@ -37,7 +37,7 @@ import pytest
 from vidlift.run import EngineCancelled
 from vidlift.subs_job import (
     SubsJobError,
-    replace_subs_output as _replace_subs_output,
+    replace_subs_output,
     run_subs_job,
     subs_output_path,
     subs_replace_target,
@@ -54,15 +54,6 @@ from test_v0414_subs_job import (  # noqa: F401
     engine_on,
     no_lock,
 )
-from _media_fixtures import bind
-
-
-def replace_subs_output(source, output, *, srt_path=None, log_line=None):
-    """Bind the new internal context for the legacy synthetic byte fixtures."""
-    if not Path(source).is_file() or not Path(output).is_file():
-        return _replace_subs_output(source, output, srt_path=srt_path, log_line=log_line)
-    op = bind(source, output, target=subs_replace_target(source), srt=srt_path)
-    return _replace_subs_output(source, output, srt_path=srt_path, log_line=log_line, operation=op)
 
 
 # ------------------------------------------------- 1. pure naming (D6)
@@ -111,7 +102,7 @@ def test_3_happy_path_moves_mp4_and_sidecar(tmp_path):
     assert not src.exists()  # source deleted SECOND
     assert expected_target.read_bytes() == b"muxed-output-bytes"
     assert (tmp_path / "movie.srt").read_bytes() == b"sidecar-bytes"
-    assert srt.read_bytes() == b"sidecar-bytes"  # public compatibility duplicate retained
+    assert not srt.exists()  # renamed, not copied
     assert any("replace-source: output now at" in line for line in log)
 
 
@@ -148,7 +139,7 @@ def test_5_source_is_mp4_one_atomic_move_no_delete_observable(
     final_out, final_srt = replace_subs_output(str(src), str(out))
     assert final_out == str(src)
     assert Path(final_out).read_bytes() == b"muxed-output-bytes"
-    assert out.read_bytes() == b"muxed-output-bytes"  # verified public duplicate retained
+    assert not out.exists()  # the .subs.mp4 name is consumed
     assert removals == []  # no delete step for this case
     assert final_srt is None
 
@@ -158,9 +149,22 @@ def _diverge_devices(monkeypatch, *paths) -> None:
     only those): the cross-device arm becomes reachable without a real
     second filesystem. Every other path (and every is_file()/exists()
     read) stays on the real stat."""
-    # The transaction always copies independently onto the source filesystem.
-    # Faking source metadata now correctly fails stable-handle validation.
-    return None
+    real_stat = os.stat
+    xor_by_path = {
+        os.path.realpath(str(path)): mask
+        for mask, path in zip((0x10, 0x20), paths)
+    }
+
+    def fake_stat(path, *a, **kw):
+        res = real_stat(path, *a, **kw)
+        real = os.path.realpath(os.fspath(path))
+        if real in xor_by_path:
+            fields = list(res)
+            fields[2] = res.st_dev ^ xor_by_path[real]  # st_dev is index 2
+            return os.stat_result(tuple(fields))
+        return res
+
+    monkeypatch.setattr(os, "stat", fake_stat)
 
 
 def test_6_cross_device_arm_stages_verifies_and_sweeps(
@@ -186,13 +190,10 @@ def test_6_cross_device_arm_stages_verifies_and_sweeps(
     target = tmp_path / "video title.mp4"
     assert final_out == str(target)
     assert target.read_bytes() == b"muxed-output-bytes"  # byte identity
-    assert out.read_bytes() == b"muxed-output-bytes"  # retained duplicate
+    assert not out.exists()  # the former output copy is unlinked
     tmp_sibling = str(target) + ".replace-tmp"
     assert not os.path.exists(tmp_sibling)  # the temp never outlives
-    assert copies == []  # no legacy copy2/predictable-temp implementation
-    journal, = tmp_path.glob(".vidlift-media-*/journal.json")
-    assert (journal.parent / "original.backup").read_bytes() == b"source-bytes"
-    assert (journal.parent / "original.captured").read_bytes() == b"source-bytes"
+    assert copies == [(str(out), tmp_sibling)]  # staged at a sibling
     assert not src.exists()  # step 3: the shipped replace removes it
 
 
@@ -208,12 +209,9 @@ def test_6b_cross_device_copy_cleanup_keeps_both_on_mid_copy_failure(
     def boom_copy2(*a, **kw):
         raise OSError(28, "No space left on device")
 
-    import vidlift.media_transaction as tx
-    monkeypatch.setattr(tx, "_copy_checked", boom_copy2)
-    log = []
-    returned, _ = replace_subs_output(str(src), str(out), log_line=log.append)
-    assert returned == str(out)
-    assert any("No space" in line for line in log)
+    monkeypatch.setattr(shutil, "copy2", boom_copy2)
+    with pytest.raises(SubsJobError, match="cross-device copy"):
+        replace_subs_output(str(src), str(out))
     assert src.read_bytes() == b"source-bytes"
     assert out.read_bytes() == b"muxed-output-bytes"
     assert not os.path.exists(
@@ -258,8 +256,8 @@ def test_8_sidecar_collision_keeps_sidecar_mp4_still_ships(tmp_path):
     assert not src.exists()
     assert stranger_srt.read_bytes() == b"unrelated-pre-existing-srt"
     assert sidecar.read_bytes() == b"sidecar-bytes"
-    assert Path(final_srt).read_bytes() == b"sidecar-bytes"  # HONEST retained private location
-    assert any("sidecar publication refused" in line for line in log)
+    assert final_srt == str(sidecar)  # HONEST location
+    assert any("35 Hours.srt already exists" in line for line in log)
 
 
 def test_9_missing_output_refuses_source_kept(tmp_path):
@@ -267,7 +265,7 @@ def test_9_missing_output_refuses_source_kept(tmp_path):
     missing = tmp_path / "vanish.subs.mp4"
     with pytest.raises(
         SubsJobError,
-        match="prepared verified operation",
+        match="replace-source refused: verified output is missing:",
     ):
         replace_subs_output(str(src), str(missing))
     assert src.read_bytes() == b"source-bytes"  # source kept
@@ -278,7 +276,7 @@ def test_10_missing_source_refuses_output_kept(tmp_path):
     missing = tmp_path / "ghost.avi"
     with pytest.raises(
         SubsJobError,
-        match="prepared verified operation",
+        match="replace-source refused: source is gone:",
     ):
         replace_subs_output(str(missing), str(out))
     assert out.read_bytes() == b"muxed-output-bytes"  # output kept
@@ -291,14 +289,14 @@ def test_11_failing_source_delete_keeps_both_and_warns(
     stands, both target and source exist, warning narrates the residue
     (the user removes the original manually — documented worst case)."""
     src, out = _stage_pair(tmp_path)
-    real_remove = os.rename
+    real_remove = os.remove
 
     def failing_remove(path, *a, **kw):
         if os.path.abspath(os.fspath(path)) == os.path.abspath(str(src)):
             raise OSError("permission denied")
         return real_remove(path, *a, **kw)
 
-    monkeypatch.setattr(os, "rename", failing_remove)
+    monkeypatch.setattr(os, "remove", failing_remove)
     log: list[str] = []
     final_out, _final_srt = replace_subs_output(
         str(src), str(out), log_line=log.append
@@ -306,7 +304,7 @@ def test_11_failing_source_delete_keeps_both_and_warns(
     assert final_out == str(tmp_path / "movie.mp4")
     assert Path(final_out).read_bytes() == b"muxed-output-bytes"
     assert src.exists()  # kept — the failed delete's residue
-    assert any("permission denied" in line for line in log)
+    assert any("source copy could not be removed" in line for line in log)
 
 
 def test_12_failing_rename_refuses_nothing_deleted_first(
@@ -315,23 +313,21 @@ def test_12_failing_rename_refuses_nothing_deleted_first(
     """os.replace(output, target) failing: SubsJobError, source and
     output both intact — the rename happens BEFORE any delete (§2)."""
     src, out = _stage_pair(tmp_path)
-    import vidlift.media_transaction as tx
-    real_replace = tx.publish_new
+    real_replace = os.replace
 
     def failing_replace(src_path, dst_path, *a, **kw):
         moving = (
-            os.path.abspath(os.fspath(dst_path))
+            os.path.abspath(os.fspath(src_path)) == os.path.abspath(str(out))
+            and os.path.abspath(os.fspath(dst_path))
             == os.path.abspath(str(tmp_path / "movie.mp4"))
         )
         if moving:
             raise OSError("destination locked")
         return real_replace(src_path, dst_path, *a, **kw)
 
-    monkeypatch.setattr(tx, "publish_new", failing_replace)
-    log = []
-    returned, _ = replace_subs_output(str(src), str(out), log_line=log.append)
-    assert returned == str(out)
-    assert any("destination locked" in line for line in log)
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(SubsJobError, match="failed to move the output to"):
+        replace_subs_output(str(src), str(out))
     assert src.read_bytes() == b"source-bytes"
     assert out.read_bytes() == b"muxed-output-bytes"
 
@@ -461,10 +457,10 @@ def test_16_cancel_after_remux_never_replaces(tmp_path, monkeypatch):
         _run_job(
             src, tmp_path, runner, replace_source=True, should_cancel=flag
         )
-    assert "cancelled after remux" in str(excinfo.value)
+    assert str(excinfo.value) == "cancelled after remux, before replace"
     assert src.is_file()
-    assert list(tmp_path.glob(".vidlift-media-*/movie.subs.mp4"))
-    assert list(tmp_path.glob(".vidlift-media-*/movie.subs.srt"))
+    assert (tmp_path / "movie.subs.mp4").is_file()
+    assert (tmp_path / "movie.subs.srt").is_file()
     assert attempted == []
 
 

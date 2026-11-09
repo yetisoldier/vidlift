@@ -32,8 +32,6 @@ restart honestly runs).
 from __future__ import annotations
 
 import os
-import uuid
-from dataclasses import dataclass
 from pathlib import Path
 
 from .server import build_services
@@ -97,23 +95,6 @@ class BatchTooLarge(Exception):
     message box, not a crash."""
 
 
-@dataclass(frozen=True)
-class GuiSubmissionResult:
-    """Internal receipt, not a new public enqueue/API return contract.
-
-    Rejected proves validation stopped before registry mutation. Unknown
-    means enqueue was entered without returning an exact record receipt.
-    Absence from the active queue never proves rejection (jobs can finish).
-    """
-
-    state: str
-    job_ids: tuple[str, ...] = ()
-    error: Exception | None = None
-    submission_id: str | None = None
-    evidence_state: str | None = None
-    payload_sha256: str | None = None
-
-
 class LocalBridgeClient:
     """The GUI's single in-process handle on the shared registry/executor."""
 
@@ -160,10 +141,27 @@ class LocalBridgeClient:
         honesty rules stay centralized in ``select_engine``."""
         opts = dict(options or {})
         opts["engine"] = engine
-        if opts.get("batch_id") is None:
-            opts["batch_id"] = uuid.uuid4().hex
-        clean = self._validated_paths(paths)
-        return self._enqueue_validated("run", clean, opts, [])
+        clean: list[str] = []
+        for path in paths:
+            path_str = str(path)
+            if not Path(path_str).is_file():
+                raise FileNotFoundError(
+                    f"no such file on this machine: {path_str}"
+                )
+            clean.append(path_str)
+        if not clean:
+            return []
+        if len(clean) > MAX_GUI_BATCH:
+            raise BatchTooLarge(
+                f"{len(clean)} files exceeds the {MAX_GUI_BATCH}-file "
+                "per-batch limit; add fewer files and run them in rounds"
+            )
+        job_ids: list[str] = []
+        for path in clean:
+            record = self.registry.enqueue(kind="run", paths=[path], options=opts)
+            self.services.executor.notify_new_work()
+            job_ids.append(record.job_id)
+        return job_ids
 
     # v0.4.14 (Mode B): the GUI's enqueue surface for standalone subs
     # jobs — the EXACT registry/executor path the MCP transcribe tool
@@ -173,12 +171,11 @@ class LocalBridgeClient:
     # shows fabricated rows).
     def enqueue_subs(
         self,
-        paths: list[str],
+        paths,
         *,
         replace_source: bool = False,
         suppress_srt: bool = False,
         device: str = "auto",
-        batch_id: str | None = None,
     ) -> list[str]:
         """Validate paths, enqueue one ``subs`` job per path in
         submission order, wake the executor, and return the job_ids in
@@ -197,22 +194,6 @@ class LocalBridgeClient:
         without the kwarg are behavior-identical to v0.4.17."""
         if device not in {"auto", "cuda", "cpu"}:
             raise ValueError("device must be one of auto|cuda|cpu")
-        clean = self._validated_paths(paths)
-        return self._enqueue_validated("subs", clean, self._subs_options(
-            device, replace_source, suppress_srt,
-            batch_id if batch_id is not None else uuid.uuid4().hex), [])
-
-    @staticmethod
-    def _subs_options(device, replace_source, suppress_srt, batch_id=None) -> dict:
-        options = {"language": "", "model": None, "device": device, "force": False,
-                "replace_source": bool(replace_source), "suppress_srt": bool(suppress_srt)}
-        if batch_id is not None:
-            options["batch_id"] = batch_id
-        return options
-
-    @staticmethod
-    def _validated_paths(paths) -> list[str]:
-        # The only boundary that can prove no registry mutation was attempted.
         clean: list[str] = []
         for path in paths:
             path_str = str(path)
@@ -221,90 +202,26 @@ class LocalBridgeClient:
                     f"no such file on this machine: {path_str}"
                 )
             clean.append(path_str)
+        if not clean:
+            return []
         if len(clean) > MAX_GUI_BATCH:
             raise BatchTooLarge(
                 f"{len(clean)} files exceeds the {MAX_GUI_BATCH}-file "
                 "per-batch limit; add fewer files and run them in rounds"
             )
-        return clean
-
-    def _enqueue_validated(self, kind, clean, options, job_ids) -> list[str]:
+        job_ids: list[str] = []
         for path in clean:
             record = self.registry.enqueue(
-                kind=kind, paths=[path], options=options,
+                kind="subs",
+                paths=[path],
+                options={"language": "", "model": None, "device": device,
+                         "force": False,
+                         "replace_source": bool(replace_source),
+                         "suppress_srt": bool(suppress_srt)},
             )
-            # Capture identity before wake-up: even a fast terminal job or a
-            # failing notifier must not erase this accepted receipt.
-            job_ids.append(record.job_id)
             self.services.executor.notify_new_work()
+            job_ids.append(record.job_id)
         return job_ids
-
-    def submit_gui_job(self, kind: str, path: str, *, options: dict | None = None,
-                       engine: str = "auto", submission_id: str | None = None) -> GuiSubmissionResult:
-        """One reviewed GUI row, with explicit mutation/receipt evidence.
-
-        No rollback or automatic resubmission. A registry exception may occur
-        after an in-memory insertion or disk replace, regardless of its type.
-        The existing public enqueue methods still return lists and raise the
-        original exceptions; this internal seam retains exact accepted IDs.
-        """
-        from .registry_transactions import canonical_payload
-        submission_id = submission_id if submission_id is not None else uuid.uuid4().hex
-        try:
-            opts = dict(options or {})
-            batch_id = opts.get("batch_id")
-            if batch_id is None:
-                batch_id = uuid.uuid4().hex
-            if kind == "subs":
-                device = opts.get("device", "auto")
-                if device not in {"auto", "cuda", "cpu"}:
-                    raise ValueError("device must be one of auto|cuda|cpu")
-                opts = self._subs_options(device, opts.get("replace_source", False),
-                                          opts.get("suppress_srt", False), batch_id)
-            elif kind == "run":
-                opts["engine"] = engine
-                opts["batch_id"] = batch_id
-            else:
-                raise ValueError("GUI job kind must be run or subs")
-            payload = canonical_payload(kind, path, opts)
-            previous = self.registry.lookup_submission(submission_id)
-            if previous is None:
-                self._validated_paths([path])
-                for pending in self.registry.list_submissions():
-                    if pending["state"] == "prepared" and pending["payload"]["source"] == payload["source"]:
-                        return GuiSubmissionResult("unknown", error=RuntimeError(
-                            "Unresolved prepared intent; review or discard it before a new submission"),
-                            submission_id=pending["submission_id"], evidence_state="prepared",
-                            payload_sha256=pending["payload_sha256"])
-        except Exception as exc:
-            return GuiSubmissionResult("rejected" if isinstance(exc, (ValueError, FileNotFoundError)) else "unknown",
-                                       error=exc, submission_id=submission_id)
-        receipt = None
-        warning = None
-        try:
-            receipt = self.registry.prepare_submission(submission_id, payload)
-            was_accepted = receipt["state"] == "accepted"
-            receipt = self.registry.enqueue_idempotent(submission_id, payload)
-            if receipt["state"] == "accepted" and not was_accepted:
-                self.services.executor.notify_new_work()
-        except Exception as exc:
-            warning = exc
-            try:
-                receipt = self.registry.lookup_submission(submission_id)
-            except Exception:
-                receipt = None
-        if receipt is None:
-            return GuiSubmissionResult("unknown", error=warning, submission_id=submission_id)
-        state = receipt["state"]
-        return GuiSubmissionResult("accepted" if state == "accepted" else
-                                   ("rejected" if state in {"rejected", "abandoned"} else "unknown"),
-                                   tuple(receipt["job_ids"]), warning, submission_id,
-                                   state, receipt["payload_sha256"])
-
-    def submission_recovery(self):
-        """Read-only exact receipt and retained history; never auto-requeue."""
-        return [dict(receipt, jobs=[self.registry.require(key).to_dict() for key in receipt["job_ids"]])
-                for receipt in self.registry.list_submissions()]
 
     # -- status -------------------------------------------------------------
 
@@ -394,7 +311,6 @@ class LocalBridgeClient:
                     "error": record.error,
                     "output_path": record.output_path,
                     "manifest_path": record.manifest_path,
-                    "transcription": _status_payload(self.services, record).get("transcription"),
                 }
             )
         return rows

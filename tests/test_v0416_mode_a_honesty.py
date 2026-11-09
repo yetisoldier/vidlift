@@ -93,14 +93,6 @@ class Runner:
         name = " ".join(str(part) for part in args)
         self.commands.append(name)
         if "-show_format" in args:
-            if ".vidlift-media-" in args[-1]:
-                payload = json.loads(self.payload)
-                payload["streams"][0].update(codec_name="hevc", width=1280, height=720)
-                payload["streams"][1].update(codec_name="aac")
-                payload["format"]["format_name"] = "mov,mp4,m4a,3gp,3g2,mj2"
-                if args[-1].endswith(".muxing.mp4"):
-                    payload["streams"].append({"index": 2, "codec_type": "subtitle", "codec_name": "mov_text"})
-                return 0, json.dumps(payload), ""
             return 0, self.payload, ""
         if "idet" in args:
             return 0, "", (
@@ -108,11 +100,6 @@ class Runner:
                 "Progressive: 0 Undetermined: 0\n"
             )
         if "-show_streams" in args and "-show_format" not in args:
-            if Path(args[-1]).is_file() and Path(args[-1]).read_bytes() == b"muxed-stub":
-                return 0, json.dumps({"streams": [
-                    {"codec_type": "video", "width": 1280, "height": 720},
-                    {"codec_type": "subtitle", "codec_name": "mov_text"},
-                ]}), ""
             return 0, json.dumps(
                 {"streams": [{"codec_type": "video", "width": 1280, "height": 720}]}
             ), ""

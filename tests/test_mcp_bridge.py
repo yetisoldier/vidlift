@@ -35,7 +35,6 @@ from vidlift.mcp_bridge import (
 )
 from vidlift.mcp_bridge.jobs import JobOutcome
 from vidlift.mcp_bridge.schemas import TOOL_SCHEMAS
-from _registry_checks import seed_exited_registry
 from vidlift.run import (
     EngineCancelled,
     StubEngine,
@@ -696,10 +695,13 @@ def test_t5_registry_persists_across_restart_queued_job_survives(tmp_path):
 def test_t5_running_job_swept_failed_on_restart(tmp_path):
     marker("t5")
     state = tmp_path / "state"
-    # A real exited owner, not this still-live test process.
-    registry = seed_exited_registry(state, [
-        {"path": "/media/gone.avi", "state": "running"}])
-    record = registry.running()[0]
+    # simulate the previous server dying mid-run: a registry fixture
+    # with a job stuck in running state
+    registry = Registry(state)
+    record = registry.enqueue(
+        kind="run", paths=["/media/gone.avi"], options={}
+    )
+    registry.transition(record, "running")
     server, _runner = make_server(tmp_path, registry=registry, start_workers=False)
     # the sweep ran at construction: the corpse is failed, never
     # silently succeeded, with the binding restart error

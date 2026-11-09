@@ -28,10 +28,6 @@ venv/
 # Agent working scratch (Bob/Forge/Karen scaffolding, probe fixtures, repo copies)
 .karen/
 
-# NVIDIA CUDA runtime stage (proprietary binaries, never committed)
-local-cuda-runtime/
 # Private investigation data and agent reports
 .specs/
 .forge*/
-# Private historical runtime diagnosis, not public product documentation
-docs/cuda-runtime-bundling.md

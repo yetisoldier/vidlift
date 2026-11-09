@@ -60,7 +60,6 @@ def marker(name: str) -> None:
 
 
 from vidlift.engine_ncnn import NcnnVulkanEngine  # v0.4.0 R-series
-from _media_fixtures import bind
 
 
 def make_media_file(tmp_path, name: str = "movie.avi") -> str:
@@ -149,17 +148,6 @@ class FakeRunner:
         # to null without idet; and the verify/prepared/encode commands
         # all end in a file path suffix.
         if "-show_format" in args:
-            if ".vidlift-media-" in args[-1]:
-                payload = json.loads(self.payload)
-                w, h = self.output_geometry
-                payload["streams"] = [
-                    {"index": 0, "codec_type": "video", "codec_name": "hevc", "width": w, "height": h},
-                    {"index": 1, "codec_type": "audio", "codec_name": "aac", "channels": 2},
-                ]
-                if args[-1].endswith(".muxing.mp4"):
-                    payload["streams"].append({"index": 2, "codec_type": "subtitle", "codec_name": "mov_text"})
-                payload["format"]["format_name"] = "mov,mp4,m4a,3gp,3g2,mj2"
-                return 0, json.dumps(payload), ""
             return 0, self.payload, ""
         if "idet" in args:
             return 0, "", self.idet_stderr or (
@@ -172,11 +160,8 @@ class FakeRunner:
             if self.verify_exit != 0:
                 return self.verify_exit, "", "verify boom"
             w, h = self.output_geometry
-            streams = [{"codec_type": "video", "width": w, "height": h}]
-            if any(s.get("codec_type") == "subtitle" and s.get("codec_name") in {"srt", "subrip", "mov_text", "ass", "ssa", "webvtt"} for s in json.loads(self.payload)["streams"]):
-                streams.append({"codec_type": "subtitle", "codec_name": "mov_text"})
             return 0, json.dumps(
-                {"streams": streams}
+                {"streams": [{"codec_type": "video", "width": w, "height": h}]}
             ), ""
         if args and args[-1] == "-" and "null" in args:
             if self.decode_exit != 0:
@@ -480,9 +465,9 @@ class TestRunFilePhases:
         assert probe_cmd[1:] == probe_args(result.state.file_path)
         assert prep_cmd[0] == "ffmpeg" and "setsar=1" in " ".join(prep_cmd)
         assert "libx265" in enc_cmd
-        assert ver_cmd[0] == "ffprobe" and Path(ver_cmd[-1]).name == Path(result.plan.output_path).name
+        assert ver_cmd[0] == "ffprobe" and result.plan.output_path in ver_cmd
         # the full decode pass (b12) decodes the encode output to null
-        assert dec_cmd[0] == "ffmpeg" and Path(dec_cmd[dec_cmd.index("-i") + 1]).name == Path(result.plan.output_path).name
+        assert dec_cmd[0] == "ffmpeg" and result.plan.output_path in dec_cmd
         assert dec_cmd[dec_cmd.index("-f") + 1:] == ["null", "-"]
         # every command the state recorded is exactly what the seam received
         received = [[b, *list(a)] for b, a in runner.commands]
@@ -1062,8 +1047,7 @@ class TestReplaceSourceV047:
         # run stays successful, both files exist, the log names it.
         import vidlift.run as run_mod
 
-        import vidlift.media_transaction as tx
-        real_replace = tx.publish_new
+        real_replace = run_mod.os.replace
 
         def denied_replace(src, dst, *args, **kwargs):
             if str(dst).endswith("movie.avi"):
@@ -1073,7 +1057,7 @@ class TestReplaceSourceV047:
         out_dir = tmp_path / "out"
         mp = pytest.MonkeyPatch()
         try:
-            mp.setattr(tx, "publish_new", denied_replace)
+            mp.setattr(run_mod.os, "replace", denied_replace)
             result, source = self._run_with_replacement(
                 tmp_path, output_dir=str(out_dir)
             )
@@ -1083,7 +1067,7 @@ class TestReplaceSourceV047:
         assert Path(source).is_file(), "source kept (guardrail d)"
         assert Path(result.plan.output_path).is_file(), "output kept"
         text = Path(result.state.log.path).read_text()
-        assert "WARNING replace-source/publication failed" in text
+        assert "WARNING: replace-source failed" in text
 
     def test_replace_helper_guards_missing_source_and_output(self, tmp_path):
         from vidlift.run import replace_source_with_output
@@ -1091,11 +1075,11 @@ class TestReplaceSourceV047:
         src = tmp_path / "gone.avi"
         out = tmp_path / "new.mp4"
         out.write_bytes(b"x")
-        with pytest.raises(RunError, match="prepared verified operation"):
+        with pytest.raises(RunError, match="source is gone"):
             replace_source_with_output(str(src), str(out))
         src2 = tmp_path / "movie.avi"
         src2.write_bytes(b"src")
-        with pytest.raises(RunError, match="prepared verified operation"):
+        with pytest.raises(RunError, match="output is missing"):
             replace_source_with_output(str(src2), "missing.mp4")
 
     def test_replace_same_path_is_a_noop(self, tmp_path):
@@ -1113,85 +1097,213 @@ class TestReplaceSourceV047:
         assert any("skipped" in line for line in lines)
 
     def test_replace_cross_filesystem_hash_mismatch_keeps_source(self, tmp_path):
-        import vidlift.media_transaction as tx
-        from vidlift.run import replace_source_with_output
+        # Simulated cross-fs (different st_dev): a corrupted/failed copy
+        # must keep BOTH original files (never destroy good data).
+        import types
+
+        import vidlift.run as run_mod
+
         src = tmp_path / "movie.avi"
         out = tmp_path / "movie.720p.mp4"
         src.write_bytes(b"source-bytes")
         out.write_bytes(b"output-bytes")
-        op = bind(src, out)
-        real = tx._same_content
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(tx, "_same_content", lambda p, fp: False if Path(p).name.startswith("publish-") else real(p, fp))
-            returned = replace_source_with_output(str(src), str(out), operation=op)
-        assert returned == str(out)
-        assert any("hash mismatch" in warning for warning in op.result.warnings)
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)) == os.path.abspath(str(src)) and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        two_fs_stat._armed = True  # the runner's branch stat diverges
+
+        def corrupt_copy2(src_f, dst_f, *args, **kwargs):
+            import shutil as _shutil
+
+            # copyfile never stats (portable under the fake stat);
+            # copy2's copystat would see the fake dev inside shutil.
+            _shutil.copyfile(src_f, dst_f)
+            Path(dst_f).write_bytes(b"corrupted-copy")
+
+        from vidlift.run import _sha256_file as real_hash
+
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            mp.setattr(run_mod.shutil, "copy2", corrupt_copy2)
+            with pytest.raises(RunError, match="does not hash-match"):
+                run_mod.replace_source_with_output(str(src), str(out))
+        finally:
+            mp.undo()
+        # the refusal is the contract (v0.4.15.3 F-2): the SOURCE bytes
+        # are intact (the staged temp absorbed the bad copy — the source
+        # is never opened for write), the verified output was never
+        # deleted, and the staged temp did not outlive the call.
         assert src.read_bytes() == b"source-bytes", "source intact"
         assert out.read_bytes() == b"output-bytes", "verified output kept"
-        assert not op.backup.exists()  # candidate stage failed before backup/retirement
-        assert op.journal.is_file()
+        assert not (tmp_path / "movie.avi.replace-tmp").exists(), (
+            "no staged temp left behind"
+        )
 
     def test_replace_cross_filesystem_midcopy_failure_keeps_source(
         self, tmp_path
     ):
-        import vidlift.media_transaction as tx
-        from vidlift.run import replace_source_with_output
+        # Karen's F7 evidence (promotion to a pin): a mid-copy failure
+        # (ENOSPC, NAS drop) must never leave the SOURCE holding partial
+        # copy data. v0.4.15.3 (F-2): the staged temp absorbs the
+        # failure; the source is never opened for write.
+        import types
+
+        import vidlift.run as run_mod
+
         src = tmp_path / "movie.avi"
         out = tmp_path / "movie.720p.mp4"
         src.write_bytes(b"source-original-bytes")
         out.write_bytes(b"output-verified-bytes")
-        op = bind(src, out)
-        real = tx._copy_checked
-        def partial_copy(src_f, dst_f, expected, cancel=None):
-            if Path(dst_f) == op.backup:
-                return real(src_f, dst_f, expected, cancel)
-            with open(dst_f, "xb") as handle:
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)) == os.path.abspath(str(src)) and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        two_fs_stat._armed = True  # the branch-deciding stat diverges
+
+        def partial_copy2(src_f, dst_f, *args, **kwargs):
+            # the truncating open + premature death: the destination
+            # (now the TEMP) holds partial bytes, ENOSPC mid-copy.
+            with open(dst_f, "wb") as handle:
                 handle.write(b"partial")
             raise OSError(28, "No space left on device")
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(tx, "_copy_checked", partial_copy)
-            returned = replace_source_with_output(str(src), str(out), operation=op)
-        assert returned == str(out)
-        assert any("No space" in warning for warning in op.result.warnings)
+
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            mp.setattr(run_mod.shutil, "copy2", partial_copy2)
+            with pytest.raises(RunError, match="cross-filesystem copy"):
+                run_mod.replace_source_with_output(str(src), str(out))
+        finally:
+            mp.undo()
         assert src.read_bytes() == b"source-original-bytes", (
             "the source never truncates (Karen's evidence)"
         )
         assert out.read_bytes() == b"output-verified-bytes", (
             "verified output untouched"
         )
-        assert not op.backup.exists()  # pre-commit copy failure
-        assert op.journal.is_file()
+        assert not (tmp_path / "movie.avi.replace-tmp").exists(), (
+            "the failed stage is cleaned up, never left as debris"
+        )
 
     def test_replace_cross_filesystem_happy_path(self, tmp_path):
+        # v0.4.15.3 (F-2) success arm: real copy staged at the temp
+        # sibling, hash-verified, renamed over the source atomically,
+        # former output copy removed, temp consumed by the rename.
+        import types
+
         import vidlift.run as run_mod
+
         src = tmp_path / "movie.avi"
         out = tmp_path / "movie.720p.mp4"
         src.write_bytes(b"source-old-bytes")
         out.write_bytes(b"output-verified-bytes")
-        op = bind(src, out)
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)) == os.path.abspath(str(src)) and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        two_fs_stat._armed = True  # the branch-deciding stat diverges
+
         lines: list[str] = []
-        returned = run_mod.replace_source_with_output(str(src), str(out), log_line=lines.append, operation=op)
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            returned = run_mod.replace_source_with_output(
+                str(src), str(out), log_line=lines.append
+            )
+        finally:
+            mp.undo()
         assert returned == str(src)
         assert src.read_bytes() == b"output-verified-bytes", (
             "the proven copy now sits at the source path"
         )
-        assert out.read_bytes() == b"output-verified-bytes", "public compatibility duplicate is retained"
-        assert op.backup.read_bytes() == op.captured.read_bytes() == b"source-old-bytes"
+        assert not out.exists(), "the former output copy is removed"
+        assert not (tmp_path / "movie.avi.replace-tmp").exists(), (
+            "the stage was consumed by the atomic rename"
+        )
         assert any("output now at" in line for line in lines)
 
     def test_replace_refused_run_still_keeps_success(self, tmp_path):
-        import vidlift.media_transaction as tx
-        real_copy = tx._copy_checked
-        def failed_backup(source, destination, expected, cancel=None):
-            if Path(destination).name == "original.backup":
-                raise OSError("copy hash mismatch")
-            return real_copy(source, destination, expected, cancel)
+        # The refusal path end-to-end: output_dir forced onto another
+        # "filesystem" whose copy hash-corrupts; the run SUCCEEDS with a
+        # WARNING and neither file is deleted.
+        import types
+
+        import vidlift.run as run_mod
+
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)).endswith("movie.avi") and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        from vidlift.run import _sha256_file as real_hash
+
+        two_fs_stat._armed = True
+        two_fs_stat._disarm = False
+
+        import vidlift.run as _rm_probe  # noqa: F401 (arming below)
+
+        def corrupt_copy2(src_f, dst_f, *args, **kwargs):
+            import shutil as _shutil
+
+            _shutil.copyfile(src_f, dst_f)
+            Path(dst_f).write_bytes(b"corrupted-copy")
+
         path = make_media_file(tmp_path)
         runner = FakeRunner(probe_payload())
         out_dir = tmp_path / "elsewhere"
         mp = pytest.MonkeyPatch()
         try:
-            mp.setattr(tx, "_copy_checked", failed_backup)
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            mp.setattr(run_mod.shutil, "copy2", corrupt_copy2)
             result = run_file(
                 path,
                 tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
@@ -1205,7 +1317,7 @@ class TestReplaceSourceV047:
             mp.undo()
         assert result.ok is True, "a refused replace cannot fail the run"
         text = Path(result.state.log.path).read_text()
-        assert "WARNING replace-source/publication failed" in text
+        assert "WARNING: replace-source failed" in text
         assert Path(path).is_file(), "source survives a refused replace"
         assert Path(result.plan.output_path).is_file(), (
             "verified output survives a refused replace"
@@ -1241,14 +1353,40 @@ class TestReplaceSourceV047:
         # CLI state here is a real refused run (the corrupt-copy probe
         # from test_replace_refused_run_still_keeps_success), so the pin
         # is end-to-end, not a fabricated SimpleNamespace.
+        import types
+
         import vidlift.run as run_mod
-        monkeypatch.setattr(run_mod, "replace_source_with_output", lambda *a, **k: (_ for _ in ()).throw(RunError("copy hash mismatch")))
+
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)).endswith("movie.avi") and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        def corrupt_copy2(src_f, dst_f, *args, **kwargs):
+            import shutil as _shutil
+
+            _shutil.copyfile(src_f, dst_f)
+            Path(dst_f).write_bytes(b"corrupted-copy")
 
         path = make_media_file(tmp_path)
         runner = FakeRunner(probe_payload())
         out_dir = tmp_path / "elsewhere"
+        two_fs_stat._armed = True
         mp = pytest.MonkeyPatch()
         try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            mp.setattr(run_mod.shutil, "copy2", corrupt_copy2)
             result = run_file(
                 path,
                 tools=ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
@@ -1278,20 +1416,53 @@ class TestReplaceSourceV047:
         assert "source NOT replaced: both files kept" in out
 
     def test_replace_cross_filesystem_verified_copy_succeeds(self, tmp_path):
+        import types
+
         import vidlift.run as run_mod
 
         src = tmp_path / "movie.avi"
         out = tmp_path / "movie.720p.mp4"
         src.write_bytes(b"source-bytes")
         out.write_bytes(b"output-bytes")
-        op = bind(src, out)
-        returned = run_mod.replace_source_with_output(str(src), str(out), operation=op)
+        real_stat = run_mod.os.stat
+
+        def two_fs_stat(p, *args, **kwargs):
+            st = real_stat(p, *args, **kwargs)
+            if os.path.abspath(str(p)) == os.path.abspath(str(src)) and (
+                getattr(two_fs_stat, "_armed", False)
+            ):
+                fields = {
+                    key: getattr(st, key)
+                    for key in dir(st)
+                    if not key.startswith("_")
+                }
+                fields["st_dev"] = 4242
+                st = types.SimpleNamespace(**fields)
+            return st
+
+        two_fs_stat._armed = True  # the runner's branch stat diverges
+
+        from vidlift.run import _sha256_file as real_hash
+
+        def clean_copy2(src_f, dst_f, *args, **kwargs):
+            import shutil as _shutil
+
+            # copyfile never stats; the real hash (unarmed for reads)
+            # verifies the faithful copy inside the helper.
+            _shutil.copyfile(src_f, dst_f)
+
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(run_mod.os, "stat", two_fs_stat)
+            mp.setattr(run_mod.shutil, "copy2", clean_copy2)
+            returned = run_mod.replace_source_with_output(str(src), str(out))
+        finally:
+            mp.undo()
         assert returned == str(src)
         assert src.read_bytes() == b"output-bytes", (
             "the verified copy replaced the source"
         )
-        assert out.read_bytes() == b"output-bytes", "compatibility public duplicate retained"
-        assert op.backup.read_bytes() == op.captured.read_bytes() == b"source-bytes"
+        assert not out.exists(), "the consumed output copy is removed"
 
     def test_cli_reports_replacement(self, tmp_path, monkeypatch, capsys):
         result, _ = run_happy(tmp_path)
@@ -1428,7 +1599,7 @@ class TestRunFileFailures:
         # ffmpeg pass before the engine's pre-frame check stops it at
         # upscale). The cancelled stop before the AI pass is the
         # behavior under test; the phase where it fires moved earlier.
-        assert state.current_phase == PHASE_PLAN  # transaction preflight observes pre-cancel
+        assert state.current_phase == PHASE_PREPARE
         # the prepare command was never issued (the old flow wasted it)
         assert not any(
             str(parts[-1]).endswith(".prepared.mkv")

@@ -1095,7 +1095,7 @@ def test_s4_live_downloading_via_mirror(tmp_path):
     existing ``activity_age_seconds`` field."""
     registry = Registry(tmp_path / "state")
     record = registry.enqueue(kind="subs", paths=["/media/movie.avi"], options={})
-    registry.transition(record, "running")
+    record.state = "running"
     record.progress_snapshot = {
         "progress": {
             "model_download": {
@@ -1107,7 +1107,6 @@ def test_s4_live_downloading_via_mirror(tmp_path):
         "current_phase": "transcribe",
         "last_activity_at": time.time(),
     }
-    registry.save()
     payload = _status_payload(_services_for(tmp_path, registry=registry), record)
     block = payload["transcription_model"]
     assert block["state"] == "downloading"
@@ -1311,7 +1310,7 @@ def test_s3_envelope_job_download_beats_idle_disk(tmp_path):
         record = client.registry.enqueue(
             kind="subs", paths=["/media/x.avi"], options={}
         )
-        client.registry.transition(record, "running")
+        record.transition("running")
         record.progress_snapshot = {
             "progress": {
                 "model_download": {
@@ -1323,7 +1322,6 @@ def test_s3_envelope_job_download_beats_idle_disk(tmp_path):
             "current_phase": "transcribe",
             "last_activity_at": time.time(),
         }
-        client.registry.save()
         server, _base = start_server(
             client=client,
             host="127.0.0.1",

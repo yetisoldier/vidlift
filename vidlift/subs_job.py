@@ -44,8 +44,6 @@ import os
 import re
 import shutil
 import time
-import tempfile
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -239,12 +237,6 @@ def run_subs_job(
     # v0.4.19 (WS3): forwarded verbatim to the core; absent = the
     # pre-0.4.19 silent-resolution behavior for direct/library callers.
     on_device=None,
-    # v0.4.20 (ADR-1/S1): the caller's batch identity — scopes the CUDA
-    # failure latch to this job/batch (one file's CUDA failure never
-    # poisons another batch; a new batch re-probes). Absent/None → no
-    # latching: every call re-probes, the honest behavior for direct use.
-    batch_id=None,
-    on_fallback=None,
 ) -> SubsJobResult:
     """One standalone subs job (B1 soft-mux; burn-in is permanently
     off the roadmap — the v0.4.15 strip removed the vestigial
@@ -271,17 +263,6 @@ def run_subs_job(
             on_step(name)
 
     started = time.time()
-    from .media_transaction import prepare_media_operation, record_verified_output, commit_media_operation
-    public_output = subs_output_path(source_path)
-    try:
-        operation = prepare_media_operation(
-            source_path, subs_replace_target(source_path) if replace_source else public_output,
-            replace_source=replace_source, suppress_srt=suppress_srt, cancel=should_cancel,
-        )
-    except OSError as exc:
-        raise SubsJobError(str(exc)) from exc
-    operation.fallback = public_output
-    operation.sidecar_target = str(Path(subs_replace_target(source_path) if replace_source else public_output).with_suffix(".srt"))
     # ---- probe (verbatim reuse) ------------------------------------
     _step("probe")
     probe_kwargs = {}
@@ -302,8 +283,8 @@ def run_subs_job(
             f"to transcribe anyway): {source_path}"
         )
 
-    output_path = str(operation.directory / Path(public_output).name)
-    if os.path.lexists(public_output):
+    output_path = subs_output_path(source_path)
+    if os.path.exists(output_path):
         raise SubsJobError(
             f"output already exists (never overwritten): {output_path}"
         )
@@ -333,12 +314,14 @@ def run_subs_job(
 
     if should_cancel is not None and should_cancel():
         from .run import EngineCancelled
+
         raise EngineCancelled("cancelled before transcription")
     lock_acquired = False
     if gpu_lock is not None:
         # Keep compatibility with injected/legacy lock adapters that expose
         # only on_wait; production GpuPhaseLock accepts cooperative cancel.
         import inspect
+
         acquire = gpu_lock.acquire
         if "should_cancel" in inspect.signature(acquire).parameters:
             lock_acquired = acquire(on_wait=_wait_label, should_cancel=should_cancel)
@@ -375,41 +358,25 @@ def run_subs_job(
             should_cancel=should_cancel,
             download_log=download_log,
             on_device=on_device,
-            batch_id=batch_id,
-            on_fallback=on_fallback,
         )
     finally:
-        if lock_acquired and gpu_lock is not None:
+        if lock_acquired:
             gpu_lock.release()
 
     # ---- remux B1: `-c copy` + mov_text into the NEW file ----------
     _step("subs-mux")
-    from .media_transaction import fingerprint, publish_sidecar
-    operation.owned_srt = os.path.abspath(transcribed.srt_path)
-    operation.srt_fingerprint = fingerprint(transcribed.srt_path)
-    try:
-        mplex(
-            source_path,
-            transcribed.srt_path,
-            output_path=output_path,
-            language=transcribed.language,
-            ffmpeg=ffmpeg,
-            runner=runner if runner is not None else _default_runner,
-            ffprobe=ffprobe,
-            probe_runner=probe_runner,
-            expected_media=media,
-        )
-    except (SubsJobError, OSError) as exc:
-        retained_srt, _ = publish_sidecar(operation, Path(public_output).with_suffix(".srt"))
-        exc.srt_path = retained_srt
-        raise
+    mplex(
+        source_path,
+        transcribed.srt_path,
+        output_path=output_path,
+        language=transcribed.language,
+        ffmpeg=ffmpeg,
+        runner=runner if runner is not None else _default_runner,
+    )
 
     final_output = output_path
     final_srt = transcribed.srt_path
     notes = list(transcribed.notes)
-    if should_cancel is not None and should_cancel():
-        from .run import EngineCancelled
-        raise EngineCancelled("cancelled after remux, before post-success changes")
     # v0.4.18 (opt-in suppress_srt): the mux above SUCCEEDED, so the
     # sidecar is redundant — remove it BEFORE any replace, where the
     # helper's isfile guard (replace_subs_output step 4) then makes the
@@ -417,12 +384,10 @@ def run_subs_job(
     # ABOVE this line, so the sidecar survived as the fallback
     # deliverable. Removal is best-effort: an OSError keeps the file
     # and final_srt stays truthful (the helper logs the WARNING).
-    operation.embedded = True
-    record_verified_output(
-        operation, output_path,
-        verification=lambda path: verify_mux(path, ffprobe=ffprobe, probe_runner=probe_runner, expected_media=media),
-        owned_srt=transcribed.srt_path,
-    )
+    if suppress_srt:
+        if remove_srt_sidecar(transcribed.srt_path, log_line=notes.append):
+            final_srt = ""
+            notes.append("srt sidecar suppressed after a successful mux")
     if replace_source:
         # v0.4.17: cancellation never replaces — after the remux lands,
         # before any mutation (transcribe.py's should_cancel contract).
@@ -437,7 +402,6 @@ def run_subs_job(
                 output_path,
                 srt_path=transcribed.srt_path,
                 log_line=notes.append,  # helper narration -> result notes
-                operation=operation,
             )
             if maybe_srt is not None:
                 final_srt = maybe_srt
@@ -447,14 +411,6 @@ def run_subs_job(
             notes.append(
                 f"WARNING replace-source failed; keeping both files: {exc}"
             )
-            operation.result = commit_media_operation(operation, cancel=should_cancel, retire_source=False)
-    else:
-        operation.result = commit_media_operation(operation, cancel=should_cancel)
-    committed = operation.result
-    final_output, final_srt = committed.output_path, committed.srt_path
-    notes.extend(committed.warnings)
-    if committed.sidecar_suppressed:
-        notes.append("srt sidecar suppressed after a successful mux")
 
     # v0.4.18 (Karen K-5, success-only): the .subs-work scratch dir is
     # Mode A's cleanup_run_artifacts counterpart. This line is reached
@@ -462,8 +418,7 @@ def run_subs_job(
     # failure/cancel above retains the scratch for diagnosis.
     # workdir_used was captured PRE-rename; the helper's path guard
     # deletes only the default-derived directory.
-    if workdir is None and not committed.needs_attention:
-        cleanup_subs_scratch(output_path, workdir_used, log_line=notes.append)
+    cleanup_subs_scratch(output_path, workdir_used, log_line=notes.append)
 
     return SubsJobResult(
         source_path=source_path,
@@ -494,9 +449,6 @@ def mplex(
     language: str,
     ffmpeg: str,
     runner,
-    ffprobe: str = "ffprobe",
-    probe_runner=None,
-    expected_media=None,
 ) -> str:
     """B1 remux: `ffmpeg -i source -i subs -map 0:v -map 0:a -map 1
     -c copy -c:s mov_text -metadata:s:s:0 language=<lang> -movflags
@@ -520,8 +472,12 @@ def mplex(
 
     Source-blind: the job touches nothing else.
     """
-    fd, tmp = tempfile.mkstemp(dir=Path(output_path).parent, prefix=".vidlift-mux-", suffix=".muxing.mp4")
-    os.close(fd)
+    tmp = output_path + ".muxing.mp4"
+    if os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     cmd = [
         ffmpeg, "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
         "-i", source_path, "-i", srt_path,
@@ -538,15 +494,7 @@ def mplex(
         "-movflags", "+faststart",
         tmp,
     ]
-    try:
-        code, _out, err = runner(cmd[0], cmd[1:])
-    except BaseException:
-        # The path is an exclusive temp created by this invocation only.
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    code, _out, err = runner(cmd[0], cmd[1:])
     if code != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
         try:
             os.remove(tmp)
@@ -556,10 +504,8 @@ def mplex(
             f"subs remux failed: {(err or '').strip()[:300]}"
         )
     try:
-        verify_mux(tmp, ffprobe=ffprobe, probe_runner=probe_runner, expected_media=expected_media)
-        from .safe_files import publish_new
-        publish_new(tmp, output_path)
-    except (OSError, SubsJobError) as exc:
+        os.replace(tmp, output_path)
+    except OSError as exc:
         try:
             os.remove(tmp)
         except OSError:
@@ -570,57 +516,161 @@ def mplex(
     return output_path
 
 
-def verify_mux(path, *, ffprobe="ffprobe", probe_runner=None, expected_media=None):
-    """Independent final probe before publication, source removal or suppression.
-
-    Stream/duration invariants detect a successful-but-invalid runner. They do
-    not certify every decoded pixel or subtitle word and are not advertised so.
-    """
-    try:
-        kwargs = {"runner": probe_runner} if probe_runner is not None else {}
-        output = probe_file(path, binary=ffprobe, **kwargs)
-        duration = output.duration_seconds
-        if (output.video is None or not output.audio or
-                not any(s.codec_name == "mov_text" for s in output.subtitles) or
-                duration is None or not math.isfinite(duration) or duration <= 0 or
-                "mp4" not in output.container.split(",")):
-            raise SubsJobError("remux verification failed: missing video/audio/mov_text or invalid MP4 duration")
-        if expected_media is not None:
-            before = expected_media.video
-            after = output.video
-            if before is None or (before.codec_name, before.width, before.height) != (after.codec_name, after.width, after.height):
-                raise SubsJobError("remux verification failed: video stream changed")
-            if [(a.codec_name, a.channels) for a in expected_media.audio] != [(a.codec_name, a.channels) for a in output.audio]:
-                raise SubsJobError("remux verification failed: audio streams changed")
-            original_duration = expected_media.duration_seconds
-            if original_duration is None or abs(duration - original_duration) > max(0.5, original_duration * 0.01):
-                raise SubsJobError("remux verification failed: duration changed or unknown")
-        from dataclasses import asdict
-        return {"ok": True, "kind": "independent-remux-probe", "media": asdict(output)}
-    except (ProbeError, OSError) as exc:
-        raise SubsJobError("remux verification failed: output could not be independently probed") from exc
-
-
 def replace_subs_output(
     source_path: str,
     output_path: str,
     *,
     srt_path: str | None = None,
     log_line=None,
-    operation=None,
 ) -> tuple[str, str | None]:
-    """Commit the bound verified remux, retaining backup, capture and journal."""
-    if operation is None or str(operation.source) != os.path.abspath(source_path) or operation.candidate != os.path.abspath(output_path):
-        raise SubsJobError("prepared verified operation required; source and output retained")
-    if operation.target != operation.source and os.path.lexists(operation.target):
-        raise SubsJobError(f"{operation.target.name} already exists as a different file; keeping both files")
-    from .media_transaction import commit_media_operation
-    operation.result = commit_media_operation(operation, cancel=getattr(operation, "cancel", None))
-    if log_line is not None:
-        for warning in operation.result.warnings:
-            log_line(warning)
-        log_line(f"replace-source: output now at {operation.result.output_path}")
-    return operation.result.output_path, operation.result.srt_path or None
+    """Mode B replace (v0.4.17, opt-in): delete the source and land the
+    verified subs output at the source's stem with an .mp4 extension.
+
+    Discipline (mirrors run.replace_source_with_output's invariants, with
+    rename-to-stem-.mp4 semantics):
+    - rename-before-delete: the output moves onto {stem}.mp4 FIRST
+      (atomic os.replace), the source is deleted SECOND; every failure
+      mode keeps BOTH files (spec §2 deviation 1);
+    - collision guard: a pre-existing {stem}.mp4 that is NOT the source
+      (normcase/abspath identity) refuses the whole replace — an
+      unrelated file is never overwritten;
+    - source-is-.mp4 (target == source path): safe and intended — the
+      single os.replace IS the delete-and-move;
+    - cross-device (unreachable by construction — output and target share
+      the source's directory — but defended): stage at a temp SIBLING of
+      the target, shutil.copy2, SHA-256-verify against the verified
+      output (from .run import _sha256_file — lazy, the _default_runner
+      pattern), then os.replace; the temp never outlives the call;
+    - sidecar: {stem}.subs.srt is renamed to {stem}.srt when (and only
+      when) no unrelated {stem}.srt exists; on refusal or OSError the
+      sidecar keeps its .subs.srt name — best-effort, never blocks the
+      mp4 outcome;
+    - raises SubsJobError on refusal/failure; the job-level caller keeps
+      the verified success either way.
+
+    Returns (final_output_path, final_srt_path_or_None): the second
+    element is the sidecar's HONEST post-attempt location — the renamed
+    path, the original path when the rename was refused/failed, or None
+    when no sidecar exists. result.srt_path must never lie.
+    """
+    source = Path(source_path)
+    output = Path(output_path)
+    target = Path(subs_replace_target(source_path))
+    target_srt = target.with_suffix(".srt")
+
+    def _log(message: str) -> None:
+        # The narration channel; None stays inert (the job-level caller
+        # always passes a collector, the bare library call stays safe).
+        if log_line is not None:
+            log_line(message)
+
+    # 1. guards (no mutation before this line)
+    if not output.is_file():
+        raise SubsJobError(
+            f"replace-source refused: verified output is missing: {output}"
+        )
+    if not source.is_file():
+        raise SubsJobError(
+            f"replace-source refused: source is gone: {source}"
+        )
+    same_path = os.path.normcase(os.path.abspath(str(source))) == (
+        os.path.normcase(os.path.abspath(str(target)))
+    )
+    if not same_path and target.exists():
+        raise SubsJobError(
+            f"replace-source refused: {target.name} already exists as a "
+            "different file; keeping both files"
+        )
+    # 2. land the output at the target (atomic)
+    if os.stat(str(source)).st_dev == os.stat(str(output)).st_dev:
+        try:
+            os.replace(str(output), str(target))
+        except OSError as exc:
+            raise SubsJobError(
+                f"replace-source failed to move the output to {target}: {exc}"
+            ) from exc
+    else:
+        # Defensive arm (v0.4.15.3 F-2 discipline, D3): unreachable by
+        # construction today (output and target share the source's
+        # directory), specced so the helper never silently relies on
+        # caller geometry. Stage at a temp SIBLING of the target (same
+        # directory -> same filesystem -> the final os.replace is an
+        # atomic rename(2)); hash-verify the staged copy against the
+        # verified output BEFORE anything else moves.
+        tmp = str(target) + ".replace-tmp"
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)  # stale temp from a killed process
+            except OSError:
+                pass
+        try:
+            try:
+                shutil.copy2(str(output), tmp)
+                from .run import _sha256_file  # lazy: circular import
+
+                if _sha256_file(str(output)) != _sha256_file(tmp):
+                    raise SubsJobError(
+                        "replace-source: the staged copy for "
+                        f"{target} does not hash-match the verified "
+                        "output; keeping everything (source, verified "
+                        "output) untouched"
+                    )
+                os.replace(tmp, str(target))
+            except OSError as exc:
+                raise SubsJobError(
+                    f"replace-source cross-device copy into {target} "
+                    f"failed: {exc}"
+                ) from exc
+        finally:
+            # The temp must never outlive the call (the run.py:1774-1783
+            # pattern): the success path consumed it via os.replace;
+            # every error path strands only an unproven copy.
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        # The copy hash-verified: the file at the target is now the good
+        # data, so only the former output copy gets removed.
+        try:
+            output.unlink()
+        except OSError as exc:
+            _log(
+                f"WARNING replace-source: the verified output copy at "
+                f"{output} could not be removed: {exc}"
+            )
+    # 3. delete the source copy (skipped when same_path — the rename
+    #    consumed the name)
+    if not same_path:
+        try:
+            os.remove(str(source))
+        except OSError as exc:
+            _log(
+                f"WARNING replace-source: output shipped to {target} "
+                f"but the source copy could not be removed: {exc}"
+            )
+    # 4. sidecar (best-effort, guarded — D1)
+    final_srt: str | None = None
+    if srt_path is not None and os.path.isfile(srt_path):
+        if os.path.normcase(os.path.abspath(srt_path)) == os.path.normcase(
+            os.path.abspath(str(target_srt))
+        ):
+            final_srt = srt_path  # already matches (defensive)
+        elif target_srt.exists():
+            _log(
+                f"WARNING replace-source: {target_srt.name} already "
+                "exists; sidecar kept as " + os.path.basename(srt_path)
+            )
+            final_srt = srt_path
+        else:
+            try:
+                os.replace(srt_path, str(target_srt))
+                final_srt = str(target_srt)
+            except OSError as exc:
+                _log(f"WARNING replace-source: sidecar kept at {srt_path}: {exc}")
+                final_srt = srt_path
+    _log(f"replace-source: output now at {target}")
+    return str(target), final_srt
 
 
 def cleanup_subs_scratch(
@@ -655,8 +705,7 @@ def cleanup_subs_scratch(
     if not scratch.is_dir():
         return []
     try:
-        # The core removes its WAV. Never recursively delete unexpected files.
-        scratch.rmdir()
+        shutil.rmtree(scratch)
     except OSError as exc:
         if log_line is not None:
             log_line(

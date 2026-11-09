@@ -188,7 +188,7 @@ def build_services(
         error=STARTUP_SWEEP_ERROR if gui_startup else RESTART_ERROR,
         include_queued=gui_startup,
     )
-
+    registry.sweep_orphans()
     # v0.4.9 (design §1.6): the scratch GC runs beside the restart
     # sweep — retained scratch becomes durable state with resume
     # shipped, and startup is where stale sets are judged and removed
@@ -205,7 +205,6 @@ def build_services(
             f"vidlift-registry: scratch GC skipped ({exc})", flush=True
         )
     services = BridgeServices(registry=registry, state_dir=resolved)
-    services.startup_recovered = True
     services.executor = JobExecutor(services)
     # v0.4.16 (model management, ADR-4): the idle-install visibility slot
     # — the GUI's install worker writes it (only it, today); the status
@@ -273,16 +272,11 @@ class McpServer:
 
             state_dir = default_state_dir()
         self.state_dir = Path(state_dir)
-        injected_registry = services.registry if services is not None else None
-        self.registry = (registry if registry is not None else
-                         injected_registry if injected_registry is not None else
-                         Registry(self.state_dir))
-        # Recover dead owners before executor wiring. A factory-recovered
-        # bundle skips the second sweep only for that exact registry, not
-        # an explicit replacement or a newly created fallback.
-        if not (getattr(services, "startup_recovered", False)
-                and self.registry is injected_registry):
-            self.registry.sweep_orphans()
+        self.registry = registry or Registry(self.state_dir)
+        # Restart sweep FIRST (Section 6): the previous server's
+        # running jobs are corpses; they become failed with the
+        # binding restart error, never silently succeeded.
+        self.registry.sweep_orphans()
         # Wire services.registry BEFORE the executor reads it: the
         # executor's worker threads claim jobs through it.
         if services is None:

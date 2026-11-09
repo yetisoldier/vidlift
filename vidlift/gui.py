@@ -22,8 +22,7 @@ import sys
 import time
 import uuid
 import threading
-import copy
-import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings, Qt, QTimer, QThreadPool, QUrl, QByteArray, QEvent
@@ -70,7 +69,7 @@ from .config import (
     QSETTINGS_DENOISE_KEYS,
 )
 from .mcp_bridge.client_local import (
-    GuiSubmissionResult,
+    BatchTooLarge,
     LocalBridgeClient,
     default_state_dir,
 )
@@ -115,6 +114,18 @@ from .ui.view_state import PlanInputs, SubtitleOptions, positive_gbph
 from .ui.drop_area import SubtitleDropGroup
 from .ui.preflight import PreparationRunnable, PreflightRunnable, PreflightSignals, probe_runner
 from .ui.review import BatchReviewDialog
+
+
+# v0.4.22 (scope restore): the one reviewed row against the .19 bridge
+# contract. The HEAD-era durable submission receipts (registry
+# transactions) are deferred (BRIDGE-1); validation failures stay
+# provably pre-mutation and everything else fails closed via
+# "unknown" (see _submit_gui_job).
+@dataclass(frozen=True)
+class SubmissionOutcome:
+    state: str  # "accepted" | "rejected" | "unknown"
+    job_ids: tuple[str, ...] = ()
+    error: Exception | None = None
 
 
 VIDEO_EXTENSIONS = {
@@ -656,19 +667,6 @@ class MainWindow(QMainWindow):
         # The bridge client owns the registry + JobExecutor (one worker,
         # serial). The GUI is a projection: every tick re-reads status.
         self.client = client or LocalBridgeClient()
-        self._submission_attempts = {}
-        self._receipt_recovery_error = None
-        self._recovery_receipts = []
-        if hasattr(self.client, "submission_recovery"):
-            try:
-                self._recovery_receipts = self.client.submission_recovery()
-                for receipt in self._recovery_receipts:
-                    if receipt["state"] == "prepared":
-                        paths = (self._uncertain_subtitle_paths if receipt["payload"]["kind"] == "subs"
-                                 else self._uncertain_upscale_paths)
-                        paths.add(receipt["payload"]["source"])
-            except Exception as exc:
-                self._receipt_recovery_error = str(exc)
         self.job_ids: list[str] = []
         # v0.4.10 (R2): the batch bar's chunk-color cache — changed
         # ONLY through _apply_batch_summary so a QSS restyle fires
@@ -1544,8 +1542,6 @@ class MainWindow(QMainWindow):
         system_colours.setChecked(self._settings().value("ui/system_palette", False, type=bool))
         system_colours.toggled.connect(self._set_system_colours)
         view.addAction(system_colours)
-        recovery_menu = menu_bar.addMenu("&Submission recovery")
-        recovery_menu.aboutToShow.connect(lambda: self._populate_recovery_menu(recovery_menu))
         remove = QAction("Remove selected staged subtitles", self.file_table)
         remove.setShortcut("Delete")
         remove.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
@@ -1578,96 +1574,24 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def _submit_gui_job(self, kind: str, path: str, options: dict,
-                        engine: str = "auto") -> GuiSubmissionResult:
-        """Use exact bridge receipts; old/injected clients fail closed on errors."""
+                        engine: str = "auto") -> SubmissionOutcome:
+        """One reviewed row against the .19 bridge contract.
+
+        Validation failures are provably pre-mutation (path/batch checks run
+        before any registry write), so they map to "rejected" and retry is
+        allowed. Anything else maps to "unknown": mark the row uncertain and
+        disable retry for that batch rather than risk a duplicate job.
+        """
         try:
-            submit = getattr(self.client, "submit_gui_job", None)
-            if submit is not None:
-                if self._receipt_recovery_error:
-                    return GuiSubmissionResult("unknown", error=RuntimeError(self._receipt_recovery_error))
-                key = (kind, os.path.normcase(str(Path(path).resolve())))
-                attempt = self._submission_attempts.get(key)
-                if attempt is None:
-                    attempt = {"id": uuid.uuid4().hex, "options": copy.deepcopy(options), "engine": engine}
-                    self._submission_attempts[key] = attempt
-                result = submit(kind, path, options=attempt["options"], engine=attempt["engine"],
-                                submission_id=attempt["id"])
-                if result.state in {"accepted", "rejected"}:
-                    self._submission_attempts.pop(key, None)
-                return result
-            # Compatibility with old bridge doubles/adapters. Their exception
-            # class and active queue deltas cannot establish acceptance.
-            ids = (self.client.enqueue_subs([path], **options) if kind == "subs" else
-                   self.client.enqueue_run([path], options=options, engine=engine))
-            if len(ids) == 1 and ids[0]:
-                return GuiSubmissionResult("accepted", tuple(ids))
-            return GuiSubmissionResult("unknown")
+            ids = (self.client.enqueue_subs([path], **options) if kind == "subs"
+                   else self.client.enqueue_run([path], options=options, engine=engine))
+        except (ValueError, FileNotFoundError, BatchTooLarge) as exc:
+            return SubmissionOutcome("rejected", error=exc)
         except Exception as exc:
-            return GuiSubmissionResult("unknown", error=exc)
-
-    def _populate_recovery_menu(self, menu):
-        menu.clear()
-        recovery = getattr(self.client, "submission_recovery", None)
-        if recovery is None:
-            action = menu.addAction("Durable recovery unavailable in this bridge")
-            action.setEnabled(False)
-            return
-        try:
-            receipts = recovery()
-            self._receipt_recovery_error = None
-        except Exception as exc:
-            self._receipt_recovery_error = str(exc)
-            action = menu.addAction("Registry unavailable; new submissions blocked")
-            action.setEnabled(False)
-            return
-        if not receipts:
-            menu.addAction("No durable submission intents").setEnabled(False)
-        for receipt in receipts:
-            submenu = menu.addMenu(f"{receipt['state']}: {receipt['payload']['source']}")
-            detail = submenu.addAction("Show exact receipt and history")
-            detail.triggered.connect(lambda _checked=False, r=receipt: self._review_recovery(r, details_only=True))
-            if receipt["state"] == "prepared":
-                review = submenu.addAction("Review and submit this intent")
-                review.triggered.connect(lambda _checked=False, r=receipt: self._review_recovery(r))
-                discard = submenu.addAction("Discard intent")
-                discard.triggered.connect(lambda _checked=False, r=receipt: self._discard_recovery(r))
-
-    def _review_recovery(self, receipt, *, details_only=False):
-        dialog = BatchReviewDialog("Exact submission recovery", json.dumps(receipt, indent=2, ensure_ascii=False), self)
-        if details_only:
-            dialog.start_button.setEnabled(False)
-        if dialog.exec() != dialog.DialogCode.Accepted or details_only:
-            return
-        if self.client.active_job_count():
-            self._show_message("Wait for active jobs before explicitly submitting a prepared intent.")
-            return
-        payload = receipt["payload"]
-        # Repeat eligibility/output/source consent review; replay keeps the
-        # original frozen payload and batch, never creates a new CUDA attempt.
-        if payload["kind"] == "subs" and subs_plan_verdict(payload["source"]) not in (SUBS_VERDICT_READY, SUBS_VERDICT_PROBE_ERROR):
-            self._show_message("Prepared source is no longer eligible; intent retained without submission.")
-            return
-        result = self.client.submit_gui_job(payload["kind"], payload["source"], options=payload["options"],
-            engine=payload["options"].get("engine", "auto"), submission_id=receipt["submission_id"])
-        self._show_message(f"Submission recovery: {result.state}; exact jobs: {', '.join(result.job_ids) or 'none'}. "
-                           f"{result.error or ''}")
-        if result.state == "accepted":
-            self._clear_recovered_source(payload["source"])
-
-    def _clear_recovered_source(self, source):
-        for paths in (self._uncertain_subtitle_paths, self._uncertain_upscale_paths):
-            paths.difference_update([p for p in paths if os.path.normcase(str(Path(p).resolve())) == source])
-        for key in list(self._submission_attempts):
-            if key[1] == source:
-                del self._submission_attempts[key]
-
-    def _discard_recovery(self, receipt):
-        if QMessageBox.question(self, "Discard prepared intent", "Discard this non-executable intent? No job or media will be changed.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
-            return
-        self.client.registry.abandon_submission(receipt["submission_id"])
-        self._clear_recovered_source(receipt["payload"]["source"])
-        self._show_message("Prepared intent abandoned. Any later attempt requires a new reviewed submission.")
+            return SubmissionOutcome("unknown", error=exc)
+        if len(ids) == 1 and ids[0]:
+            return SubmissionOutcome("accepted", tuple(ids))
+        return SubmissionOutcome("unknown")
 
     def _set_system_colours(self, checked: bool) -> None:
         self._settings().setValue("ui/system_palette", checked)
@@ -2919,7 +2843,6 @@ class MainWindow(QMainWindow):
             # One path per call prevents partial registry writes from
             # masquerading as an entirely failed multi-file submission.
             successful: set[str] = set()
-            batch_id = uuid.uuid4().hex
             for row in eligible:
                 for index in range(self.file_table.rowCount() - 1, -1, -1):
                     if self._row_meta(index).get("staged_id") == row["id"]:
@@ -2932,7 +2855,6 @@ class MainWindow(QMainWindow):
                     suppress_srt=row["suppress_srt"], device=row["options"].device,
                     checked_verdicts=checked_verdicts,
                     row_id=row["id"],
-                    batch_id=batch_id,
                 )
                 successful.update(submitted)
                 if not submitted:
@@ -2957,7 +2879,6 @@ class MainWindow(QMainWindow):
         suppress_srt: bool | None = None, device: str = "auto",
         checked_verdicts: dict[str, str] | None = None,
         row_id: str | None = None,
-        batch_id: str | None = None,
     ) -> set[str]:
         """Create registry jobs; return only paths actually enqueued."""
         # v0.4.19 (WS2): plan-time pre-flight BEFORE the conflict guard
@@ -3033,7 +2954,6 @@ class MainWindow(QMainWindow):
             "replace_source": self.subs_replace_source.isChecked() if replace_source is None else replace_source,
             "suppress_srt": self.subs_suppress_srt.isChecked() if suppress_srt is None else suppress_srt,
             "device": device,
-            "batch_id": batch_id,
         })
         fresh_ids = list(result.job_ids)
         if result.state != "accepted":
@@ -3783,7 +3703,7 @@ class MainWindow(QMainWindow):
 
     def _submit_upscale_reviewed(self, items, options: dict, engine: str) -> None:
         """Submit a frozen review, preserving accepted receipts on later errors."""
-        options = dict(options, batch_id=uuid.uuid4().hex)
+        options = dict(options)
         accepted = []
         self.job_ids = []
         errors = []
@@ -5166,12 +5086,6 @@ class MainWindow(QMainWindow):
         self._request_ingestion(paths, subtitles=self.workflow_tabs.currentWidget() is self.subs_setup_scroll)
         event.acceptProposedAction()
 
-    def raise_for_single_instance(self) -> None:
-        if not self._ui_closed:
-            self.showNormal()
-            self.raise_()
-            self.activateWindow()
-
 
 def main(argv: list[str] | None = None) -> int:
     # QSettings canonical path BEFORE MainWindow (design §2 rule for
@@ -5193,23 +5107,10 @@ def main(argv: list[str] | None = None) -> int:
         _stop_monitor()
 
     app = QApplication(list(argv or sys.argv[1:]))
-    from .ui.single_instance import SingleInstanceGuard
-    guard = SingleInstanceGuard()
-    if not guard.start(app):
-        if guard.status == "signalled":
-            return 0
-        if sys.stderr is not None:
-            print(guard.error, file=sys.stderr)
-        QMessageBox.critical(None, "VidLift cannot start", guard.error or "Local IPC ownership could not be established.")
-        return 1
     app.aboutToQuit.connect(_shutdown)
     window = MainWindow()
-    guard.on_raise = window.raise_for_single_instance
     window.show()
-    try:
-        return app.exec()
-    finally:
-        guard.close()
+    return app.exec()
 
 
 if __name__ == "__main__":

@@ -111,7 +111,6 @@ def test_t3_subs_terminal_success_reports_result_and_pin(tmp_path):
         options={"device": "auto"},
     )
     record.result = {"device": "cuda", "language": "en", "cue_count": 3}
-    registry.save()
     payload = _status_payload(services, record)
     assert payload["state"] == "succeeded"
     assert payload["transcription"] == {
@@ -132,7 +131,6 @@ def test_t4_subs_foreign_engine_empty_device_reads_null(tmp_path):
         options={},
     )
     record.result = {"device": ""}
-    registry.save()
     payload = _status_payload(services, record)
     assert payload["transcription"] == {
         "device": None,

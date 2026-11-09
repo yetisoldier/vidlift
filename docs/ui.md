@@ -14,21 +14,14 @@ too. One source of truth, two readers.
 
 A muted helper line above the controls names the canonical order:
 
-> AI Upscale: Add files → Plan Batch → Start Upscale.
-
-For **Subtitles Only**, add and review staged files, then **Start Subtitles**.
-Screenshots on this page show an earlier layout, not the current tabs.
+> 1. Add files → 2. Plan → 3. Start. Planning never writes to disk.
 
 ### Controls
-The settings surface uses **AI Upscale** and **Subtitles Only** tabs, each with
-its own options. Switching tabs is presentation only: it does not plan, stage,
-submit or cancel work. Queue/results remain shared outside the tabs. Settings
-pages scroll when space is limited. Checkboxes show an empty square when off
-and a tick when on, including disabled checked states.
+The settings surface is divided into two titled groups: **Upscale** and **Add subtitles (no upscale)**. Each group shows only the controls that the respective mode consumes.
 
-**AI Upscale tab**
+**Upscale Group**
 - **Add Files:** select one or more videos.
-- **Add Folder:** recursively add supported videos, including subfolders.
+- **Add Folder:** add supported videos directly inside one folder.
 - **Clear:** remove the current list.
 - **GB/hour:** set the approximate final size per hour of video.
 - **Output Folder:** send every planned MP4 to one destination.
@@ -42,40 +35,61 @@ and a tick when on, including disabled checked states.
   (cancel to change it).
 - **Enable subtitle OCR:** convert selected bitmap PGS/VobSub subtitles to text. Turning this off does not disable ordinary text-subtitle pass-through.
 - **Transcribe missing subtitles:** (Default: ON) If no subtitle track is found, VidLift will attempt to generate one from the audio using a local AI model (~1.5 GB).
-- **Replace original on success:** opt-in publication at the exact original
-  pathname after verification, retaining original bytes in recovery storage.
-- **Suppress .srt sidecar on success:** opt-in withholding of the public SRT
-  after a verified embed/publication; private subtitle evidence is retained.
+- **Replace original on success:** (Upscale only) After a verified upscale, delete the source and rename the output to the source's name.
 - **Resume retained work:** If a previous run was interrupted, this allows VidLift to pick up from the last verified chunk.
 - **Plan Batch:** probe and classify every listed file.
 - **Start Upscale:** enqueue every ready item as a tracked job.
 - **Cancel Current:** stop the running job safely through the same
   cancel path an MCP agent uses; it can take a few seconds while the
-  engine exits. Built-in transcription has supervised worker cancellation and
-  timeouts; GPU-lock waits are cancellable. Late cancellation during publication
-  is deferred to a safe checkpoint, not used to undo a committed output.
+  engine exits cleanly. Cancellation is now observed during pre-transcription
+  steps (model resolution, download, load, and language detection) in both modes.
+  Note: a process blocked inside a hung native call still requires quitting the app,
+  and waiting on the GPU phase lock is not cancellable.
 
-**Subtitles Only tab**
-- **Add Subtitles… / Add Folder:** check and stage videos, with recursive folder
-  collection. Set options before adding: staged rows retain those options.
-- **Transcription device:** select the requested transcription device.
-- **Start Subtitles:** recheck and submit eligible staged files, not just the
-  selected row. Adding files alone does not start jobs.
-- **Remove selected staged / Clear staged subtitles:** remove staged choices
-  without deleting media or cancelling submitted jobs.
-- **Replace original on success (deletes source):** opt-in publication at
-  **{stem}.mp4** beside the source; original bytes are retained, not erased.
-- **Suppress .srt sidecar on success:** independent of the upscale option;
-  withholds the public SRT only after verified embedding/publication.
+**Add subtitles (no upscale) Group**
+- **Add Subtitles…:** Add videos to be processed for subtitles only (no AI upscale).
+- **Replace original on success (deletes source):** After a successful subtitles pass, delete the original file and rename the output to the original name with an `.mp4` extension (e.g. `movie.avi` → `movie.mp4`). If a file of that name already exists, both files are kept.
 - **Scope:** This mode adds subtitles from the file's own audio — video streams are copied without re-encoding or upscaling.
 - **Pre-flight Skip:** To prevent unnecessary runs, VidLift now checks files at the pick stage. Files that already carry a usable text subtitle track are marked as `skip — already has subtitles` and are not enqueued. Files whose output already exists are marked as `blocked — subtitles output already exists` and are not enqueued. These static rows are rendered in the table for visibility but do not become active jobs.
 
 Files can also be dragged into the window.
 
-Folder collection and GUI submissions are limited to 500 files per batch;
-VidLift-generated **.subs.mp4** outputs are excluded from recursive collection.
-See [replacement, storage and supported limits](usage.md#replacement-sidecars-and-recovery-storage)
-for collision handling, retained backups/journals and writable-source requirements.
+## Workflow tabs and staged review
+
+The controls split into two workflow tabs above the settings: **AI Upscale** and
+**Subtitles Only**. Each tab's group shows only the controls that mode consumes;
+switching tabs is presentation only — it never plans, stages, or submits work.
+
+On the **Subtitles Only** tab, picked and dropped videos first land as **staged
+rows** instead of starting work immediately. Each staged row shows its
+plan-time verdict (ready / skip — already has subtitles / blocked — output
+exists / not submitted), and the per-row options applied when it was added:
+replace original on success, delete the `.srt` sidecar after a successful
+embed, and the requested device (`Auto` / `CUDA` / `CPU`). Options are frozen
+at staging per row — changing the checkboxes afterwards affects files added
+next, not the staged ones. Rows can be removed individually (`Remove selected
+staged subtitles`, Delete key) or cleared as a set; nothing is deleted from
+disk — only the staging entry is dropped.
+
+When the staged batch is ready, **Start Subtitles** shows a review dialog that
+lists every affected source and output with its post-success deletion options.
+The dialog offers **Start reviewed jobs** and **Go back** (the default button);
+Escape and the window close mean Go back — no work starts unless the review is
+explicitly accepted. One accepted row becomes exactly one tracked job through
+the same registry the `vidlift mcp-server` uses. If a source fails validation
+it is rejected with nothing changed (retry allowed); if a submission's outcome
+cannot be proven, the row re-stages marked **submission unknown** and automatic
+retry is disabled for it — inspect Recent jobs before touching that source
+again. Files added while another submission or a review is in flight stay
+staged rather than joining the queue mid-review.
+
+While the staged files are being checked (**Cancel check** cancels it),
+progress reads plan/preflight state honestly: probing and preparation show
+their step, and a check can always be cancelled before anything is enqueued.
+
+Destructive starts still require explicit consent: AI-Upscale starts with
+replace/sidecar-suppression options confirmed, and subtitle starts with
+deletion options go through the same review dialog before any job is recorded.
 
 
 ## Planned batch
@@ -138,12 +152,23 @@ shows.
 
 ## Monitor via MCP
 
-The GUI and MCP use the same persistent job registry. Registry reads refresh
-when its file changes; an MCP server need not be restarted merely to discover
-GUI-submitted jobs. Use **list**, **status** and **manifest** to inspect recorded
-jobs. Detailed live telemetry depends on the owning process; the GUI's read-only
-LAN monitor exposes its live status. A persisted job record alone is not proof
-that its worker is still running.
+An MCP server reads the same registry the GUI writes to, **as of
+server startup**: the `vidlift mcp-server` stdio server loads
+`$VIDLIFT_STATE_DIR/jobs.json` once when it starts and does not
+re-scan live processes afterwards.
+
+- `list` — job ids known to the server at its startup.
+- `status {job_id}` — the full runner state contract: current phase,
+  progress frames, log tail, engine honesty fields, ETA when measured.
+- `manifest {job_id}` — the run manifest verbatim.
+
+Practical contract:
+
+- A server started **before** GUI jobs run will not see them.
+- To inspect GUI-started runs, start (or restart) the MCP server
+  after the run completes.
+- Cancelling a live GUI job from a separate MCP server process is
+  not supported in v0.4.4 (queued for v0.4.5).
 
 The registry lives in one state directory per machine
 (`$VIDLIFT_STATE_DIR/jobs.json`, default `~/.vidlift` in development

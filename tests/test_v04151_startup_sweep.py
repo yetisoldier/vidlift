@@ -18,9 +18,8 @@ running ones, and every active-count guard in the window reads them.
 
 Red-first contracts:
 
-1. ``build_services(gui_startup=True)`` sweeps demonstrably dead-owner
-   queued+running to ``failed`` with startup/restart errors respectively;
-   live or unverifiable owners and terminal history remain untouched.
+1. ``build_services(gui_startup=True)`` sweeps queued+running to
+   ``failed`` with the startup-sweep error; terminal history untouched.
 2. ``LocalBridgeClient`` construction IS the GUI startup: after
    construct, ``active_job_count() == 0``, stale records are failed and
    PERSISTED, and their history rows remain (visible, not deleted).
@@ -43,8 +42,6 @@ import os
 import time
 
 import pytest
-from _gui_checks import wait_for_checks
-from _registry_checks import seed_exited_registry
 
 pytest.importorskip("PyQt6")
 
@@ -83,20 +80,30 @@ def _seed_stale_registry(
     """The post-crash jobs.json shape: stale queued + running records
     (paths need not exist — the previous session died), plus terminal
     history rows that must survive every sweep untouched."""
-    jobs = [{"path": f"/media/gone-queued-{i}.avi", "state": "queued",
-             "options": {"engine": "auto"}} for i in range(queued)]
-    jobs += [{"path": f"/media/gone-running-{i}.avi", "state": "running",
-              "options": {"engine": "auto"}} for i in range(running)]
+    registry = Registry(tmp_path)
+    for i in range(queued):
+        registry.enqueue(
+            kind="run",
+            paths=[f"/media/gone-queued-{i}.avi"],
+            options={"engine": "auto"},
+        )
+    for i in range(running):
+        record = registry.enqueue(
+            kind="run",
+            paths=[f"/media/gone-running-{i}.avi"],
+            options={"engine": "auto"},
+        )
+        registry.transition(record, "running")
     if with_terminals:
-        jobs += [{"path": "/media/old-done.avi", "state": "succeeded"},
-                 {"path": "/media/old-corpse.avi", "state": "failed", "error": RESTART_ERROR}]
-    # Same-process enqueue now records a LIVE owner. An exited child models
-    # the actual crashed predecessor without stripping ownership metadata.
-    return seed_exited_registry(tmp_path, jobs)
-
-
-def _recovery_error(path):
-    return RESTART_ERROR if "/gone-running-" in path else STARTUP_SWEEP_ERROR
+        done = registry.enqueue(kind="run", paths=["/media/old-done.avi"], options={})
+        registry.transition(done, "running")
+        registry.transition(done, "succeeded")
+        corpse = registry.enqueue(kind="run", paths=["/media/old-corpse.avi"], options={})
+        registry.transition(corpse, "running")
+        corpse.error = RESTART_ERROR
+        registry.transition(corpse, "failed")
+    registry.save()
+    return registry
 
 
 def _settings_patch(monkeypatch, tmp_path):
@@ -136,7 +143,7 @@ def test_build_services_gui_startup_sweep_covers_queued_and_running(
     tmp_path, monkeypatch
 ):
     """§1: gui_startup=True sweeps queued AND running to failed with the
-    queued startup / running restart errors; terminal history is untouched; the result is
+    startup-sweep error; terminal history is untouched; the result is
     persisted to jobs.json before any consumer can count actives."""
     monkeypatch.delenv("VIDLIFT_STATE_DIR", raising=False)
     _seed_stale_registry(tmp_path)
@@ -155,7 +162,7 @@ def test_build_services_gui_startup_sweep_covers_queued_and_running(
     ):
         record = by_first_path[stale_path]
         assert record.state == "failed", stale_path
-        assert record.error == _recovery_error(stale_path), stale_path
+        assert record.error == STARTUP_SWEEP_ERROR, stale_path
         assert record.ok is False, stale_path
     # persisted NOW, before any active-job read in the GUI
     rows = json.loads((tmp_path / "jobs.json").read_text())["jobs"]
@@ -166,7 +173,7 @@ def test_build_services_gui_startup_sweep_covers_queued_and_running(
         "/media/gone-running-0.avi",
     ):
         assert persisted[stale_path]["state"] == "failed", stale_path
-        assert persisted[stale_path]["error"] == _recovery_error(stale_path)
+        assert persisted[stale_path]["error"] == STARTUP_SWEEP_ERROR
     # terminal history rows keep their original truth
     assert by_first_path["/media/old-done.avi"].state == "succeeded"
     assert by_first_path["/media/old-corpse.avi"].state == "failed"
@@ -187,22 +194,20 @@ def test_local_bridge_client_startup_sweep_clears_stale_actives(
     client = LocalBridgeClient(state_dir=tmp_path, start_executor=False)
     # THE Eric-repro red line: pre-fix this reads 3 (2 queued + 1 running)
     assert client.active_job_count() == 0
-    # Every stale record is failed with its precise queued/running error.
+    # every stale record is failed with the startup-sweep error
     for job_id in stale_ids:
         record = client.registry.require(job_id)
         if record.paths and record.paths[0].startswith("/media/gone"):
             assert record.state == "failed", job_id
-            assert record.error == _recovery_error(record.paths[0]), job_id
+            assert record.error == STARTUP_SWEEP_ERROR, job_id
     # terminal history untouched
     seeded = client.registry.history()
     assert len(seeded) == 5  # 3 swept + 2 terminal rows stayed
     states = sorted(r.state for r in seeded)
     assert states == ["failed", "failed", "failed", "failed", "succeeded"]
     # the swept rows are VISIBLE history, not deleted records
-    swept_rows = [r for r in seeded if r.paths[0].startswith("/media/gone")]
+    swept_rows = [r for r in seeded if r.error == STARTUP_SWEEP_ERROR]
     assert len(swept_rows) == 3
-    assert sum(r.error == STARTUP_SWEEP_ERROR for r in swept_rows) == 2
-    assert sum(r.error == RESTART_ERROR for r in swept_rows) == 1
     # persisted before any GUI read
     rows = json.loads((tmp_path / "jobs.json").read_text())["jobs"]
     assert all(
@@ -214,9 +219,7 @@ def test_local_bridge_client_startup_sweep_clears_stale_actives(
     client2 = LocalBridgeClient(state_dir=tmp_path, start_executor=False)
     assert client2.active_job_count() == 0
     assert len([r for r in client2.registry.history()
-                if r.paths[0].startswith("/media/gone")]) == 3
-    assert {r.job_id: r.to_dict() for r in client2.registry.history()} == {
-        r.job_id: r.to_dict() for r in seeded}
+                if r.error == STARTUP_SWEEP_ERROR]) == 3
 
 
 def test_stdio_mcp_server_restart_still_resumes_queued(tmp_path):
@@ -259,7 +262,7 @@ def test_gui_startup_empty_table_clear_files_not_blocked(qapp, monkeypatch, tmp_
         assert client.active_job_count() == 0
         # history rows still show the swept jobs as failed (visible)
         assert all(
-            r.state == "failed" and r.error == _recovery_error(r.paths[0])
+            r.state == "failed" and r.error == STARTUP_SWEEP_ERROR
             for r in client.registry.history()
             if r.paths and r.paths[0].startswith("/media/gone")
         )
@@ -295,47 +298,6 @@ def test_gui_start_upscale_guard_quiet_after_startup_sweep(
         record = client.registry.require(win.job_ids[0])
         assert record.kind == "run"
         assert record.state == "queued"  # executor not started in-test
-    finally:
-        _teardown_window(win, qapp)
-
-
-def test_add_subtitles_picker_opens_with_stale_registry(
-    qapp, monkeypatch, tmp_path
-):
-    """§6 boundary (per the ee234b6 independence design): 'Add
-    Subtitles…' opens the picker and enqueues even though the registry
-    carried stale records — the startup sweep guarantees the guard
-    reads zero."""
-    monkeypatch.delenv("VIDLIFT_STATE_DIR", raising=False)
-    _seed_stale_registry(tmp_path)
-    fresh = tmp_path / "fresh-subs-target.mkv"
-    fresh.write_bytes(b"x")
-
-    import vidlift.gui as gui_mod
-
-    _settings_patch(monkeypatch, tmp_path)
-    captured = _capture_information(monkeypatch)
-    monkeypatch.setattr(
-        gui_mod.QFileDialog,
-        "getOpenFileNames",
-        staticmethod(lambda *a, **k: ([str(fresh)], "")),
-    )
-
-    client = LocalBridgeClient(state_dir=tmp_path, start_executor=False)
-    win = MainWindow(client=client)
-    try:
-        assert client.active_job_count() == 0  # startup swept (RED pre-fix: 3)
-        win.add_subs_button.click()
-        wait_for_checks(win)
-        win.start_subtitles()  # staged Add is submitted only on explicit Start
-        assert captured["log"] == [], (
-            f"subs picker blocked: {captured['log']!r}"
-        )
-        assert len(win.job_ids) == 1
-        record = client.registry.require(win.job_ids[0])
-        assert record.kind == "subs"
-        assert record.state == "queued"
-        assert record.paths == [str(fresh)]
     finally:
         _teardown_window(win, qapp)
 
@@ -377,27 +339,3 @@ def test_sweep_orphans_defaults_and_queued_extension_pins(tmp_path):
         error=STARTUP_SWEEP_ERROR, include_queued=True
     ) == []
     assert registry.queued() == [] and registry.running() == []
-
-
-@pytest.mark.parametrize("gui_startup", [False, True])
-@pytest.mark.parametrize("owner_status", ["live", "unknown"])
-def test_restart_retains_live_or_unverifiable_owner(tmp_path, monkeypatch, gui_startup, owner_status):
-    """A second services/server must never reclaim another live/unknown owner."""
-    from vidlift.mcp_bridge import registry_transactions
-
-    registry = Registry(tmp_path)
-    queued = registry.enqueue(kind="run", paths=["synthetic-queued"], options={})
-    running = registry.enqueue(kind="run", paths=["synthetic-running"], options={})
-    registry.transition(running, "running")
-    if owner_status == "unknown":
-        monkeypatch.setattr(registry_transactions, "owner_alive", lambda fact: None)
-    else:
-        assert registry_transactions.owner_alive(running.to_dict()["owner"]) is True
-    before = (tmp_path / "jobs.json").read_bytes()
-    services = build_services(tmp_path, gui_startup=gui_startup)
-    server = McpServer(state_dir=tmp_path, services=services, start_workers=False)
-    assert server.registry.require(queued.job_id).state == "queued"
-    assert server.registry.require(running.job_id).state == "running"
-    assert server.registry.history() == []
-    assert server.executor._threads == []
-    assert (tmp_path / "jobs.json").read_bytes() == before

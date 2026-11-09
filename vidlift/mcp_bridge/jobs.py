@@ -56,20 +56,15 @@ class CancelFlag:
 
     def __init__(self) -> None:
         self._event = threading.Event()
-        self._poll = None
-        self._last_poll = 0.0
 
     def set(self) -> None:
         self._event.set()
 
     def is_set(self) -> bool:
-        if self._poll is not None and time.monotonic() - self._last_poll >= 0.1:
-            self._last_poll = time.monotonic()
-            self._poll()
         return self._event.is_set()
 
     def __call__(self) -> bool:
-        return self.is_set()
+        return self._event.is_set()
 
 
 class JobOutcome:
@@ -164,7 +159,7 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
     # cannot re-install a stale file row over the live seams: the
     # record's _live state box and the cancel flag are process-local
     # and must survive any concurrent reload.
-    # Registry preserves process-local boxes on the committed record.
+    services.registry._jobs[record.job_id] = record
 
     log_root = Path(
         options.get("log_dir") or (Path(path).parent / ".vidlift-runs")
@@ -272,7 +267,6 @@ def _execute_run_job(record: JobRecord, services, cancel: CancelFlag) -> JobOutc
             # records) reads as False → the KEEP-sidecar v0.4.17
             # behavior, byte-identical.
             suppress_srt=bool(options.get("suppress_srt", False)),
-            transcription_batch_id=options.get("batch_id"),
         )
     except EngineCancelled as exc:
         state = getattr(exc, "state", None)
@@ -380,7 +374,7 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
     # v0.4.5 (D2): re-pin the record so a reader's _maybe_reload
     # cannot re-install a stale file row over the live seams (mirrors
     # _execute_run_job's pin).
-    # No direct writes to registry._jobs; persistence is transactional.
+    services.registry._jobs[record.job_id] = record
 
     def tracked(binary: str, args: list[str]):
         record.touch()
@@ -473,13 +467,6 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
         state.touch()
         record.touch()
 
-    def on_fallback(note: str) -> None:
-        progress = dict(state.progress or {})
-        progress["transcription_fallback_reason"] = note
-        state.progress = progress
-        state.touch()
-        record.touch()
-
     try:
         from ..run import find_tools
         tools = find_tools(
@@ -519,9 +506,6 @@ def _execute_subs_job(record: JobRecord, services, cancel: CancelFlag) -> JobOut
             on_download_progress=on_download_progress,
             should_cancel=cancel,
             on_device=on_device,
-            on_fallback=on_fallback,
-            # Legacy records deliberately retain per-call (no latch) semantics.
-            batch_id=options.get("batch_id"),
         )
     except EngineCancelled as exc:
         return JobOutcome(ok=False, cancelled=True, error=str(exc))
@@ -723,12 +707,7 @@ class JobExecutor:
         # path too, not just _run_job — any bug anywhere in the loop
         # body kills the single worker and silently starves the queue.
         while not self._stopping:
-            from ..file_mutex import FileMutex
-            lease = FileMutex(self.registry.path.with_name(self.registry.path.name + ".executor"))
             try:
-                if not lease.acquire(0.1):
-                    continue
-                self.registry.sweep_orphans(lease_held=True)
                 job = self._claim_next()
                 if job is None:
                     # bounded idle poll; a new enqueue shortens latency
@@ -746,8 +725,6 @@ class JobExecutor:
                         f"worker survived loop failure: "
                         f"{type(exc).__name__}: {exc}"
                     )
-            finally:
-                lease.release()
 
     def _run_job(self, record: JobRecord) -> None:
         # The D1 fix (layer a): the registry created and registered
@@ -756,11 +733,9 @@ class JobExecutor:
         # old claim window against "no live owner". The defensive
         # create covers direct-API callers that bypass the executor.
         cancel_flag = self.registry.get_cancel_flag(record.job_id)
-        owner_token = (getattr(record, "_extra", {}).get("owner") or {}).get("claim_token")
         if cancel_flag is None:
             cancel_flag = CancelFlag()
-        self.registry.set_cancel_flag(record.job_id, cancel_flag)
-        cancel_flag._poll = self.registry.poll_cancellation
+            self.registry.set_cancel_flag(record.job_id, cancel_flag)
         log_event = getattr(self.services, "log_event", None)
         if log_event is not None:
             log_event(f"job {record.job_id} ({record.kind}) running")
@@ -790,16 +765,11 @@ class JobExecutor:
         # truth; the contradiction is LOGGED, never silent.
         try:
             if outcome.cancelled:
-                terminal = "cancelled"
+                self.registry.transition(record, "cancelled")
             elif outcome.ok:
-                terminal = "succeeded"
+                self.registry.transition(record, "succeeded")
             else:
-                terminal = "failed"
-            self.registry.finish_job(record.job_id, terminal, owner_token=owner_token, ok=outcome.ok,
-                output_path=outcome.output_path, manifest_path=outcome.manifest_path,
-                log_path=outcome.log_path, error=outcome.error,
-                engine_simulated=outcome.engine_simulated, engine_note=outcome.engine_note,
-                result=outcome.result)
+                self.registry.transition(record, "failed")
         except RegistryError as exc:
             if log_event is not None:
                 log_event(
@@ -835,18 +805,14 @@ class JobExecutor:
             activity = getattr(state, "last_activity_at", None)
             if progress is None and not phase:
                 continue
-            snapshot = {
+            record.progress_snapshot = {
                 "progress": dict(progress) if progress else {},
                 "current_phase": phase,
                 "last_activity_at": activity,
             }
-            owner_token = (getattr(record, "_extra", {}).get("owner") or {}).get("claim_token")
-            try:
-                self.registry.update_job(record.job_id, expected_state="running", owner_token=owner_token,
-                                         progress_snapshot=snapshot, last_activity_at=activity)
-            except RegistryError:
-                continue
             mirrored += 1
+        if mirrored:
+            self.registry.save()
         self._last_mirror_at = time.monotonic()
         return mirrored
 
