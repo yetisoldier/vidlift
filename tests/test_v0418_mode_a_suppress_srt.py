@@ -8,7 +8,7 @@ fakes (no real ffmpeg/whisper/network/GPU anywhere):
      sidecar present + path set (unchanged v0.4.17)
   29 embedded-text branch ON: the `-c:s srt` extract command NEVER
      runs; status "carried"; ``embedded`` dict present; flag set.
-     (The track already rode the encode as mov_text.)
+     (The track already rode the encode as subrip.)
   30 adopted-sidecar branch ON: the run's COPY ({output-stem}.srt
      beside the OUTPUT) is removed; the USER's original sidecar beside
      the SOURCE is byte-identical (never a candidate).
@@ -23,7 +23,7 @@ fakes (no real ffmpeg/whisper/network/GPU anywhere):
 
 The runner subclass adds the two arms test_run's FakeRunner lacks for
 a full fake subtitle run: the transcription wav extract (pcm_s16le)
-and the mov_text mux (whose final arg is the .muxing.mp4 TEMP, which
+and the subrip mux (whose final arg is the .muxing.mkv TEMP, which
 test_run's FakeRunner does not dispatch).
 """
 
@@ -55,8 +55,8 @@ class ModeARunner(FakeRunner):
 
     - pcm_s16le: the wav extract into the transcribe workdir (writes
       b"wav", exactly the test_v0414_subs_job FakeRunner arm).
-    - `-c:s mov_text` with any final arg: the mov_text mux — writes the
-      TEMP sibling at args[-1] (mux_srt_into_mp4 then os.replace()s).
+    - `-c:s subrip` with any final arg: the subrip mux — writes the
+      TEMP sibling at args[-1] (mux_srt_into_video then os.replace()s).
     - mux_fail: only the mux (never the encode) exits nonzero — the
       fail-open test's lever.
     """
@@ -75,7 +75,7 @@ class ModeARunner(FakeRunner):
             self.commands.append((binary, tuple(argv)))
             Path(argv[-1]).write_bytes(b"wav")
             return 0, "", ""
-        if "-c:s" in argv and "mov_text" in argv:
+        if "-c:s" in argv and "subrip" in argv:
             self.commands.append((binary, tuple(argv)))
             if self.mux_fail:
                 return 1, "", "mux boom"
@@ -144,7 +144,7 @@ def _mode_a_run_with_tools(tmp_path, runner, *, suppress_srt, monkeypatch,
 
 def _mux_cmd_in(runner) -> bool:
     return any(
-        "-c:s" in argv and "mov_text" in argv for _b, argv in runner.commands
+        "-c:s" in argv and "subrip" in argv for _b, argv in runner.commands
     )
 
 
@@ -198,7 +198,7 @@ def test_29_embedded_text_branch_skips_extract_entirely(
     assert result.ok
     assert subs["status"] == "carried"
     assert subs["sidecar_suppressed"] is True
-    assert subs["embedded"] == {"codec": "mov_text", "language_tag": "eng"}
+    assert subs["embedded"] == {"codec": "subrip", "language_tag": "eng"}
     # NO `-c:s srt` extract command ran at all (the suppressed arm)
     extracts = [
         " ".join(argv)
@@ -398,7 +398,7 @@ def test_34_cli_print_honesty_suppressed_and_default(
 
         subs = dict(clean_subs)
         subs["embedded"] = {
-            "codec": "mov_text", "language_tag": "eng",
+            "codec": "subrip", "language_tag": "eng",
         }
         if posture == "carried-suppressed":
             subs.pop("sidecar_path", None)
@@ -440,14 +440,14 @@ def test_34_cli_print_honesty_suppressed_and_default(
 
     out_carried = _run_cli("carried-suppressed")
     assert (
-        "subtitles: carried (mov_text embedded; .srt sidecar suppressed)"
+        "subtitles: carried (subrip embedded; .srt sidecar suppressed)"
         in out_carried
     )
     out_ocr = _run_cli("ocr-suppressed")
     assert "  sidecar: suppressed after a successful embed" in out_ocr
     out_c_default = _run_cli("carried-default")
     assert (
-        "subtitles: carried (mov_text embedded + .srt sidecar)"
+        "subtitles: carried (subrip embedded + .srt sidecar)"
         in out_c_default
     )
     out_o_default = _run_cli("ocr-default")

@@ -3,17 +3,17 @@ boundaries (Bob's implementation spec §8, file A).
 
 Groups:
 
-1. Pure naming (`subs_replace_target`): always `{stem}.mp4` beside the
+1. Pure naming (`subs_replace_target`): always `{stem}.mkv` beside the
    source; the old extension is never carried; the stem-strip regex is
    the byte-identical twin of `subs_output_path`.
 2. Helper happy paths (`replace_subs_output`): rename-before-delete
    keeps every failure mode two-filed; sidecar renames to `{stem}.srt`;
-   source-is-mp4 is one atomic move (no delete observable); the
+   source-is-mkv is one atomic move (no delete observable); the
    defensive cross-device arm stages a temp SIBLING, SHA-256-verifies,
    renames, and never leaves the temp behind.
-3. Helper refusals / graceful degradation: stranger `{stem}.mp4`
+3. Helper refusals / graceful degradation: stranger `{stem}.mkv`
    refuses the WHOLE replace (nothing deleted, nothing moved); stranger
-   `{stem}.srt` only downgrades the SIDECAR (mp4 still ships); missing
+   `{stem}.srt` only downgrades the SIDECAR (mkv still ships); missing
    output/source refuse pre-mutation; failing deletes/renames keep
    both files and narrate honestly.
 4. `run_subs_job` integration (fake engine + fake runner, the
@@ -57,15 +57,15 @@ from test_v0414_subs_job import (  # noqa: F401
 
 
 # ------------------------------------------------- 1. pure naming (D6)
-def test_1_suffix_sources_target_stem_mp4():
-    """`.avi`/`.mkv`/`.ts`/`.MP4` → `{stem}.mp4` beside the source; the
+def test_1_suffix_sources_target_stem_mkv():
+    """`.avi`/`.mkv`/`.ts`/`.MP4` → `{stem}.mkv` beside the source; the
     old extension is NEVER carried to the target (D6)."""
     assert subs_replace_target("/lib/H/Show.s01e01.avi") == (
-        "/lib/H/Show.s01e01.mp4"
+        "/lib/H/Show.s01e01.mkv"
     )
-    assert subs_replace_target("/x/movie.mkv") == "/x/movie.mp4"
-    assert subs_replace_target("/x/cap.ts") == "/x/cap.mp4"
-    assert subs_replace_target("/x/cap.MP4") == "/x/cap.mp4"
+    assert subs_replace_target("/x/movie.mkv") == "/x/movie.mkv"
+    assert subs_replace_target("/x/cap.ts") == "/x/cap.mkv"
+    assert subs_replace_target("/x/cap.MP4") == "/x/cap.mkv"
 
 
 def test_2_multi_dot_stem_stripped_like_subs_output_path():
@@ -73,22 +73,22 @@ def test_2_multi_dot_stem_stripped_like_subs_output_path():
     regex parity with subs_output_path (one derivation, F-5 lesson)."""
     stem = "show - S03E01 - 35 Hours"
     src = f"/media/{stem}.avi"
-    assert subs_replace_target(src) == f"/media/{stem}.mp4"
+    assert subs_replace_target(src) == f"/media/{stem}.mkv"
     # the family relationship holds for the same source, and the
-    # `.subs.mp4` infix stays distinct from the replace target
-    assert subs_output_path(src) == f"/media/{stem}.subs.mp4"
+    # `.subs.mkv` infix stays distinct from the replace target
+    assert subs_output_path(src) == f"/media/{stem}.subs.mkv"
 
 
 # ----------------------------------- 2. helper happy paths (+ §6 test 4)
 def _stage_pair(tmp_path, *, stem="movie", suffix=".avi"):
     src = tmp_path / f"{stem}{suffix}"
     src.write_bytes(b"source-bytes")
-    out = tmp_path / f"{stem}.subs.mp4"
+    out = tmp_path / f"{stem}.subs.mkv"
     out.write_bytes(b"muxed-output-bytes")
     return src, out
 
 
-def test_3_happy_path_moves_mp4_and_sidecar(tmp_path):
+def test_3_happy_path_moves_mkv_and_sidecar(tmp_path):
     src, out = _stage_pair(tmp_path)
     srt = tmp_path / "movie.subs.srt"
     srt.write_bytes(b"sidecar-bytes")
@@ -96,7 +96,7 @@ def test_3_happy_path_moves_mp4_and_sidecar(tmp_path):
     final_out, final_srt = replace_subs_output(
         str(src), str(out), srt_path=str(srt), log_line=log.append
     )
-    expected_target = tmp_path / "movie.mp4"
+    expected_target = tmp_path / "movie.mkv"
     assert final_out == str(expected_target)
     assert final_srt == str(tmp_path / "movie.srt")
     assert not src.exists()  # source deleted SECOND
@@ -109,7 +109,7 @@ def test_3_happy_path_moves_mp4_and_sidecar(tmp_path):
 def test_4_no_sidecar_returns_none(tmp_path):
     src, out = _stage_pair(tmp_path)
     final_out, final_srt = replace_subs_output(str(src), str(out))
-    assert final_out == str(tmp_path / "movie.mp4")
+    assert final_out == str(tmp_path / "movie.mkv")
     assert final_srt is None
     # an srt_path that does NOT exist on disk is equally honest-None
     # (its own fresh pair: the helper is one-shot by design)
@@ -120,12 +120,15 @@ def test_4_no_sidecar_returns_none(tmp_path):
     assert final_srt is None
 
 
-def test_5_source_is_mp4_one_atomic_move_no_delete_observable(
+def test_5_source_is_mkv_one_atomic_move_no_delete_observable(
     tmp_path, monkeypatch
 ):
     """Same-path case (D2): target == source path — the single
-    os.replace IS the delete-and-move; os.remove must never fire."""
-    src, out = _stage_pair(tmp_path, stem="show", suffix=".mp4")
+    os.replace IS the delete-and-move; os.remove must never fire.
+    v0.4.24: the same-path identity attaches to a `.mkv` source (a
+    `.mp4` source is now an ordinary rename — the target is always
+    `{stem}.mkv`, never the source's extension)."""
+    src, out = _stage_pair(tmp_path, stem="show", suffix=".mkv")
     assert subs_replace_target(str(src)) == str(src)  # the identity case
     removals: list[str] = []
 
@@ -139,7 +142,7 @@ def test_5_source_is_mp4_one_atomic_move_no_delete_observable(
     final_out, final_srt = replace_subs_output(str(src), str(out))
     assert final_out == str(src)
     assert Path(final_out).read_bytes() == b"muxed-output-bytes"
-    assert not out.exists()  # the .subs.mp4 name is consumed
+    assert not out.exists()  # the .subs.mkv name is consumed
     assert removals == []  # no delete step for this case
     assert final_srt is None
 
@@ -187,7 +190,7 @@ def test_6_cross_device_arm_stages_verifies_and_sweeps(
 
     monkeypatch.setattr(shutil, "copy2", spy_byte_copy2)
     final_out, final_srt = replace_subs_output(str(src), str(out))
-    target = tmp_path / "video title.mp4"
+    target = tmp_path / "video title.mkv"
     assert final_out == str(target)
     assert target.read_bytes() == b"muxed-output-bytes"  # byte identity
     assert not out.exists()  # the former output copy is unlinked
@@ -215,20 +218,20 @@ def test_6b_cross_device_copy_cleanup_keeps_both_on_mid_copy_failure(
     assert src.read_bytes() == b"source-bytes"
     assert out.read_bytes() == b"muxed-output-bytes"
     assert not os.path.exists(
-        str(tmp_path / "failcopy.mp4.replace-tmp")
+        str(tmp_path / "failcopy.mkv.replace-tmp")
     )
 
 
 # ------------------------- 3. helper refusals / graceful degradation
 def test_7_stranger_target_refuses_whole_replace(tmp_path):
-    """A pre-existing unrelated {stem}.mp4 refuses EVERYTHING — no move,
+    """A pre-existing unrelated {stem}.mkv refuses EVERYTHING — no move,
     no delete; all three files survive byte-identical (D2)."""
     src, out = _stage_pair(tmp_path, stem="35 Hours")
-    stranger = tmp_path / "35 Hours.mp4"
+    stranger = tmp_path / "35 Hours.mkv"
     stranger.write_bytes(b"unrelated-pre-existing")
     with pytest.raises(
         SubsJobError,
-        match="35 Hours.mp4 already exists as a different file; "
+        match="35 Hours.mkv already exists as a different file; "
         "keeping both files",
     ):
         replace_subs_output(str(src), str(out))
@@ -237,8 +240,8 @@ def test_7_stranger_target_refuses_whole_replace(tmp_path):
     assert stranger.read_bytes() == b"unrelated-pre-existing"
 
 
-def test_8_sidecar_collision_keeps_sidecar_mp4_still_ships(tmp_path):
-    """A stranger {stem}.srt only downgrades the SIDECAR: the mp4
+def test_8_sidecar_collision_keeps_sidecar_mkv_still_ships(tmp_path):
+    """A stranger {stem}.srt only downgrades the SIDECAR: the mkv
     replace still ships, the stranger .srt survives, the sidecar keeps
     its .subs.srt name, and an honest warning is narrated (D1)."""
     src, out = _stage_pair(tmp_path, stem="35 Hours")
@@ -250,7 +253,7 @@ def test_8_sidecar_collision_keeps_sidecar_mp4_still_ships(tmp_path):
     final_out, final_srt = replace_subs_output(
         str(src), str(out), srt_path=str(sidecar), log_line=log.append
     )
-    target = tmp_path / "35 Hours.mp4"
+    target = tmp_path / "35 Hours.mkv"
     assert final_out == str(target)
     assert Path(final_out).read_bytes() == b"muxed-output-bytes"  # ships
     assert not src.exists()
@@ -262,7 +265,7 @@ def test_8_sidecar_collision_keeps_sidecar_mp4_still_ships(tmp_path):
 
 def test_9_missing_output_refuses_source_kept(tmp_path):
     src, _out = _stage_pair(tmp_path)
-    missing = tmp_path / "vanish.subs.mp4"
+    missing = tmp_path / "vanish.subs.mkv"
     with pytest.raises(
         SubsJobError,
         match="replace-source refused: verified output is missing:",
@@ -301,7 +304,7 @@ def test_11_failing_source_delete_keeps_both_and_warns(
     final_out, _final_srt = replace_subs_output(
         str(src), str(out), log_line=log.append
     )
-    assert final_out == str(tmp_path / "movie.mp4")
+    assert final_out == str(tmp_path / "movie.mkv")
     assert Path(final_out).read_bytes() == b"muxed-output-bytes"
     assert src.exists()  # kept — the failed delete's residue
     assert any("source copy could not be removed" in line for line in log)
@@ -319,7 +322,7 @@ def test_12_failing_rename_refuses_nothing_deleted_first(
         moving = (
             os.path.abspath(os.fspath(src_path)) == os.path.abspath(str(out))
             and os.path.abspath(os.fspath(dst_path))
-            == os.path.abspath(str(tmp_path / "movie.mp4"))
+            == os.path.abspath(str(tmp_path / "movie.mkv"))
         )
         if moving:
             raise OSError("destination locked")
@@ -349,13 +352,13 @@ def _run_job(src, tmp_path, runner, *, replace_source, should_cancel=None):
 @pytest.mark.usefixtures("engine_on", "no_lock")
 def test_13_replace_on_end_to_end_renames_pair(tmp_path):
     """Eric's repro end-to-end: `Show - S03E01 - 35 Hours.avi` →
-    `…35 Hours.mp4` + `…35 Hours.srt`, source gone, honest notes."""
+    `…35 Hours.mkv` + `…35 Hours.srt`, source gone, honest notes."""
     stem = "Show - S03E01 - 35 Hours"
     src = tmp_path / f"{stem}.avi"
     src.write_bytes(b"source-bytes")
     runner = FakeRunner(_probe_payload())
     result = _run_job(src, tmp_path, runner, replace_source=True)
-    target = tmp_path / f"{stem}.mp4"
+    target = tmp_path / f"{stem}.mkv"
     assert result.output_path == str(target)
     assert result.srt_path == str(tmp_path / f"{stem}.srt")
     assert target.is_file()
@@ -369,13 +372,13 @@ def test_13_replace_on_end_to_end_renames_pair(tmp_path):
 
 @pytest.mark.usefixtures("engine_on", "no_lock")
 def test_14_default_absent_is_byte_identical_to_v0416_behavior(tmp_path):
-    """Option OFF (the §10-1 invariant): output stays `{stem}.subs.mp4`,
+    """Option OFF (the §10-1 invariant): output stays `{stem}.subs.mkv`,
     source untouched, and NO replace note — the v0.4.16.2 behavior."""
     src = tmp_path / "movie.avi"
     src.write_bytes(b"source-bytes")
     runner = FakeRunner(_probe_payload())
     result = _run_job(src, tmp_path, runner, replace_source=False)
-    assert result.output_path == str(tmp_path / "movie.subs.mp4")
+    assert result.output_path == str(tmp_path / "movie.subs.mkv")
     assert Path(result.output_path).read_bytes() == b"muxed-out"
     assert src.read_bytes() == b"source-bytes"
     assert result.srt_path == str(tmp_path / "movie.subs.srt")
@@ -386,7 +389,7 @@ def test_14_default_absent_is_byte_identical_to_v0416_behavior(tmp_path):
 def test_15_replace_failure_keeps_success_and_warns(
     tmp_path, monkeypatch
 ):
-    """A replace failure NEVER fails the job: the original `.subs.mp4`
+    """A replace failure NEVER fails the job: the original `.subs.mkv`
     path rides, both files stay on disk, the Mode A warning note lands."""
     src = tmp_path / "movie.avi"
     src.write_bytes(b"source-bytes")
@@ -397,7 +400,7 @@ def test_15_replace_failure_keeps_success_and_warns(
 
     monkeypatch.setattr("vidlift.subs_job.replace_subs_output", boom)
     result = _run_job(src, tmp_path, runner, replace_source=True)
-    assert result.output_path == str(tmp_path / "movie.subs.mp4")
+    assert result.output_path == str(tmp_path / "movie.subs.mkv")
     assert Path(result.output_path).read_bytes() == b"muxed-out"
     assert src.read_bytes() == b"source-bytes"  # both files on disk
     assert (
@@ -416,7 +419,7 @@ class _ArmingRunner(FakeRunner):
 
     def __call__(self, binary: str, args: list[str]) -> tuple[int, str, str]:
         argv = tuple(args)
-        if "-c:s" in argv and "mov_text" in argv:
+        if "-c:s" in argv and "subrip" in argv:
             self._flag.armed = True
         return super().__call__(binary, args)
 
@@ -426,7 +429,7 @@ def test_16_cancel_after_remux_never_replaces(tmp_path, monkeypatch):
     """Cancellation after the remux lands, before the replace:
     EngineCancelled('cancelled after remux, before replace'); both files
     stay; the replace helper is never attempted (zero rename calls onto
-    the {stem}.mp4 target)."""
+    the {stem}.mkv target)."""
     src = tmp_path / "movie.avi"
     src.write_bytes(b"source-bytes")
 
@@ -443,11 +446,11 @@ def test_16_cancel_after_remux_never_replaces(tmp_path, monkeypatch):
     real_replace = os.replace
 
     def spy_replace(src_path, dst_path, *a, **kw):
-        # only renames onto a {stem}.mp4 (NOT the .subs.mp4 remux
-        # finalize, NOT the .replace-tmp staging) count as a replace
+        # only renames onto a {stem}.mkv (NOT the .subs.mkv remux
+        # finalize, NOT the .muxing.mkv staging) count as a replace
         name = os.path.basename(os.fspath(dst_path))
-        if name.endswith(".mp4") and not (
-            name.endswith(".subs.mp4") or name.endswith(".muxing.mp4")
+        if name.endswith(".mkv") and not (
+            name.endswith(".subs.mkv") or name.endswith(".muxing.mkv")
         ):
             attempted.append(1)
         return real_replace(src_path, dst_path, *a, **kw)
@@ -459,7 +462,7 @@ def test_16_cancel_after_remux_never_replaces(tmp_path, monkeypatch):
         )
     assert str(excinfo.value) == "cancelled after remux, before replace"
     assert src.is_file()
-    assert (tmp_path / "movie.subs.mp4").is_file()
+    assert (tmp_path / "movie.subs.mkv").is_file()
     assert (tmp_path / "movie.subs.srt").is_file()
     assert attempted == []
 
@@ -472,7 +475,7 @@ def test_17_no_cancel_observer_is_inert_replace_ships(tmp_path):
     src.write_bytes(b"source-bytes")
     runner = FakeRunner(_probe_payload())
     result = _run_job(src, tmp_path, runner, replace_source=True)
-    assert result.output_path == str(tmp_path / "movie.mp4")
+    assert result.output_path == str(tmp_path / "movie.mkv")
     assert not src.exists()
 
 # ----------------------------------------------------------------- fakes
@@ -524,7 +527,7 @@ def test_19_cmd_subs_threads_flag_and_refused_replace_exits_zero(
 
         return SubsJobResult(
             source_path=path,
-            output_path=str(tmp_path / "35 Hours.mp4"),
+            output_path=str(tmp_path / "35 Hours.mkv"),
             srt_path=str(tmp_path / "35 Hours.srt"),
             cue_count=2,
             language="en",
@@ -545,7 +548,7 @@ def test_19_cmd_subs_threads_flag_and_refused_replace_exits_zero(
     assert rc == 0  # a refused replace is still a succeeded job
     assert captured["replace_source"] is True
     out = capsys.readouterr().out
-    assert "35 Hours.mp4" in out  # the renamed location prints
+    assert "35 Hours.mkv" in out  # the renamed location prints
     assert (
         "note: WARNING replace-source failed; keeping both files: boom"
         in out
@@ -643,7 +646,7 @@ def _drive_executor(tmp_path, monkeypatch, options: dict, output_stem: str):
         captured.update(kw)
         return SubsJobResult(
             source_path=job_path,
-            output_path=str(tmp_path / f"{output_stem}.mp4"),
+            output_path=str(tmp_path / f"{output_stem}.mkv"),
             srt_path=str(tmp_path / f"{output_stem}.srt"),
             cue_count=2,
             language="en",
@@ -704,8 +707,8 @@ def test_24_terminal_echo_carries_renamed_path_same_payload_shape(
         "output_path", "srt_path", "language", "cue_count",
         "model", "device", "notes",
     }
-    assert outcome.result["output_path"] == str(tmp_path / "35 Hours.mp4")
-    assert outcome.output_path == str(tmp_path / "35 Hours.mp4")
+    assert outcome.result["output_path"] == str(tmp_path / "35 Hours.mkv")
+    assert outcome.output_path == str(tmp_path / "35 Hours.mkv")
     assert "replace-source: output now at x" in outcome.result["notes"]
 
 

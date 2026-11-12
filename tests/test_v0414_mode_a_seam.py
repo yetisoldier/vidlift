@@ -11,7 +11,7 @@ These tests drive the REAL run.py transcribed branch end to end over a
 real ffmpeg-made fixture; ONLY the whisper engine is mocked (a stub
 factory via run_file's own ``transcribe_engine_factory`` seam) — all of
 run.py's plan resolution, model resolve, GPU-phase lock, audio extract,
-and mov_text mux code EXECUTES.
+and subrip mux code EXECUTES.
 
 The fail-open contract is also pinned here: any TranscriptionError
 inside the branch must NOT fail the run — Mode A degrades to the same
@@ -132,7 +132,7 @@ def test_mode_a_transcribed_branch_runs_end_to_end(tmp_path):
     ``TypeError: transcribe_source_to_srt() got an unexpected keyword
     argument 'engine'`` on EVERY real Mode A run. The real run.py code
     path must complete: model resolved via the factory seam, audio
-    extracted through ffmpeg, SRT written beside the output, mov_text
+    extracted through ffmpeg, SRT written beside the output, subrip
     muxed with the detected language tag, run OK."""
     src = _make_source(tmp_path)
     made = {}
@@ -164,10 +164,10 @@ def test_mode_a_transcribed_branch_runs_end_to_end(tmp_path):
     assert "Hello there." in srt_text
     assert "General Kenobi." in srt_text
     assert "-->" in srt_text
-    # the subtitles phase carried (mov_text into the mp4)
+    # the subtitles phase carried (subrip into the mkv)
     assert state.subtitles["status"] == "carried"
     assert state.subtitles["transcription"]["language"] == "en"
-    assert state.subtitles["embedded"]["codec"] == "mov_text"
+    assert state.subtitles["embedded"]["codec"] == "subrip"
 
 
 def test_mode_a_real_mux_command_uses_detected_language_tag(tmp_path):
@@ -210,7 +210,7 @@ def test_mode_a_real_mux_command_uses_detected_language_tag(tmp_path):
                 return 0, "", ""
             cmd_path = Path(argv[-1]) if argv else None
             if cmd_path is not None and str(cmd_path).endswith(
-                (".prepared.mkv", ".mp4")
+                (".prepared.mkv", ".mkv")
             ):
                 cmd_path.write_bytes(b"x")
                 return 0, "", ""
@@ -232,8 +232,8 @@ def test_mode_a_real_mux_command_uses_detected_language_tag(tmp_path):
         command_runner=Recorder(),
     )
     mux = [argv for _b, argv in commands
-           if "-c:s" in argv and "mov_text" in argv]
-    assert mux, "no mov_text mux command ran in the subtitles phase"
+           if "-c:s" in argv and "subrip" in argv]
+    assert mux, "no subrip mux command ran in the subtitles phase"
     assert "-metadata:s:s:0" in mux[-1]
     tag_idx = mux[-1].index("-metadata:s:s:0")
     assert mux[-1][tag_idx + 1] == "language=eng"

@@ -10,7 +10,7 @@ Bob spec §12 file B. Contracts:
     16 ON + mux failure → SubsJobError, sidecar KEPT (no suppression)
     17 ON + removal OSError → success stands, sidecar present, honest
          srt_path, S-9 in notes
-    18 ON + replace_source → single {stem}.mp4, NO .srt anywhere,
+    18 ON + replace_source → single {stem}.mkv, NO .srt anywhere,
          source deleted, srt_path "", replace narrated (helper's
          sidecar step a demonstrated no-op)
   Group 5 — cleanup_subs_scratch + integration:
@@ -80,7 +80,7 @@ def _job(**overrides):
 
 def _mux_args(runner) -> list:
     return [argv for _b, argv in runner.commands
-            if "-c:s" in argv and "mov_text" in argv]
+            if "-c:s" in argv and "subrip" in argv]
 
 
 # ---------------------------------------------------------------- group 4
@@ -119,7 +119,7 @@ def test_15_suppress_on_removes_sidecar_after_successful_mux(
         suppress_srt=True,
         **_job(),
     )
-    output = tmp_path / "movie.subs.mp4"
+    output = tmp_path / "movie.subs.mkv"
     sidecar = tmp_path / "movie.subs.srt"
     assert output.is_file()  # the deliverable stands
     assert not sidecar.exists()  # the sidecar is GONE
@@ -174,7 +174,7 @@ def test_17_suppress_removal_oserror_keeps_sidecar_and_succeeds(
     )
     # best-effort: the success stands, the sidecar stays, srt_path is
     # the honest truth, and S-9 rides the notes
-    assert (tmp_path / "movie.subs.mp4").is_file()
+    assert (tmp_path / "movie.subs.mkv").is_file()
     assert srt_target.is_file()
     assert result.srt_path == str(srt_target)
     assert any(
@@ -186,7 +186,7 @@ def test_17_suppress_removal_oserror_keeps_sidecar_and_succeeds(
     )
 
 
-def test_18_suppress_plus_replace_single_mp4_no_srt(
+def test_18_suppress_plus_replace_single_mkv_no_srt(
     tmp_path, engine_on
 ):
     runner = FakeRunner(_probe_payload())
@@ -198,8 +198,8 @@ def test_18_suppress_plus_replace_single_mp4_no_srt(
         replace_source=True,
         **_job(),
     )
-    assert result.output_path == str(tmp_path / "movie.mp4")
-    assert (tmp_path / "movie.mp4").is_file()
+    assert result.output_path == str(tmp_path / "movie.mkv")
+    assert (tmp_path / "movie.mkv").is_file()
     assert not (tmp_path / "movie.avi").exists()  # source deleted
     # NO .srt anywhere (suppression ran first; the replace helper's
     # sidecar step found nothing and no-oped)
@@ -221,7 +221,7 @@ def test_19_default_workdir_scratch_removed_after_success(
     {output}.subs-work is created by the core seam and GONE after the
     job, with the S-16 success note in the notes."""
     runner = FakeRunner(_probe_payload())
-    scratch = tmp_path / "movie.subs.mp4.subs-work"
+    scratch = tmp_path / "movie.subs.mkv.subs-work"
     result = run_subs_job(
         _media(tmp_path),
         probe_runner=runner,
@@ -231,7 +231,7 @@ def test_19_default_workdir_scratch_removed_after_success(
     assert not scratch.exists(), "the .subs-work scratch dir must be gone"
     assert any(
         note.startswith("cleanup subs scratch: ")
-        and note.endswith("movie.subs.mp4.subs-work")
+        and note.endswith("movie.subs.mkv.subs-work")
         for note in result.notes
     )
 
@@ -262,7 +262,7 @@ def test_21_failure_and_cancel_retain_scratch(tmp_path, engine_on):
     a mid-transcribe cancel both keep the scratch for diagnosis."""
     # (a) mux failure
     fail_runner = FakeRunner(_probe_payload(), remux_fails=True)
-    scratch = tmp_path / "movie.subs.mp4.subs-work"
+    scratch = tmp_path / "movie.subs.mkv.subs-work"
     with pytest.raises(SubsJobError):
         run_subs_job(
             _media(tmp_path),
@@ -274,7 +274,7 @@ def test_21_failure_and_cancel_retain_scratch(tmp_path, engine_on):
     # (b) cancel mid-transcribe: should_cancel True → the core's
     # per-segment check raises EngineCancelled before the mux.
     runner = FakeRunner(_probe_payload())
-    scratch2 = tmp_path / "movie.subs.mp4.subs-work"
+    scratch2 = tmp_path / "movie.subs.mkv.subs-work"
     with pytest.raises(EngineCancelled):
         run_subs_job(
             str(tmp_path / "movie.avi"),
@@ -290,7 +290,7 @@ def test_22_replace_on_scratch_named_off_pre_rename_output(
     tmp_path, engine_on
 ):
     """D10 by construction: the replace renamed the OUTPUT
-    ({stem}.subs.mp4 → {stem}.mp4) but the scratch was captured
+    ({stem}.subs.mkv → {stem}.mkv) but the scratch was captured
     PRE-rename — it is the {output}.subs-work dir (named off the
     OUTPUT), removed after the replace lands."""
     runner = FakeRunner(_probe_payload())
@@ -301,12 +301,12 @@ def test_22_replace_on_scratch_named_off_pre_rename_output(
         replace_source=True,
         **_job(),
     )
-    assert result.output_path == str(tmp_path / "movie.mp4")
-    assert not (tmp_path / "movie.subs.mp4").exists()
-    assert not (tmp_path / "movie.subs.mp4.subs-work").exists()
+    assert result.output_path == str(tmp_path / "movie.mkv")
+    assert not (tmp_path / "movie.subs.mkv").exists()
+    assert not (tmp_path / "movie.subs.mkv.subs-work").exists()
     # the note names the PRE-rename scratch path (D10 by construction):
     assert any(
-        note == f"cleanup subs scratch: {tmp_path / 'movie.subs.mp4.subs-work'}"
+        note == f"cleanup subs scratch: {tmp_path / 'movie.subs.mkv.subs-work'}"
         for note in result.notes
     )
 
@@ -316,7 +316,7 @@ def test_23_cleanup_rmtree_failure_keeps_success(tmp_path, engine_on,
     """The best-effort guardrail: an rmtree OSError logs the S-16
     warning note and the success stands (the directory leaks — the
     strictly-non-worse pre-0.4.18 state)."""
-    scratch = tmp_path / "movie.subs.mp4.subs-work"
+    scratch = tmp_path / "movie.subs.mkv.subs-work"
     import shutil as shutil_mod
 
     real_rmtree = shutil_mod.rmtree
@@ -336,13 +336,13 @@ def test_23_cleanup_rmtree_failure_keeps_success(tmp_path, engine_on,
         runner=runner,
         **_job(),
     )
-    assert result.output_path == str(tmp_path / "movie.subs.mp4")
+    assert result.output_path == str(tmp_path / "movie.subs.mkv")
     assert scratch.is_dir()  # the leak is visible and named
     assert any(
         note.startswith(
             "WARNING subs scratch cleanup could not remove "
         )
-        and "movie.subs.mp4.subs-work" in note
+        and "movie.subs.mkv.subs-work" in note
         for note in result.notes
     )
 
@@ -360,7 +360,7 @@ def test_24_stale_default_scratch_survives_custom_workdir(
     prior run's retained diagnostic scratch."""
     from vidlift.subs_job import cleanup_subs_scratch
 
-    stale = tmp_path / "movie.subs.mp4.subs-work"
+    stale = tmp_path / "movie.subs.mkv.subs-work"
     stale.mkdir()
     (stale / "prior-run-diagnostics.txt").write_text("retained")
     mine = tmp_path / "mine"
@@ -382,7 +382,7 @@ def test_24_stale_default_scratch_survives_custom_workdir(
     # the helper agrees at the direct-call level: the path guard
     # returns [] (nothing removed) for the custom-workdir pair.
     assert (
-        cleanup_subs_scratch(str(tmp_path / "movie.subs.mp4"), str(mine))
+        cleanup_subs_scratch(str(tmp_path / "movie.subs.mkv"), str(mine))
         == []
     )
     assert stale.is_dir()
@@ -459,7 +459,7 @@ def test_25_tool_transcribe_and_executors_forward_the_flag(
             "R", (),
             {
                 "source_path": path,
-                "output_path": str(src) + ".subs.mp4",
+                "output_path": str(src) + ".subs.mkv",
                 "srt_path": "",
                 "cue_count": 0,
                 "language": "en",
@@ -563,7 +563,7 @@ def test_27_argparse_defaults_flip_and_both_cmds_thread(tmp_path,
             "R", (),
             {
                 "source_path": path,
-                "output_path": path + ".subs.mp4",
+                "output_path": path + ".subs.mkv",
                 "srt_path": "",
                 "cue_count": 0,
                 "language": "en",

@@ -1,4 +1,4 @@
-"""Subtitle extraction, OCR, and MP4 embedding for VidLift (v0.4.1).
+"""Subtitle extraction, OCR, and MKV embedding for VidLift (v0.4.1).
 
 Port of bluray-to-mp4's twice-field-proven subtitle machinery
 (v0.2.27 unattended two-pass seconv+Tesseract OCR, v0.2.29 stale-file
@@ -59,7 +59,7 @@ __all__ = [
     "extract_subtitles",
     "intermediate_ext",
     "mux_language",
-    "mux_srt_into_mp4",
+    "mux_srt_into_video",
     "remove_srt_sidecar",  # v0.4.18 (opt-in sidecar suppression)
     "ocr_selected_track",
     "resolve_tesseract",
@@ -459,7 +459,7 @@ def extract_subtitles(
 
 
 def sidecar_srt_path(output_path: str) -> str:
-    """<output-stem>.srt next to the finished MP4 (the KEEP contract)."""
+    """<output-stem>.srt next to the finished output (the KEEP contract)."""
     return os.path.splitext(output_path)[0] + ".srt"
 
 
@@ -843,13 +843,13 @@ def write_ocr_diagnostic_kit(
     track_path: str | None,
     raw_srt_path: str | None,
 ) -> list[str]:
-    """Retain OCR inputs in <output-stem>.ocr/ next to the MP4.
+    """Retain OCR inputs in <output-stem>.ocr/ next to the output.
 
     Port of b2m's _write_ocr_diagnostic_kit: the extracted track fed to
     OCR and the raw pass-1 output copied as <stem>.raw.srt, enough to
     re-run OCR offline without re-ripping/re-encoding. A subfolder,
-    deliberately: a bare raw .srt next to the MP4 would make every
-    player auto-load the uncorrected pass-1 text over the shipped
+    deliberately: a bare raw .srt next to the output would make
+    every player auto-load the uncorrected pass-1 text over the shipped
     sidecar. Size-capped at 150 MB with an honest skip note; any
     OSError degrades to a note, never an error (fail-open like
     everything here). Written on SUCCESS AND on fail-open (the caller
@@ -902,14 +902,14 @@ def run_subtitle_ocr(
 ) -> "OcrResult":
     """Extract -> OCR -> normalize -> <output-stem>.srt sidecar.
 
-    The disposition contract (design §B.3/B.4): embed mov_text in the
-    MP4 AND keep the editable .srt sidecar; the .ocr/ kit retains the
-    inputs for offline tuning. Fail-open semantics live one level up
-    (run.py catches SubtitleOcrError and fails open); this function
-    raises on hard OCR failure so the kit can still be written by the
-    caller from whatever inputs exist (b2m's rule: a bad-OCR source
-    must be re-tunable without re-work -- the kit writes on fail-open
-    too, subtitles.py:616-630).
+    The disposition contract (design §B.3/B.4): embed subrip in the
+    finished MKV AND keep the editable .srt sidecar; the .ocr/ kit
+    retains the inputs for offline tuning. Fail-open semantics live
+    one level up (run.py catches SubtitleOcrError and fails open); this
+    function raises on hard OCR failure so the kit can still be written
+    by the caller from whatever inputs exist (b2m's rule: a bad-OCR
+    source must be re-tunable without re-work -- the kit writes on
+    fail-open too, subtitles.py:616-630).
     """
     os.makedirs(workdir, exist_ok=True)
     # Extract the selected bitmap stream losslessly from the SOURCE
@@ -1089,7 +1089,7 @@ class OcrResult:
 
 
 def mux_language(lang: str) -> str:
-    """Subtitle language -> MP4 track tag.
+    """Subtitle language -> subtitle track tag.
 
     The v0.2.16-embedded-subs honesty rule is about UNCONFIRMED streams:
     never stamp 'eng' on a stream we could not identify — unknown/empty/
@@ -1102,8 +1102,9 @@ def mux_language(lang: str) -> str:
 
     Table = ISO 639-2/B for the languages the transcription core can
     emit plus the common embedded-sub codes; anything unrecognized is
-    still honestly 'und'. ffmpeg/mp4a round-trip verified for kor/zho/
-    jpn/chi (ffprobe echoes the tag verbatim).
+    still honestly 'und'. ffmpeg round-trip verified for kor/zho/
+    jpn/chi (ffprobe echoes the tag verbatim; identical `-metadata:s:s`
+    tags on Matroska per the v0.4.24 container ADR).
     """
     code = (lang or "").strip().lower()
     if not code:
@@ -1169,7 +1170,7 @@ _PASS_THROUGH_639_2 = {
 }
 
 
-def mux_srt_into_mp4(
+def mux_srt_into_video(
     video_path: str,
     srt_path: str,
     *,
@@ -1177,16 +1178,17 @@ def mux_srt_into_mp4(
     ffmpeg: str,
     runner: Runner,
 ) -> str:
-    """Embed srt_path as a soft mov_text track in video_path.
+    """Embed srt_path as a soft subrip track in the MKV at video_path.
 
     Port of b2m's mux_srt_into_mp4 (v0.2.16-embedded-subs §2): muxes to
     a temp sibling then os.replace()s it over video_path, so a failed
     or interrupted mux can never destroy the finished encode -- on any
     failure the temp is deleted and video_path stays bit-identical.
-    mov_text is the only subtitle codec MP4 supports and the one every
-    player reads from .mp4. Through the runner seam here.
+    SubRip is the container-native text codec (MP4/mov_text left the
+    live path in v0.4.24; ffmpeg 8.0.1-verified, language tag
+    preserved). Through the runner seam here.
     """
-    tmp = video_path + ".muxing.mp4"  # sibling: same fs -> atomic replace
+    tmp = video_path + ".muxing.mkv"  # sibling: same fs -> atomic replace
     if os.path.exists(tmp):
         try:
             os.remove(tmp)  # stale temp from a killed run
@@ -1196,7 +1198,7 @@ def mux_srt_into_mp4(
         ffmpeg, "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
         "-i", video_path, "-i", srt_path,
         "-map", "0", "-map", "1",
-        "-c", "copy", "-c:s", "mov_text",
+        "-c", "copy", "-c:s", "subrip",
         "-metadata:s:s:0", f"language={mux_language(language)}",
         tmp,
     ]
@@ -1217,7 +1219,7 @@ def mux_srt_into_mp4(
         except OSError:
             pass
         raise SubtitleOcrError(
-            f"subtitle muxing could not replace the MP4: {exc}"
+            f"subtitle muxing could not replace the MKV: {exc}"
         ) from exc
     return video_path
 

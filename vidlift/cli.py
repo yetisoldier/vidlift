@@ -102,7 +102,7 @@ def _render_plan(item) -> str:
     lines.append(f"  verdict: {item.process_verdict}")
     lines.append(f"  output: {item.output_path}")
     lines.append(
-        f"  target: {item.output_width}x{item.output_height} HEVC MP4 "
+        f"  target: {item.output_width}x{item.output_height} HEVC MKV "
         f"at {item.target_gb_per_hour:g} GB/hour"
     )
     lines.append(
@@ -113,7 +113,7 @@ def _render_plan(item) -> str:
     lines.append(f"  subtitles: {item.subtitle_note}")
     # v0.4.1 (design §B.7): the plan names the disposition — which
     # track, how carried, OCR engine, and the honest style-loss note
-    # for ASS sources (mov_text carries plain text + timing only).
+    # for ASS sources (subrip carries plain text + timing only).
     sp = item.subtitle_plan
     if sp is not None:
         if sp.source == "embedded":
@@ -122,12 +122,12 @@ def _render_plan(item) -> str:
             target = f"sidecar {os.path.basename(sp.sidecar_path)}"
         if sp.ocr_required:
             engine = "seconv" if os.name == "nt" else "tesseract"
-            lines.append(f"  subtitle plan: {target} -> OCR ({engine}) -> mov_text + sidecar")
+            lines.append(f"  subtitle plan: {target} -> OCR ({engine}) -> subrip + sidecar")
         else:
-            lines.append(f"  subtitle plan: {target} -> mov_text + sidecar")
+            lines.append(f"  subtitle plan: {target} -> subrip + sidecar")
     if item.subtitle_style_loss:
         lines.append(
-            "  warning: ASS/SSA styling does not survive mov_text "
+            "  warning: ASS/SSA styling does not survive subrip "
             "conversion (plain text + timing only)"
         )
     lines.append(f"  expectation: {item.expectation}")
@@ -369,11 +369,11 @@ def _cmd_run(
             # prints the unchanged v0.4.17 line.
             if subs.get("sidecar_suppressed"):
                 print(
-                    "subtitles: carried (mov_text embedded; "
+                    "subtitles: carried (subrip embedded; "
                     ".srt sidecar suppressed)"
                 )
             else:
-                print("subtitles: carried (mov_text embedded + .srt sidecar)")
+                print("subtitles: carried (subrip embedded + .srt sidecar)")
         else:
             print("subtitles: none")
     print(f"log: {state.log.path if state.log else 'none'}")
@@ -551,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vidlift",
         description=(
-            "Batch AI upscaler for SD video files to 720p HEVC MP4"
+            "Batch AI upscaler for SD video files to 720p HEVC MKV"
         ),
     )
     parser.add_argument(
@@ -644,7 +644,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "after a verified upscale, delete the source video and move the "
-            "MP4 into its place (IRREVERSIBLE: the original SD encode is "
+            "output into its place (IRREVERSIBLE: the original SD encode is "
             "destroyed; default: keep both files)"
         ),
     )
@@ -723,7 +723,7 @@ def build_parser() -> argparse.ArgumentParser:
         "subs",
         help=(
             "transcribe a file's own audio and soft-mux subtitles into a NEW "
-            "{stem}.subs.mp4 beside it (Mode B; no upscale, source untouched)"
+            "{stem}.subs.mkv beside it (Mode B; no upscale, source untouched)"
         ),
     )
     subs_parser.add_argument(
@@ -745,14 +745,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # v0.4.17 (opt-in Mode B replace-source): the Mode A --replace-source
     # pattern (cli.py's run-parser wording) with the Mode B naming rule
-    # spelled out — the target is always {stem}.mp4.
+    # spelled out — the target is always {stem}.mkv.
     subs_parser.add_argument(
         "--replace-source",
         action="store_true",
         help=(
             "after a verified subtitles pass, delete the source video and "
-            "rename the output to the source's name with an .mp4 extension "
-            "(e.g. …35 Hours.avi → …35 Hours.mp4); if a file of that name "
+            "rename the output to the source's name with an .mkv extension "
+            "(e.g. …35 Hours.avi → …35 Hours.mkv); if a file of that name "
             "already exists, both files are kept (default: off)"
         ),
     )
@@ -762,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--suppress-srt",
         action="store_true",
         help=(
-            "after the subtitle track is muxed into the MP4, delete the "
+            "after the subtitle track is muxed into the MKV, delete the "
             "redundant .srt sidecar (on a mux failure the sidecar is kept "
             "as the fallback; default: keep the sidecar)"
         ),

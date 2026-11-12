@@ -122,7 +122,7 @@ class FlipRunner:
         if args and str(args[-1]).endswith(".prepared.mkv"):
             Path(args[-1]).write_bytes(b"prepared-stub")
             return 0, "", ""
-        if args and str(args[-1]).endswith(".720p.mp4"):
+        if args and str(args[-1]).endswith(".720p.mkv"):
             if self.encode_writes_output:
                 Path(args[-1]).write_bytes(b"output-stub")
             return self.encode_exit, "", ""
@@ -171,7 +171,7 @@ class TestRunLevelBoundaries:
         post-command boundary closes it cancelled; verify/manifest never
         produce a success manifest."""
         path = make_media_file(tmp_path)
-        runner = FlipRunner(probe_payload(), flip_marker=".720p.mp4")
+        runner = FlipRunner(probe_payload(), flip_marker=".720p.mkv")
         with pytest.raises(EngineCancelled) as excinfo:
             run_file(path, cancel=runner.flag, **run_kwargs(tmp_path, runner))
         state = excinfo.value.state  # type: ignore[attr-defined]
@@ -183,7 +183,7 @@ class TestRunLevelBoundaries:
         # "nothing followed the encode" check is the precise one)
         encode_index = next(
             i for i, name in enumerate(runner.commands)
-            if name.split(" ")[-1].endswith(".720p.mp4")
+            if name.split(" ")[-1].endswith(".720p.mkv")
         )
         assert encode_index == len(runner.commands) - 1
         # the cancel manifest was written (outcome cancelled, not success)
@@ -198,7 +198,7 @@ class TestRunLevelBoundaries:
         cancelled — the old flow surfaced VideoToolError and the job
         closed `failed` (the `/history` mix Eric's monitor showed)."""
         path = make_media_file(tmp_path)
-        runner = FlipRunner(probe_payload(), flip_marker=".720p.mp4")
+        runner = FlipRunner(probe_payload(), flip_marker=".720p.mkv")
         runner.encode_exit = -15  # killed by SIGTERM, wrote nothing
         runner.encode_writes_output = False
         with pytest.raises(EngineCancelled) as excinfo:
@@ -240,7 +240,7 @@ class TestRunLevelBoundaries:
             run_file(path, cancel=runner.flag, **run_kwargs(tmp_path, runner))
         commands = " ".join(runner.commands)
         assert ".prepared.mkv" not in commands
-        assert ".720p.mp4" not in commands
+        assert ".720p.mkv" not in commands
         state = excinfo.value.state  # type: ignore[attr-defined]
         assert state.current_phase == PHASE_PREPARE
 
@@ -260,7 +260,7 @@ class TestRunLevelBoundaries:
             )
         assert engine.runs == 1  # the engine ran; its completed frames are discarded
         commands = " ".join(runner.commands)
-        assert ".720p.mp4" not in commands  # encode never issued
+        assert ".720p.mkv" not in commands  # encode never issued
 
     def test_cancel_flip_in_verify_decode_never_yields_a_success_manifest(
         self, tmp_path
@@ -359,7 +359,7 @@ class BridgeRunner:
     def __call__(self, binary: str, args: list[str]) -> tuple[int, str, str]:
         self.commands.append((binary, tuple(args)))
         name = " ".join(str(part) for part in args)
-        if ".720p.mp4" in str(args[-1] if args else "") and "-i" in args:
+        if ".720p.mkv" in str(args[-1] if args else "") and "-i" in args:
             self.blocked_count += 1
             self._gate.wait(timeout=15)
         if "-show_format" in args:
@@ -379,7 +379,7 @@ class BridgeRunner:
         if args and str(args[-1]).endswith(".slice.prepared.mkv"):
             Path(args[-1]).write_bytes(b"slice-stub")
             return 0, "", ""
-        if args and str(args[-1]).endswith(".720p.mp4"):
+        if args and str(args[-1]).endswith(".720p.mkv"):
             Path(args[-1]).write_bytes(b"output-stub")
             return 0, "", ""
         if args and args[-1] == "-" and "null" in args:
@@ -519,7 +519,7 @@ class TestBridgeCancelJourney:
                     {"streams": [
                         {"codec_type": "video", "width": 1280, "height": 720}]}
                 ), ""
-            if ".720p.mp4" in str(args[-1] if args else ""):
+            if ".720p.mkv" in str(args[-1] if args else ""):
                 seen["encode_cancel"] = cancel
                 Path(args[-1]).write_bytes(b"output-stub")
                 return 0, "", ""

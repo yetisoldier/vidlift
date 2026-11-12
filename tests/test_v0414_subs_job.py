@@ -2,11 +2,11 @@
 
 Red-first contracts at the highest boundaries:
 
-1. Naming/guard (pure): {stem}.subs.mp4 output name; output-exists
+1. Naming/guard (pure): {stem}.subs.mkv output name; output-exists
    never-overwrite; usable-text-track guard; --force override.
 2. Success path (fake engine + fake runner): probe -> transcribe (GPU
-   lock claimed) -> B1 remux command shape (-c copy, mov_text,
-   language tag, faststart, NEW file); source untouched.
+   lock claimed) -> B1 remux command shape (-c copy, subrip,
+   language tag, NEW file — no -movflags); source untouched.
 3. Executor + registry: subs jobs execute through _execute_subs_job
    with the seam runner; transition through the state graph; cancel
    mid-run closes cancelled.
@@ -126,19 +126,19 @@ class FakeRunner:
         self.commands.append((binary, argv))
         joined = " ".join(argv)
         if "-show_format" in argv and "-show_streams" in argv:
-            if argv[-1].endswith((".muxing.mp4", ".subs.mp4")):
+            if argv[-1].endswith((".muxing.mkv", ".subs.mkv")):
                 # The final independent probe describes the remux, not the
                 # source AVI/PGS inventory. Verification itself stays real.
                 output = json.loads(self.payload)
                 output["streams"] = [s for s in output["streams"]
                                      if s["codec_type"] in {"video", "audio"}]
                 output["streams"].append({"index": len(output["streams"]),
-                    "codec_type": "subtitle", "codec_name": "mov_text",
+                    "codec_type": "subtitle", "codec_name": "subrip",
                     "tags": {"language": "eng"}})
-                output["format"]["format_name"] = "mov,mp4,m4a,3gp,3g2,mj2"
+                output["format"]["format_name"] = "matroska,webm"
                 return 0, json.dumps(output), ""
             return 0, self.payload, ""
-        if "-c:s" in argv and "mov_text" in argv:
+        if "-c:s" in argv and "subrip" in argv:
             if self.remux_fails:
                 return 1, "", "mux boom"
             out = argv[-1]
@@ -228,11 +228,11 @@ def no_lock(monkeypatch):
 
 
 # ------------------------------------------------------- 1. naming/guard
-def test_subs_output_name_is_stem_subs_mp4():
+def test_subs_output_name_is_stem_subs_mkv():
     assert subs_output_path("/lib/H/Show.s01e01.mkv") == (
-        "/lib/H/Show.s01e01.subs.mp4"
+        "/lib/H/Show.s01e01.subs.mkv"
     )
-    assert subs_output_path("/x/movie.avi") == "/x/movie.subs.mp4"
+    assert subs_output_path("/x/movie.avi") == "/x/movie.subs.mkv"
 
 
 def test_bitmap_only_subs_do_not_stop_mode_b():
@@ -252,7 +252,7 @@ def test_text_track_is_usable():
 def test_output_exists_fails_job_never_overwrites(tmp_path):
     src = tmp_path / "movie.avi"
     src.write_bytes(b"source-bytes")
-    out = tmp_path / "movie.subs.mp4"
+    out = tmp_path / "movie.subs.mkv"
     out.write_bytes(b"already there")
     with pytest.raises(SubsJobError, match="output already exists"):
         run_subs_job(
@@ -307,7 +307,7 @@ def test_b1_success_remux_shape_and_source_blind(tmp_path, no_lock):
         workdir=str(tmp_path / "wd"),
     )
     assert isinstance(result, SubsJobResult)
-    assert result.output_path == str(tmp_path / "movie.subs.mp4")
+    assert result.output_path == str(tmp_path / "movie.subs.mkv")
     assert Path(result.output_path).read_bytes() == b"muxed-out"
     assert Path(result.srt_path).is_file()
     assert result.cue_count == 2
@@ -318,15 +318,16 @@ def test_b1_success_remux_shape_and_source_blind(tmp_path, no_lock):
     # a fabricated guess.
     assert result.device == ""
 
-    # the remux command: copy codecs, mov_text, tag, faststart, new file
+    # the remux command: copy codecs, subrip, tag, new file — and NO
+    # -movflags token (D7: faststart is MP4-only, ignored by Matroska)
     mux_cmds = [c for c in runner.commands if "-c:s" in c[1]]
     assert len(mux_cmds) == 1
     argv = mux_cmds[0][1]
     assert "-c" in argv and "copy" in argv
-    assert "-c:s" in argv and "mov_text" in argv
+    assert "-c:s" in argv and "subrip" in argv
     assert "-metadata:s:s:0" in argv and "language=eng" in argv
-    assert "-movflags" in argv and "+faststart" in argv
-    assert argv[-1].endswith(".muxing.mp4")  # temp sibling, atomic replace
+    assert "-movflags" not in argv
+    assert argv[-1].endswith(".muxing.mkv")  # temp sibling, atomic replace
 
     # v0.4.15.3 (F-1): the map is exactly the allowlist form — video +
     # audio + the new SRT; the unqualified `-map 0` (which dragged
@@ -380,7 +381,7 @@ def test_bitmap_subs_source_completes_and_allowlist_maps(tmp_path, no_lock):
         workdir=str(tmp_path / "wd"),
     )
     assert isinstance(result, SubsJobResult)
-    assert result.output_path == str(tmp_path / "pgs-movie.subs.mp4")
+    assert result.output_path == str(tmp_path / "pgs-movie.subs.mkv")
     assert Path(result.output_path).read_bytes() == b"muxed-out"
     assert src.read_bytes() == b"source-bytes"  # source-blind
 
@@ -444,7 +445,7 @@ def test_coordination_failure_never_runs_unlocked_cuda(tmp_path, monkeypatch, pi
             run_subs_job(str(src), **kwargs)
         assert not built
         assert not events
-        assert not (tmp_path / "coordination.subs.mp4").exists()
+        assert not (tmp_path / "coordination.subs.mkv").exists()
     assert src.read_bytes() == b"source-bytes"
 
 
@@ -606,7 +607,7 @@ def test_subs_job_executes_through_executor(tmp_path, no_lock, monkeypatch):
     executor._run_job(record)
     final = registry.require(record.job_id)
     assert final.state == "succeeded", final.error
-    assert final.output_path == str(tmp_path / "movie.subs.mp4")
+    assert final.output_path == str(tmp_path / "movie.subs.mkv")
     assert (final.result or {}).get("language") == "en"
 
 
@@ -626,7 +627,7 @@ def test_subs_cancel_closes_cancelled(tmp_path, no_lock, monkeypatch):
             from vidlift.transcribe import TranscriptionError
             raise TranscriptionError("cancelled during transcription")
         return SubsJobResult(
-            source_path=str(src), output_path=str(src) + ".subs.mp4",
+            source_path=str(src), output_path=str(src) + ".subs.mkv",
             srt_path="", cue_count=0, language="en",
             language_confidence=1.0, model="medium",
         )
@@ -652,7 +653,7 @@ def test_cli_subs_dispatch(tmp_path, monkeypatch, capsys):
         "vidlift.subs_job.run_subs_job",
         lambda path, **kw: SubsJobResult(
             source_path=path,
-            output_path=path[:-4] + ".subs.mp4",
+            output_path=path[:-4] + ".subs.mkv",
             srt_path=path[:-4] + ".subs.srt",
             cue_count=2, language="ko", language_confidence=0.93,
             model="medium", notes=[],

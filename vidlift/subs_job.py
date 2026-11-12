@@ -3,15 +3,15 @@
 One pass over an EXISTING file at ANY resolution that lacks a usable
 subtitle track: transcribe the source's own audio (the shared core,
 transcribe_source_to_srt), then soft-mux (v0.4.15.3 allowlist map
-`-map 0:v -map 0:a -map 1`, `-c copy`, mov_text + a language tag)
+`-map 0:v -map 0:a -map 1`, `-c copy`, subrip + a language tag)
 into a NEW file beside the source —
-``{stem}.subs.mp4`` — never touching the source (source-blind
+``{stem}.subs.mkv`` — never touching the source (source-blind
 safety). The KEEP ``{stem}.subs.srt`` sidecar is written next to the
 output by the core itself.
 
 v0.4.17 (opt-in): ``replace_source`` makes the ONE post-success
 exception to source-blindness — after a verified remux, the source is
-deleted and the output lands at ``{stem}.mp4`` (see
+deleted and the output lands at ``{stem}.mkv`` (see
 :func:`replace_subs_output`). The default stays source-blind.
 
 v0.4.18 (opt-in ``suppress_srt``, strictly opt-in default OFF): with
@@ -110,26 +110,34 @@ class SubsJobResult:
 
 
 def subs_output_path(source_path: str) -> str:
-    """The Mode B output name: ``{stem}.subs.mp4`` beside the source —
+    """The Mode B output name: ``{stem}.subs.mkv`` beside the source —
     a distinct infix family, it can never collide with the upscale
-    ``.{target}.mp4`` names. A .mkv source STILL remuxes to .mp4: mp4
-    is where mov_text lives."""
+    ``.{target}.mkv`` names. A .mkv source STILL remuxes to .mkv:
+    MKV is where subrip and bitmap subtitles live."""
     base = os.path.basename(source_path)
     stem = re.sub(r"\.[^.]+$", "", base)
-    return os.path.join(os.path.dirname(source_path), f"{stem}.subs.mp4")
+    return os.path.join(os.path.dirname(source_path), f"{stem}.subs.mkv")
 
 
 def subs_replace_target(source_path: str) -> str:
-    """The v0.4.17 replace-source target name: ``{stem}.mp4`` beside the
-    source — ALWAYS ``.mp4`` regardless of the source container
-    (``.avi``, ``.mkv``, ``.ts``, …): mp4 is where mov_text lives, and
-    the old extension is NEVER carried over (D6). The byte-identical
-    stem-strip regex as :func:`subs_output_path` keeps one naming
-    derivation for display, pre-flight, and the run guard (the
-    v0.4.15.3 F-5 lesson)."""
+    """The v0.4.17 replace-source target name: ``{stem}.mkv`` beside the
+    source — ALWAYS ``.mkv`` regardless of the source container
+    (``.avi``, ``.ts``, …): MKV is where subrip and bitmap subtitles
+    live, and the old extension is NEVER carried over (D6). The
+    byte-identical stem-strip regex as :func:`subs_output_path` keeps
+    one naming derivation for display, pre-flight, and the run guard
+    (the v0.4.15.3 F-5 lesson)."""
     base = os.path.basename(source_path)
     stem = re.sub(r"\.[^.]+$", "", base)
-    return os.path.join(os.path.dirname(source_path), f"{stem}.mp4")
+    return os.path.join(os.path.dirname(source_path), f"{stem}.mkv")
+
+
+def _legacy_subs_output_path(source_path: str) -> str:
+    """Pre-0.4.24 Mode B output name — exists-checks only, never a
+    write target."""
+    base = os.path.basename(source_path)
+    stem = re.sub(r"\.[^.]+$", "", base)
+    return os.path.join(os.path.dirname(source_path), f"{stem}.subs.mp4")
 
 
 _USABLE_KINDS = {"text"}
@@ -171,13 +179,16 @@ def subs_plan_verdict(
 
     Returns one of the ``SUBS_VERDICT_*`` constants:
 
-    - ``blocked-output-exists`` — the ``{stem}.subs.mp4`` already
-      exists; never overwritten. Checked FIRST and probe-free: the
+    - ``blocked-output-exists`` — the ``{stem}.subs.mkv`` (current) or
+      the pre-0.4.24 legacy ``{stem}.subs.mp4`` already exists; never
+      overwritten, either name. Checked FIRST and probe-free: the
       dominant re-add case costs no subprocess, and when both
       conditions hold the would-overwrite reason is the actionable one
       (a deliberate divergence from the run guard's order — spec §1
-      WS2-D3). ``force`` does NOT bypass this (the run-side guard has
-      no force exception either).
+      WS2-D3). The legacy arm (v0.4.24, D8) stops re-adding an older
+      VidLift-serviced folder from silently re-transcribing into the
+      new container. ``force`` does NOT bypass this (the run-side
+      guard has no force exception either).
     - ``skip-subtitles`` — the source already carries a usable TEXT
       subtitle track (:func:`source_has_usable_subtitles`'s exact
       predicate: bitmap tracks and sidecars do NOT count).
@@ -189,7 +200,9 @@ def subs_plan_verdict(
       preflight's "unknown proceeds" discipline).
     - ``ready`` — enqueue.
     """
-    if os.path.exists(subs_output_path(path)):
+    if os.path.exists(subs_output_path(path)) or os.path.exists(
+        _legacy_subs_output_path(path)
+    ):
         return SUBS_VERDICT_BLOCKED_OUTPUT
     if force:
         return SUBS_VERDICT_READY
@@ -244,10 +257,12 @@ def run_subs_job(
 
     Never overwrites the source (unless the opt-in ``replace_source``
     post-success path ships — then, v0.4.17, the source is deleted and
-    the output lands at ``{stem}.mp4``; see :func:`replace_subs_output`):
-    the output is ``{stem}.subs.mp4`` and a pre-existing output FAILS
+    the output lands at ``{stem}.mkv``; see :func:`replace_subs_output`):
+    the output is ``{stem}.subs.mkv`` and a pre-existing output FAILS
     the job (not-ready, the caller decides; run-side guard mirrors the
-    plan-time collision gate).
+    plan-time collision gate). The guard also blocks on the
+    pre-0.4.24 legacy ``{stem}.subs.mp4`` name (v0.4.24, D8) — naming
+    whichever file matched.
 
     v0.4.18 (``suppress_srt``, strictly opt-in — default False keeps the
     v0.4.17 byte behavior): after the mux SUCCEEDS the sidecar is
@@ -284,10 +299,26 @@ def run_subs_job(
         )
 
     output_path = subs_output_path(source_path)
-    if os.path.exists(output_path):
+    legacy_output = _legacy_subs_output_path(source_path)
+    # v0.4.24 (D8): blocks on BOTH output families — the current
+    # ``{stem}.subs.mkv`` and the pre-0.4.24 legacy ``{stem}.subs.mp4``
+    # — naming whichever file matched; neither is ever overwritten.
+    blocked = next(
+        (
+            candidate
+            for candidate in (output_path, legacy_output)
+            if os.path.exists(candidate)
+        ),
+        None,
+    )
+    if blocked is not None:
         raise SubsJobError(
-            f"output already exists (never overwritten): {output_path}"
+            f"output already exists (never overwritten): {blocked}"
         )
+    # Sidecar derivation strips the 4-char output extension: byte-safe
+    # for both the current ``.mkv`` and the legacy ``.mp4`` (both 4
+    # chars, so ``{stem}.subs`` + ".srt" derives identically) — pinned
+    # by T-NEW-6.
     srt_path = os.path.join(
         os.path.dirname(output_path),
         os.path.basename(output_path)[:-4] + ".srt",
@@ -363,7 +394,7 @@ def run_subs_job(
         if lock_acquired:
             gpu_lock.release()
 
-    # ---- remux B1: `-c copy` + mov_text into the NEW file ----------
+    # ---- remux B1: `-c copy` + subrip into the NEW file ----------
     _step("subs-mux")
     mplex(
         source_path,
@@ -451,28 +482,30 @@ def mplex(
     runner,
 ) -> str:
     """B1 remux: `ffmpeg -i source -i subs -map 0:v -map 0:a -map 1
-    -c copy -c:s mov_text -metadata:s:s:0 language=<lang> -movflags
-    +faststart <output>` — temp-sibling + os.replace atomicity (the
-    mux_srt_into_mp4 pattern), but building a NEW file beside the
-    source instead of replacing the finished encode in place.
+    -c copy -c:s subrip -metadata:s:s:0 language=<lang> <output>` —
+    temp-sibling + os.replace atomicity (the mux_srt_into_video
+    pattern), but building a NEW file beside the source instead of
+    replacing the finished encode in place.
 
     The map is an allowlist by contract: the probe→guard gate upstream
     guarantees ≥1 video stream, ≥1 audio stream, and no *text*
     subtitle track (unless `--force`), so `0:a` is non-optional. Bitmap
     subtitles (PGS/VobSub — the files Mode B exists for), attachments,
-    and data streams are deliberately NOT carried: they cannot be
-    transcoded to mov_text and several cannot live in mp4 at all. The
-    output's subtitle track IS the transcription; the untouched source
-    keeps its bitmap tracks.
+    and data streams are deliberately NOT carried here: the untouched
+    source keeps them — bitmap tracks land in the output as OCR'd
+    text only via Mode A; passthrough is Mode A follow-up R-1. The
+    output's subtitle track IS the transcription.
 
-    Residual boundary: a source whose *video* codec has no mp4 tag
-    (e.g. some VPx/theora builds) still fails the remux honestly with
-    :class:`SubsJobError` — unchanged, out of the v0.4.15.3 fix's
-    scope.
+    Matroska truth (v0.4.24, the container ADR): Matroska natively
+    carries every video codec class VidLift ingests (VPx/theora
+    included), so the old mp4-tag failure class no longer exists; the
+    remux fails honestly only on real muxer rejections. `-movflags`
+    left with the MP4 container (D7) — faststart is a no-op on the
+    Matroska muxer.
 
     Source-blind: the job touches nothing else.
     """
-    tmp = output_path + ".muxing.mp4"
+    tmp = output_path + ".muxing.mkv"
     if os.path.exists(tmp):
         try:
             os.remove(tmp)
@@ -489,9 +522,8 @@ def mplex(
         # guarantees a video and an audio stream (see the
         # source_has_usable_subtitles contract).
         "-map", "0:v", "-map", "0:a", "-map", "1",
-        "-c", "copy", "-c:s", "mov_text",
+        "-c", "copy", "-c:s", "subrip",
         "-metadata:s:s:0", f"language={mux_language(language)}",
-        "-movflags", "+faststart",
         tmp,
     ]
     code, _out, err = runner(cmd[0], cmd[1:])
@@ -524,17 +556,17 @@ def replace_subs_output(
     log_line=None,
 ) -> tuple[str, str | None]:
     """Mode B replace (v0.4.17, opt-in): delete the source and land the
-    verified subs output at the source's stem with an .mp4 extension.
+    verified subs output at the source's stem with an .mkv extension.
 
     Discipline (mirrors run.replace_source_with_output's invariants, with
-    rename-to-stem-.mp4 semantics):
-    - rename-before-delete: the output moves onto {stem}.mp4 FIRST
+    rename-to-stem-.mkv semantics):
+    - rename-before-delete: the output moves onto {stem}.mkv FIRST
       (atomic os.replace), the source is deleted SECOND; every failure
       mode keeps BOTH files (spec §2 deviation 1);
-    - collision guard: a pre-existing {stem}.mp4 that is NOT the source
+    - collision guard: a pre-existing {stem}.mkv that is NOT the source
       (normcase/abspath identity) refuses the whole replace — an
       unrelated file is never overwritten;
-    - source-is-.mp4 (target == source path): safe and intended — the
+    - source-is-.mkv (target == source path): safe and intended — the
       single os.replace IS the delete-and-move;
     - cross-device (unreachable by construction — output and target share
       the source's directory — but defended): stage at a temp SIBLING of
@@ -544,7 +576,7 @@ def replace_subs_output(
     - sidecar: {stem}.subs.srt is renamed to {stem}.srt when (and only
       when) no unrelated {stem}.srt exists; on refusal or OSError the
       sidecar keeps its .subs.srt name — best-effort, never blocks the
-      mp4 outcome;
+      mkv outcome;
     - raises SubsJobError on refusal/failure; the job-level caller keeps
       the verified success either way.
 
@@ -692,7 +724,7 @@ def cleanup_subs_scratch(
       (normcase/abspath identity). A caller-supplied ``workdir`` is the
       caller's own directory and is NEVER touched here.
 
-    ``output_path`` is the PRE-replace ``{stem}.subs.mp4`` path — the
+    ``output_path`` is the PRE-replace ``{stem}.subs.mkv`` path — the
     scratch name never follows a replace-source rename. Returns the
     removed paths ([] when nothing was removed).
     """

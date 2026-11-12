@@ -33,7 +33,7 @@ class _StubRunResult:
     def __init__(self) -> None:
         self.state = _StubState()
         self.plan = type(
-            "P", (), {"output_path": "movie.720p.mp4",
+            "P", (), {"output_path": "movie.720p.mkv",
                       "expectation": "bigger"}
         )()
         self.verification = type("V", (), {"ok": True})()

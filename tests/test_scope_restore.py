@@ -162,17 +162,17 @@ def test_blacklist_greps_clean_over_vidlift():
 
 
 def test_version_four_file_agreement():
-    assert vidlift.__version__ == "0.4.23.0"
+    assert vidlift.__version__ == "0.4.24.0"
 
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     match = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"\s*$', pyproject)
     assert match, "pyproject.toml has no [project] version line"
-    assert match.group(1) == "0.4.23.0"
+    assert match.group(1) == "0.4.24.0"
 
-    stamp = "0.4.23.0"
+    stamp = "0.4.24.0"
     info = (REPO_ROOT / "packaging" / "version_info.txt").read_text(encoding="utf-8")
-    assert re.search(r"filevers=\(0, 4, 23, 0\)", info)
-    assert re.search(r"prodvers=\(0, 4, 23, 0\)", info)
+    assert re.search(r"filevers=\(0, 4, 24, 0\)", info)
+    assert re.search(r"prodvers=\(0, 4, 24, 0\)", info)
     assert re.search(r"StringStruct\('FileVersion',\s*u?'" + re.escape(stamp) + r"'\)", info)
     assert re.search(r"StringStruct\('ProductVersion',\s*u?'" + re.escape(stamp) + r"'\)", info)
 

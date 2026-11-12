@@ -498,16 +498,16 @@ def test_v0412_item4_no_completed_phrased_batch_format_string_in_gui_source():
 
 def test_v0412_item3_expected_output_names_carry_target_not_hevc(tmp_path):
     """The plan boundary: outputs are named {stem}.{target}.mp4 — no
-    "hevc" infix (the "Part Two - S01E02.720p.mp4" contract)."""
+    "hevc" infix (the "Part Two - S01E02.720p.mkv" contract)."""
     from vidlift.plan import _expected_output_path
 
     assert (
         _expected_output_path("/media/Movie.avi", None, "720p")
-        == "/media/Movie.720p.mp4"
+        == "/media/Movie.720p.mkv"
     )
     assert (
         _expected_output_path("/media/Movie.avi", "/output", "720p")
-        == "/output/Movie.720p.mp4"
+        == "/output/Movie.720p.mkv"
     )
 
 
@@ -520,7 +520,7 @@ def test_v0412_item3_build_batch_plan_yields_new_name(tmp_path):
     report.path = str(source)
     batch = build_batch_plan([report], target="720p", gb_per_hour=1.5)
     (item,) = batch.files
-    assert item.output_path == str(tmp_path / "movie.720p.mp4")
+    assert item.output_path == str(tmp_path / "movie.720p.mkv")
     assert "hevc" not in item.output_path
 
 
@@ -534,7 +534,7 @@ def test_v0412_item3_plan_time_collision_marks_not_ready_with_warning(
 
     source = tmp_path / "collide.avi"
     source.write_text("")
-    existing_output = tmp_path / "collide.720p.mp4"
+    existing_output = tmp_path / "collide.720p.mkv"
     existing_output.write_bytes(b"previous output")
     report = _report("collide.avi")
     report.path = str(source)
@@ -573,7 +573,7 @@ def test_v0412_item3_gui_plan_shows_collision_warning_in_row(
 
     source = tmp_path / "gui-collide.avi"
     source.write_text("")
-    (tmp_path / "gui-collide.720p.mp4").write_bytes(b"occupied")
+    (tmp_path / "gui-collide.720p.mkv").write_bytes(b"occupied")
     report = _report("gui-collide.avi")
     report.path = str(source)
     from vidlift.plan import build_file_plan
@@ -603,7 +603,7 @@ def test_v0412_item3_gui_plan_shows_collision_warning_in_row(
     win.render_batch(win.batch)
     warnings_cell = win.file_table.item(0, 7)
     assert warnings_cell is not None
-    assert "output exists: gui-collide.720p.mp4" in warnings_cell.text()
+    assert "output exists: gui-collide.720p.mkv" in warnings_cell.text()
     assert "(will not be overwritten)" in warnings_cell.text()
     # the verdict cell is not green (not ready) and Start stays disabled
     assert win.start_button.isEnabled() is False
@@ -653,8 +653,10 @@ def test_v0412_item3_run_time_guard_fails_single_job_not_batch(tmp_path):
 
 
 def test_v0412_item3_no_stale_hevc_name_assertions_remain():
-    """Name-sweep pin (design §4/§5): no `.hevc.mp4` construction or
-    assertion remains in production code or tests; the only allowed
+    """Name-sweep pin (design §4/§5; extended v0.4.24): no `.hevc.mp4`
+    construction or assertion remains in production code or tests; no
+    `.{target}.mp4` output construction remains either (the container
+    ADR — every planned output ends `.mkv`); the only allowed
     occurrence is the intentional historical comment in plan.py and
     this test's own docstring."""
     import vidlift
@@ -681,14 +683,26 @@ def test_v0412_item3_no_stale_hevc_name_assertions_remain():
             for lineno, line in enumerate(
                 py.read_text(encoding="utf-8").splitlines(), 1
             ):
-                if "hevc.mp4" not in line:
-                    continue
                 if "hardcoded literal" in line:
                     continue  # plan.py's intentional historical comment
                 if _in_own_test(py, lineno):
                     continue  # this test's own text
-                hits.append(f"{py.name}:{lineno}: {line.strip()}")
-    assert hits == [], hits
+                if "hevc.mp4" in line:
+                    hits.append(f"{py.name}:{lineno}: {line.strip()}")
+                if ".720p.mp4" in line or ".1080p.mp4" in line:
+                    # v0.4.24: no `.{target}.mp4` output construction
+                    # (or assertion) survives anywhere — inputs that
+                    # merely HAPPEN to be .mp4 are fine and are not
+                    # matched by this token.
+                    hits.append(f"{py.name}:{lineno}: {line.strip()}")
+
+    # and the positive half of the container fact: the planner writes
+    # `.mkv` finals for every target it accepts.
+    from vidlift.plan import _expected_output_path
+
+    for target in ("720p", "1080p"):
+        planned = _expected_output_path("/media/Movie.avi", None, target)
+        assert planned.endswith(f".{target}.mkv"), planned
 
 
 # ---------------------------------------------------------------------------

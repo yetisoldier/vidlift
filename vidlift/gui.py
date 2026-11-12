@@ -156,8 +156,8 @@ def collect_video_files(folder: str | Path, *, cancel: threading.Event | None = 
     documented default). The result is fully sorted — the pre-0.4.18
     ``sorted(iterdir())`` determinism generalized to the tree.
 
-    v0.4.19 (WS2): never yields VidLift's own ``*.subs.mp4`` outputs
-    (any case).
+    v0.4.19 (WS2): never yields VidLift's own ``*.subs.mp4`` /
+    ``*.subs.mkv`` outputs (any case).
     """
     found: list[str] = []
     for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
@@ -169,14 +169,15 @@ def collect_video_files(folder: str | Path, *, cancel: threading.Event | None = 
                 return []
             candidate = Path(dirpath) / name
             if candidate.suffix.lower() in VIDEO_EXTENSIONS:
-                # v0.4.19 (WS2): VidLift's OWN keep-original outputs
-                # (the {stem}.subs.mp4 family) are never re-ingested —
-                # re-adding a finished folder must not re-queue its own
-                # results. Name-based fast path only: the
-                # replace-source-renamed .mp4 form is
+                # v0.4.19 (WS2): VidLift's OWN keep-original outputs are
+                # never re-ingested — re-adding a finished folder must
+                # not re-queue its own results. v0.4.24: BOTH families,
+                # the legacy ``{stem}.subs.mp4`` and the current
+                # ``{stem}.subs.mkv`` (container ADR). Name-based fast
+                # path only: the replace-source-renamed form is
                 # name-indistinguishable and is caught by the WS2
                 # plan-time subtitle probe instead (belt + suspenders).
-                if name.lower().endswith(".subs.mp4"):
+                if name.lower().endswith((".subs.mp4", ".subs.mkv")):
                     continue
                 found.append(str(candidate))
     seen: set[str] = set()
@@ -202,7 +203,11 @@ def _collect_inputs(paths: tuple[str, ...], cancel: threading.Event) -> list[str
             if cancel.is_set():
                 return []
             candidate = Path(path)
-            if candidate.suffix.lower() not in VIDEO_EXTENSIONS or candidate.name.lower().endswith(".subs.mp4"):
+            # v0.4.24: exclude both subs-output families (legacy .subs.mp4
+            # + current .subs.mkv) — mirrors collect_video_files' guard.
+            if candidate.suffix.lower() not in VIDEO_EXTENSIONS or candidate.name.lower().endswith(
+                (".subs.mp4", ".subs.mkv")
+            ):
                 continue
             key = os.path.normcase(os.path.realpath(candidate))
             if key not in seen:
@@ -384,7 +389,7 @@ def detail_text(
         "OUTPUT PREVIEW",
         f"Destination: {item.output_path}",
         f"Target geometry: {item.output_width}x{item.output_height}",
-        f"Video: HEVC MP4, {item.output_width}x{item.output_height}, {item.video_bitrate_kbps}k",
+        f"Video: HEVC MKV, {item.output_width}x{item.output_height}, {item.video_bitrate_kbps}k",
         f"Audio: AAC, {item.audio.bitrate_kbps}k {item.audio.label}",
         f"Subtitles: {subtitle_text}",
         f"Estimated size: {format_bytes(item.estimated_output_bytes)}",
@@ -814,7 +819,7 @@ class MainWindow(QMainWindow):
         )
         self.replace_source.setToolTip(
             "After a verified upscale, delete the source video and move the "
-            "finished 720p MP4 into its original path.\n\n"
+            "finished 720p MKV into its original path.\n\n"
             "Replaces the original file after a successful upscale "
             "(irreversible). If the replace cannot be done, the upscale "
             "output is kept in its planned location and nothing is deleted."
@@ -877,9 +882,9 @@ class MainWindow(QMainWindow):
             self._settings().value("suppress_srt", False, type=bool)
         )
         self.suppress_srt.setToolTip(
-            "After subtitles are safely embedded in the finished MP4, do "
+            "After subtitles are safely embedded in the finished MKV, do "
             "not keep the .srt sidecar beside the output — the toggleable "
-            "track inside the MP4 is the deliverable.\n\n"
+            "track inside the MKV is the deliverable.\n\n"
             "Whenever subtitles fail open (no embed), the sidecar that "
             "was written is kept as the fallback, no matter how this "
             "option is set."
@@ -980,7 +985,7 @@ class MainWindow(QMainWindow):
         self.add_subs_button.setToolTip(
             "Add subtitles by transcribing each file's own audio — without "
             "re-encoding the video.\n\n"
-            "The output lands beside each source as <name>.subs.mp4 plus a "
+            "The output lands beside each source as <name>.subs.mkv plus a "
             ".srt sidecar; the source is kept (a per-run opt-in can replace "
             "it — see the checkbox beside this button). Existing videos at "
             "any resolution are welcome. First use downloads a ~1.5 GB model "
@@ -1045,8 +1050,8 @@ class MainWindow(QMainWindow):
         )
         self.subs_replace_source.setToolTip(
             "After a successful subtitles pass, delete the original file "
-            "and rename the output to the original name with an .mp4 "
-            "extension (e.g. …35 Hours.avi → …35 Hours.mp4).\n\n"
+            "and rename the output to the original name with an .mkv "
+            "extension (e.g. …35 Hours.avi → …35 Hours.mkv).\n\n"
             "The .srt sidecar is renamed to match. If a file of that name "
             "already exists, or the replace cannot be done, both files are "
             "kept and the job still succeeds. Applies to Add Subtitles "
@@ -1072,9 +1077,9 @@ class MainWindow(QMainWindow):
             )
         )
         self.subs_suppress_srt.setToolTip(
-            "After the subtitle track is safely muxed into the MP4, delete "
+            "After the subtitle track is safely muxed into the MKV, delete "
             "the redundant .srt sidecar — the toggleable track inside the "
-            "MP4 is the deliverable.\n\n"
+            "MKV is the deliverable.\n\n"
             "If the mux fails, the .srt is kept as the fallback deliverable "
             "no matter how this option is set. Applies to Add Subtitles "
             "only — the upscale panel has its own sidecar option."
@@ -1394,7 +1399,7 @@ class MainWindow(QMainWindow):
     def _write_staged_row(self, row: int, staged: dict) -> None:
         cells = self._subs_file_rows([staged["path"]], {staged["path"]: staged["verdict"]})[0]
         if staged["verdict"] != SUBS_VERDICT_SKIP_SUBTITLES:
-            cells[3] = "replace original → .mp4" if staged["replace_source"] else "keep original"
+            cells[3] = "replace original → .mkv" if staged["replace_source"] else "keep original"
             cells[6] = "Will transcribe own audio if eligible"
         if staged.get("error"):
             cells[0] = "submission unknown" if staged.get("uncertain") else "not submitted"
@@ -2622,7 +2627,7 @@ class MainWindow(QMainWindow):
             existing = Path(out_path)
             verdict = verdicts.get(path, SUBS_VERDICT_READY)
             action = (
-                "replace original → .mp4"
+                "replace original → .mkv"
                 if self.subs_replace_source.isChecked()
                 else "keep original"
             )
@@ -2992,7 +2997,7 @@ class MainWindow(QMainWindow):
         self.file_table.setRowCount(seed + len(ordered))
         for offset, cells in enumerate(self._subs_file_rows(ordered, verdicts)):
             if replace_source is not None and verdicts[ordered[offset]] != SUBS_VERDICT_SKIP_SUBTITLES:
-                cells[3] = "replace original → .mp4" if replace_source else "keep original"
+                cells[3] = "replace original → .mkv" if replace_source else "keep original"
             for column, text in enumerate(cells):
                 self.file_table.setItem(
                     seed + offset, column, QTableWidgetItem(text)
@@ -3459,20 +3464,21 @@ class MainWindow(QMainWindow):
             if self._row_meta(row).get("kind") == "staged-subtitles":
                 lines.append("Staged only: no transcription job has been submitted.")
         # v0.4.17 workstream-2 (Karen K-2): column 3 of a subs row carries an
-        # ACTION phrase ("replace original → .mp4" / "keep original"), not a
+        # ACTION phrase ("replace original → .mkv" / "keep original"), not a
         # resolution — the "Resolution handling" heading was a v0.4.14
         # upscale-schema holdover and read incoherently under the subs
         # schema. The heading now names the source's fate, rendered in BOTH
         # postures (silence used to imply "kept" — the invisibility class
         # this workstream exists to kill). The literals mirror
-        # _subs_file_rows (:1574-1577) — pinned by test 28 and §8-T8.
-        if target == "replace original → .mp4":
+        # _subs_file_rows (:1574-1577) — pinned by test 28 and §8-T8
+        # (v0.4.24: the literal follows the output's container, .mkv).
+        if target == "replace original → .mkv":
             lines.append(
-                "Source file: replaced on success — output renamed to <name>.mp4"
+                "Source file: replaced on success — output renamed to <name>.mkv"
             )
         elif target == "keep original":
             lines.append(
-                "Source file: kept — output beside it as <name>.subs.mp4"
+                "Source file: kept — output beside it as <name>.subs.mkv"
             )
         elif target:
             lines.append(f"Source file: {target}")

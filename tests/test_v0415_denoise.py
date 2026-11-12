@@ -289,7 +289,7 @@ def test_manifest_records_denoise(tmp_path, monkeypatch):
                 return 0, PROBE_PAYLOAD, ""
             if "-show_streams" in args:
                 last = args[-1] if args else ""
-                if last.endswith(".720p.mp4"):
+                if last.endswith(".720p.mkv"):
                     return 0, json.dumps({"streams": [
                         {"codec_type": "video", "width": 1280,
                          "height": 720}]}) + "\n", ""
@@ -312,7 +312,7 @@ def test_manifest_records_denoise(tmp_path, monkeypatch):
                 return 0, "900\n", ""
             if "-show_entries" in args and "nb_frames" in args:
                 return 0, json.dumps({"streams": [{"nb_frames": "900"}]}), ""
-            if args and args[-1].endswith(".720p.mp4"):
+            if args and args[-1].endswith(".720p.mkv"):
                 Path(args[-1]).write_bytes(b"output")
                 return 0, "", ""
             return 1, "", f"unexpected: {binary} {joined}"

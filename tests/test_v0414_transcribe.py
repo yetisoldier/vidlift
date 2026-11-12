@@ -63,7 +63,7 @@ class TestTranscribedSeamEnabledByDefault:
         assert plan.subtitle_plan.kind == "text"
         assert plan.subtitle_plan.ocr_required is False
         assert plan.subtitle_plan.stream_index == -1
-        assert plan.subtitle_plan.codec_name == "mov_text"
+        assert plan.subtitle_plan.codec_name == "subrip"
         assert plan.transcription == {"model": "medium", "device": "auto", "language": ""}
 
     def test_transcription_disabled_via_config_plans_honest_none(self):

@@ -18,6 +18,13 @@ from vidlift.subtitles import mux_language
 from vidlift.transcribe import TranscriptSegment, WordStamp
 
 
+def _real_ffmpeg_runner(binary: str, args: list[str]):
+    """The real subprocess runner shaped like subs_job._default_runner —
+    the mux seam's injected-runner contract stays honest here."""
+    proc = subprocess.run([binary, *args], capture_output=True, text=True)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 class TestDetectedLanguagesGetRealTags:
     """The M1 fix: ko/zh/ja/en (faster-whisper's 639-1 output) and the
     common remainder map to ISO 639-2; unrecognized stays honestly und."""
@@ -65,43 +72,54 @@ class TestDetectedLanguagesGetRealTags:
 
 
 class TestMuxTagRoundTrip:
-    """The tags must survive a REAL ffmpeg mov_text mux (mp4a language
-    descriptor round-trips through ffprobe verbatim) — pinned once with
-    a real encode, the level the defect actually surfaced."""
+    """The tags must survive a REAL ffmpeg subrip mux into MKV (the
+    language descriptor round-trips through ffprobe verbatim; v0.4.24
+    container ADR — Matroska carries `-metadata:s:s` tags identically) —
+    pinned once with a real mux, the level the defect actually
+    surfaced."""
 
     @pytest.mark.parametrize(
         "code,tag", [("ko", "kor"), ("zh", "zho"), ("ja", "jpn")]
     )
     def test_ko_zh_ja_survive_real_mux(self, tmp_path, code, tag):
-        src = tmp_path / "slice.mp4"
+        src = tmp_path / "slice.mkv"
         srt = tmp_path / "cue.srt"
         srt.write_text(
             "1\r\n00:00:00,000 --> 00:00:00,400\r\nx\r\n", encoding="utf-8"
         )
+        # Real minimal v+a MKV base (lavfi, no external inputs), then
+        # the PRODUCTION mux seam (the §5 pinned shape: temp-sibling +
+        # os.replace, `-c copy -c:s subrip` + language tag) — the mp4/
+        # mov_text round-trip this class used to pin left with the
+        # MP4 container (v0.4.24 ADR).
         subprocess.run(
             [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-f", "lavfi", "-i", "color=black:s=64x64:d=0.5",
                 "-f", "lavfi", "-i", "anullsrc=d=0.5",
-                "-i", str(srt),
-                "-map", "0:v", "-map", "1:a", "-map", "2:s",
                 "-shortest",
                 "-c:v", "libx264", "-preset", "ultrafast",
-                "-c:a", "aac", "-c:s", "mov_text",
-                "-metadata:s:s:0", f"language={mux_language(code)}",
+                "-c:a", "aac",
                 str(src),
             ],
             check=True, capture_output=True, text=True,
         )
+        from vidlift.subtitles import mux_srt_into_video
+
+        mux_srt_into_video(
+            str(src), str(srt), language=code,
+            ffmpeg="ffmpeg", runner=_real_ffmpeg_runner,
+        )
         probe = subprocess.run(
             [
                 "ffprobe", "-v", "error", "-select_streams", "s:0",
-                "-show_entries", "stream_tags=language",
-                "-of", "default=nw=1:nk=1", str(src),
+                "-show_entries", "stream=codec_name:stream_tags=language",
+                "-of", "default=nw=1", str(src),
             ],
             check=True, capture_output=True, text=True,
         )
-        assert probe.stdout.strip() == tag
+        assert "codec_name=subrip" in probe.stdout
+        assert f"language={tag}" in probe.stdout
 
 
 class TestModeACueTimingWordOnsets:

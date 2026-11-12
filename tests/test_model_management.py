@@ -949,7 +949,7 @@ def test_h1_h3_mode_b_download_beats_then_pop(
         kwargs["on_step"]("transcribe-resolve")
         kwargs["on_step"]("transcribe-language")
         return SimpleNamespace(
-            output_path=str(tmp_path / "out.subs.mp4"),
+            output_path=str(tmp_path / "out.subs.mkv"),
             srt_path=str(tmp_path / "out.srt"),
             language="en",
             cue_count=2,
@@ -1008,7 +1008,7 @@ def test_h1b_publisher_heartbeat_keeps_record_activity_young(
             "a silent download never leaves the heartbeat stale"
         )
         return SimpleNamespace(
-            output_path=str(tmp_path / "o.subs.mp4"),
+            output_path=str(tmp_path / "o.subs.mkv"),
             srt_path=str(tmp_path / "o.srt"),
             language="en",
             cue_count=1,

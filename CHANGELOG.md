@@ -2,6 +2,41 @@
 
 All notable changes to VidLift. Dates are America/Chicago.
 
+## [0.4.24.0] - 2026-11-11
+
+### Changed
+- **Output container is MKV (Matroska):** every VidLift-produced final
+  output is now Matroska — upscaled Mode A outputs are
+  `{stem}.{target}.mkv` (e.g. `Movie.720p.mkv`), Add-Subtitles outputs
+  are `{stem}.subs.mkv`, and the Mode B "replace original" target is
+  `{stem}.mkv`. No toggle, no sidecar MP4. (Apple-ecosystem players
+  that cannot read MKV are out of scope — the destination libraries
+  direct-play MKV/HEVC.)
+- **Embedded subtitles are SubRip:** text subtitles embed as `subrip`
+  in the MKV at all three mux points (encode-time carry, post-verify
+  embeds, and the Mode B remux), and the verify decode-check asserts
+  `subrip`. Manifest `subtitles.embedded.codec` now reads `"subrip"`.
+- **Legacy outputs are guarded, never overwritten:** re-running Add
+  Subtitles on a folder that already holds a pre-0.4.24
+  `{stem}.subs.mp4` now blocks with the same "output already exists
+  (never overwritten)" guard as the current `{stem}.subs.mkv` name,
+  and neither family is re-ingested by folder-add. `--force`
+  bypasses the subtitle check only, not the never-overwrite guard.
+
+### Removed
+- The MP4-era `-movflags +faststart` token left both ffmpeg command
+  builders with the MP4 container (it was silently ignored by the
+  Matroska muxer).
+
+### Migration
+- Legacy `{stem}.subs.mp4` files block Mode B re-runs on their folder
+  until moved/deleted (deliberate: prevents silent duplicate
+  re-transcription post-upgrade).
+- Old `{stem}.{target}.mp4` upscale outputs are never overwritten:
+  re-running a file after the upgrade writes a new `{stem}.720p.mkv`
+  beside the legacy name. Old replace-source runs keep shipping the
+  output to the source's exact path.
+
 ## [0.4.23.0] - 2026-11-09
 
 ### Fixed

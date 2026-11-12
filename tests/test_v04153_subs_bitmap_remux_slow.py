@@ -1,18 +1,20 @@
-"""F-1 integration gate (v0.4.15.3) — real ffmpeg through ``mplex`` on
-the designed Mode B source class: a bitmap-subs (PGS) mkv.
+"""F-1 integration gate (v0.4.15.3; re-pinned v0.4.24) — real ffmpeg
+through ``mplex`` on the designed Mode B source class: a bitmap-subs
+(PGS) mkv.
 
 Bob's v0.4.15.3 F-1 spec asked for a real-ffmpeg pin that the guard-
 admitted source completes the remux and the output's only subtitle
-stream is mov_text. Fixture note (the spec's documented "iterate the
-fixture command" clause): the sketched fixture (`-c:s dvdsub` from an
-SRT) fails ffmpeg's categorical text→bitmap guard ("Subtitle encoding
-currently only possible from text to text or bitmap to bitmap") —
-ffmpeg cannot SYNTHESIZE a bitmap subtitle track from text by design.
-The fixture that works: a hand-crafted MINIMAL valid PGS display set
-(raw HDMV ``.sup`` segments: PDS/ODS/PCS/WDS/END) muxed with
-``-c:s copy`` — producing the exact designed source class
-(``hdmv_pgs_subtitle``) with zero network, zero real model, and zero
-decoding of the bitmap track (the allowlist never maps it).
+stream is the transcription (mov_text in the MP4 era; subrip since the
+v0.4.24 Matroska container). Fixture note (the spec's documented
+"iterate the fixture command" clause): the sketched fixture (`-c:s
+dvdsub` from an SRT) fails ffmpeg's categorical text→bitmap guard
+("Subtitle encoding currently only possible from text to text or
+bitmap to bitmap") — ffmpeg cannot SYNTHESIZE a bitmap subtitle track
+from text by design. The fixture that works: a hand-crafted MINIMAL
+valid PGS display set (raw HDMV ``.sup`` segments: PDS/ODS/PCS/WDS/
+END) muxed with ``-c:s copy`` — producing the exact designed source
+class (``hdmv_pgs_subtitle``) with zero network, zero real model, and
+zero decoding of the bitmap track (the allowlist never maps it).
 
 Skips when the host has no ffmpeg/ffprobe; the argv pins in
 tests/test_v0414_subs_job.py are the always-on gate.
@@ -122,11 +124,12 @@ def _real_runner(binary: str, args: list[str]) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def test_real_bitmap_subs_mkv_remuxes_with_only_mov_text(tmp_path):
+def test_real_bitmap_subs_mkv_remuxes_with_only_subrip(tmp_path):
     """The designed F-1 evidence class: the probe admits the file (no
     usable text subs), the real ffmpeg remux COMPLETES, and the output
-    carries exactly one subtitle stream — mov_text (the transcription).
-    The pre-fix blanket `-map 0` failed every such source at the mux."""
+    carries exactly one subtitle stream — subrip in the Matroska
+    container (v0.4.24; the transcription). The pre-fix blanket
+    `-map 0` failed every such source at the mux."""
     # -- fixture: v + a + bitmap-subs mkv (PGS via hand-crafted .sup) --
     src = tmp_path / "pgs-source.mkv"
     sup = tmp_path / "sub.sup"
@@ -154,7 +157,7 @@ def test_real_bitmap_subs_mkv_remuxes_with_only_mov_text(tmp_path):
     assert "h264" in src_streams and "aac" in src_streams
 
     # -- the real mplex (allowlist map; temp-sibling + os.replace) --
-    output = tmp_path / "pgs-source.subs.mp4"
+    output = tmp_path / "pgs-source.subs.mkv"
     out = mplex(
         str(src),
         str(srt),
@@ -167,11 +170,11 @@ def test_real_bitmap_subs_mkv_remuxes_with_only_mov_text(tmp_path):
     assert output.is_file() and output.stat().st_size > 0
     assert src.is_file(), "source-blind: the bitmap track stays in the source"
 
-    # exactly ONE subtitle stream in the output, and it is mov_text.
+    # exactly ONE subtitle stream in the output, and it is subrip.
     out_streams = _probe_streams(output)
     sub_lines = [line for line in out_streams if line.endswith(",subtitle")]
     assert len(sub_lines) == 1, "\n".join(out_streams)
-    assert sub_lines[0].endswith(",mov_text,subtitle"), "\n".join(out_streams)
+    assert sub_lines[0].endswith(",subrip,subtitle"), "\n".join(out_streams)
 
 
 def test_real_pgs_source_classifies_as_bitmap_not_usable(tmp_path):

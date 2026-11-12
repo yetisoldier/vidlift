@@ -17,7 +17,7 @@ exist):
    ``cancelled`` (never failed) via the claim-time CancelFlag; Cancel
    Batch marks the queued remainder (the registry's state machine is
    job-kind-blind).
-5. Collision gate: a picked file whose {stem}.subs.mp4 output already
+5. Collision gate: a picked file whose {stem}{stem}.subs.mkv output already
    exists shows the blocked/warning row BEFORE submission — never
    overwritten, never silently dropped (the job-level guard stays the
    run-side gate; this is the visible pre-flight).
@@ -512,7 +512,7 @@ def test_subs_collision_blocked_row_never_overwrites(
     qapp, monkeypatch, tmp_path
 ):
     """§4 constraint (re-aimed v0.4.19 WS2): a picked file whose
-    {stem}.subs.mp4 already exists renders the blocked + visible-warning
+    {stem}.subs.mkv already exists renders the blocked + visible-warning
     row — and under v0.4.19 WS2 the blocked file is NEVER ENQUEUED (the
     plan-time verdict keeps red failures out of the batch). The run-side
     gate remains the backstop for direct enqueues; the old output bytes
@@ -522,7 +522,7 @@ def test_subs_collision_blocked_row_never_overwrites(
     good.write_bytes(b"x")
     blocked = tmp_path / "done-ep.mkv"
     blocked.write_bytes(b"source-bytes")
-    existing_out = tmp_path / "done-ep.subs.mp4"
+    existing_out = tmp_path / "done-ep.subs.mkv"
     existing_out.write_bytes(b"already-there")
 
     client = _ScriptedClient()
@@ -571,7 +571,7 @@ def test_subs_rows_output_cell_uses_subs_output_path_for_every_extension(
 ):
     """F-5 (v0.4.15.3): every row's Output cell is exactly
     subs_output_path(p) — the one regex-based derivation. The .ts case
-    must produce movie.subs.mp4, NOT the old slice's 'movi.subs.mp4',
+    must produce movie.subs.mkv, NOT the old slice's 'movi.subs.mp4',
     and no row may carry a doubled dot. (v0.4.19 WS2: the rows render
     from an explicit verdict map — all-ready here.)"""
     from vidlift.subs_job import SUBS_VERDICT_READY, subs_output_path
@@ -590,10 +590,10 @@ def test_subs_rows_output_cell_uses_subs_output_path_for_every_extension(
     for row, path in zip(rows, paths):
         assert row[4] == subs_output_path(path), path
         assert ".." not in row[4]
-    assert rows[0][4] == "/m/movie.subs.mp4"  # not 'movi.subs.mp4'
-    assert rows[1][4] == "/m/movie.subs.mp4"  # '.divx' fully stripped
-    assert rows[2][4] == "/m/movie.subs.mp4"  # '.mpeg' fully stripped
-    assert rows[3][4] == "/m/movie.subs.mp4"
+    assert rows[0][4] == "/m/movie.subs.mkv"  # not 'movi.subs.mp4'
+    assert rows[1][4] == "/m/movie.subs.mkv"  # '.divx' fully stripped
+    assert rows[2][4] == "/m/movie.subs.mkv"  # '.mpeg' fully stripped
+    assert rows[3][4] == "/m/movie.subs.mkv"
     next(gen, None)
 
 
@@ -609,7 +609,7 @@ def test_subs_rows_collision_preflight_fires_for_non_4char_extensions(
 
     source = tmp_path / "done-ep.ts"
     source.write_bytes(b"source-bytes")
-    existing = tmp_path / "done-ep.subs.mp4"
+    existing = tmp_path / "done-ep.subs.mkv"
     existing.write_bytes(b"already-there")
 
     gen = _window(qapp, monkeypatch, tmp_path, _ScriptedClient())
@@ -620,7 +620,7 @@ def test_subs_rows_collision_preflight_fires_for_non_4char_extensions(
     assert rows[0][0] == (
         "blocked — subtitles output already exists (will not be overwritten)"
     )
-    assert "output exists: done-ep.subs.mp4" in rows[0][7]
+    assert "output exists: done-ep.subs.mkv" in rows[0][7]
     assert "will not be overwritten" in rows[0][7]
     # the untouched prior output
     assert existing.read_bytes() == b"already-there"
@@ -970,7 +970,7 @@ def test_subs_replace_checkbox_exists_beside_button_default_off_tooltip(
 ):
     """v0.4.17 item 25 (workstream-2 re-placed): the checkbox lives in
     the Mode B group's own grid at (0, 1) — immediately right of
-    'Add Subtitles…' at (0, 0) — default OFF, with the .mp4 naming
+    'Add Subtitles…' at (0, 0) — default OFF, with the .mkv naming
     rule (D6), the keep-both promise, and the scope disambiguation in
     its tooltip. Workstream-2 (Karen K-1) shortened the label and
     moved the pair out of the shared upscale grid into the Mode B
@@ -1004,8 +1004,8 @@ def test_subs_replace_checkbox_exists_beside_button_default_off_tooltip(
         "Replace original on success (deletes source)"
     )
     tooltip = win.subs_replace_source.toolTip().lower()
-    assert "35 hours.avi" in tooltip and "35 hours.mp4" in tooltip
-    assert ".mp4" in tooltip
+    assert "35 hours.avi" in tooltip and "35 hours.mkv" in tooltip
+    assert ".mkv" in tooltip
     assert "both files are kept" in tooltip  # the D2/D5 keep-both promise
     assert "sidecar" in tooltip  # the D1 rename-to-match note
     # the button tooltip no longer claims an absolute "never modified"
@@ -1137,7 +1137,7 @@ def test_subs_pick_flow_threads_checkbox_state_into_enqueue(
 def test_subs_file_rows_column3_tracks_submitted_state(
     qapp, monkeypatch, tmp_path
 ):
-    """v0.4.17 item 28: column 3 reads 'replace original → .mp4' when
+    """v0.4.17 item 28: column 3 reads 'replace original → .mkv' when
     ON and 'keep original' when OFF (the row is rendered at enqueue
     time from the exact state being enqueued). (v0.4.19 WS2: rows
     render from an explicit verdict map — all-ready here.)"""
@@ -1153,7 +1153,7 @@ def test_subs_file_rows_column3_tracks_submitted_state(
     assert off_rows[0][3] == "keep original"
     win.subs_replace_source.setChecked(True)
     on_rows = win._subs_file_rows([str(media)], ready)
-    assert on_rows[0][3] == "replace original → .mp4"
+    assert on_rows[0][3] == "replace original → .mkv"
     next(gen, None)
 
 

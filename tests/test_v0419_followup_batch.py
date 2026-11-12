@@ -102,7 +102,7 @@ def _core(tmp_path, *, flag_box: "dict | None" = None, steps: list | None = None
 
     kwargs = dict(
         source_path=str(tmp_path / "movie.avi"),
-        output_path=str(tmp_path / "movie.subs.mp4"),
+        output_path=str(tmp_path / "movie.subs.mkv"),
         workdir=str(tmp_path / "work"),
         ffmpeg="ffmpeg",
         runner=FakeRunner(_probe_payload()),
@@ -408,7 +408,7 @@ def test_t7_absent_should_cancel_golden_path_unchanged(tmp_path, engine_on):
 
     result = transcribe_source_to_srt(**_core(tmp_path))
     assert result.cue_count == 2
-    srt = Path(str(tmp_path / "movie.subs.mp4")).with_name("movie.subs.srt")
+    srt = Path(str(tmp_path / "movie.subs.mkv")).with_name("movie.subs.srt")
     assert srt.is_file(), f"no KEEP sidecar at {srt}"
     assert "Hello there." in srt.read_text(encoding="utf-8-sig")
 
@@ -471,7 +471,7 @@ class _ModeARunner:
         if argv and argv[-1].endswith(".slice.prepared.mkv"):
             Path(argv[-1]).write_bytes(b"slice-stub")
             return 0, "", ""
-        if argv and argv[-1].endswith(".720p.mp4"):
+        if argv and argv[-1].endswith(".720p.mkv"):
             Path(argv[-1]).write_bytes(b"output-stub")
             return 0, "", ""
         if argv and argv[-1] == "-" and "null" in argv:
@@ -1035,7 +1035,7 @@ def test_t11_subs_plan_verdict_matrix(tmp_path):
 
     # (a) output-exists -> blocked, probe-free
     src = _source(tmp_path)
-    Path(str(tmp_path / "movie.subs.mp4")).write_bytes(b"already-there")
+    Path(str(tmp_path / "movie.subs.mkv")).write_bytes(b"already-there")
     counter = _CountingProbeRunner(_probe_payload())
     assert subs_plan_verdict(src, probe_runner=counter) == (
         SUBS_VERDICT_BLOCKED_OUTPUT
@@ -1091,10 +1091,11 @@ def test_t11_subs_plan_verdict_matrix(tmp_path):
 
 
 def test_t12_collector_never_reingests_subs_outputs(tmp_path):
-    """The collector exclusion (T12): VidLift's own *.subs.mp4 family is
-    never re-ingested — case-insensitive, both modes; a *.subs.mkv is
-    NOT a VidLift output (outputs are always .mp4) and stays
-    collectible."""
+    """The collector exclusion (T12; v0.4.24 dual-family): VidLift's own
+    subs-output outputs are never re-ingested — case-insensitive, and
+    now BOTH families: the pre-0.4.24 legacy ``*.subs.mp4`` AND the
+    current ``*.subs.mkv`` (container ADR). A plain ``.mp4`` source is
+    NOT a VidLift output and stays collectible."""
     from vidlift.gui import collect_video_files
 
     root = tmp_path / "tree"
@@ -1105,7 +1106,6 @@ def test_t12_collector_never_reingests_subs_outputs(tmp_path):
     (root / "nested" / "deep" / "x.subs.mkv").write_bytes(b"x")
     collected = collect_video_files(root)
     assert collected == [
-        str(root / "nested" / "deep" / "x.subs.mkv"),
         str(root / "nested" / "plain.mp4"),
     ]
 
@@ -1287,7 +1287,7 @@ def test_t16_cli_subs_skip_blocked_exit_zero_and_force_spy(
     skip_file.write_bytes(b"x")
     blocked_file = tmp_path / "cli-blocked.avi"
     blocked_file.write_bytes(b"x")
-    blocked_file.with_name("cli-blocked.subs.mp4").write_bytes(b"out")
+    blocked_file.with_name("cli-blocked.subs.mkv").write_bytes(b"out")
 
     verdicts_map = {
         str(skip_file): "skip-subtitles",
@@ -1306,7 +1306,7 @@ def test_t16_cli_subs_skip_blocked_exit_zero_and_force_spy(
     assert rc == 0  # an all-done batch is NOT a failure (WS2-D9)
     assert "  skip — already has subtitles" in out
     assert "  blocked — output already exists (never overwritten): " in out
-    assert "cli-blocked.subs.mp4" in out
+    assert "cli-blocked.subs.mkv" in out
 
     # a real failure (the run guard raised at run time) still exits 1
     real_file = tmp_path / "cli-real.avi"
@@ -1369,7 +1369,7 @@ def test_t17_mcp_transcribe_additive_skipped_rows(tmp_path, monkeypatch):
     # existing output, no force: the blocked reason
     (tmp_path / "mcp-blocked.avi").write_bytes(b"x")
     src_b = str(tmp_path / "mcp-blocked.avi")
-    (tmp_path / "mcp-blocked.subs.mp4").write_bytes(b"out")
+    (tmp_path / "mcp-blocked.subs.mkv").write_bytes(b"out")
     result = tool_transcribe(services, {"paths": [src_b]})
     assert result["jobs"][0].get("reason") == (
         "output already exists (never overwritten)"
@@ -1405,7 +1405,7 @@ def test_t18_run_side_backstop_unchanged(tmp_path, engine_on):
         f"transcribe anyway): {src}"
     )
 
-    out = Path(str(tmp_path / "backstop.subs.mp4"))
+    out = Path(str(tmp_path / "backstop.subs.mkv"))
     out.write_bytes(b"already-there")
     plain_runner = FakeRunner(_probe_payload())
     with pytest.raises(SubsJobError) as excinfo2:

@@ -189,7 +189,7 @@ def test_mode_a_zero_cue_fails_open_with_status_note(tmp_path, monkeypatch):
     out = Path(state.output_path)
     assert out.is_file()                       # the upscale shipped
     assert not out.with_suffix(".srt").exists()  # no empty sidecar lie
-    # and no mov_text mux ran (there was nothing to mux)
+    # and no subrip mux ran (there was nothing to mux)
     manifest = json.loads(Path(result.manifest_path).read_text())
 
 
@@ -219,7 +219,7 @@ class _SubsRunner(_OkRunner):
         if "pcm_s16le" in joined:
             Path(argv[-1]).write_bytes(b"wav")
             return 0, "", ""
-        if "-c:s" in argv and "mov_text" in argv:
+        if "-c:s" in argv and "subrip" in argv:
             Path(argv[-1]).write_bytes(b"muxed-out")
             return 0, "", ""
         return 0, "", ""
@@ -288,5 +288,5 @@ def test_mode_b_zero_cue_job_fails_named(tmp_path, monkeypatch):
     # the user sees WHY (named), not a raw ffmpeg parse error
     assert "no speech detected in audio" in final.error
     # nothing was muxed or left behind
-    assert not (tmp_path / "movie.subs.mp4").exists()
+    assert not (tmp_path / "movie.subs.mkv").exists()
     assert not (tmp_path / "movie.subs.srt").exists()

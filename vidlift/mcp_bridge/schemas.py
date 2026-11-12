@@ -137,7 +137,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "force": {"type": "boolean"},
             # v0.4.17 (opt-in Mode B replace-source): absent -> False (the
             # absent-defaults rule); when True, a verified success deletes
-            # the source and renames the output to {stem}.mp4 (never the
+            # the source and renames the output to {stem}.mkv (never the
             # old extension) with a keep-both guard on collision.
             "replace_source": {"type": "boolean"},
             # v0.4.18 (opt-in sidecar suppression, D6): absent -> False
@@ -197,10 +197,10 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "transcribe": (
         "Standalone subtitles (v0.4.14 Mode B): transcribe the file's own "
         "audio (faster-whisper, medium by default; first use downloads the "
-        "model) and soft-mux mov_text subtitles into a NEW {stem}.subs.mp4 "
+        "model) and soft-mux subrip subtitles into a NEW {stem}.subs.mkv "
         "beside the source — never overwriting it (unless the optional "
         "`replace_source` flag is set — then on success the source is "
-        "deleted and the output takes the source's name with an .mp4 "
+        "deleted and the output takes the source's name with an .mkv "
         "extension, with a keep-both guard on collision). "
         "With the optional suppress_srt flag the redundant .srt sidecar is "
         "removed after a successful mux (a mux failure keeps it as the "

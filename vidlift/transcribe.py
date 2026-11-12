@@ -27,7 +27,7 @@ under Modes A (upscale fallback) and B (standalone subs). faster-whisper
   the feature is rejected structurally, not by flag.
 
 The KEEP contract: ``transcribe_sidecar_srt_path`` writes
-``{output-stem}.srt`` next to the finished file in BOTH modes, exactly
+``{output-stem}.srt`` next to the finished output in BOTH modes, exactly
 like ``subtitles.sidecar_srt_path``.
 
 CPU fallback: ``device="cpu"`` with int8 compute (config pin
@@ -2325,7 +2325,7 @@ def build_audio_extract_command(
     THE SYNC ANCHOR (design §Music/current seams): the encode maps
     ``1:a:0`` from the ORIGINAL input with no tempo filter anywhere;
     transcribing this same stream yields SRT timestamps valid on the
-    finished MP4 with ZERO offset math (PAL sped-up audio included —
+    finished output with ZERO offset math (PAL sped-up audio included —
     its timestamps are the sped timeline the viewer hears).
     """
     return [

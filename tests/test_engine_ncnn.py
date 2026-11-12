@@ -2200,7 +2200,7 @@ def test_long_steps_emit_steps_and_heartbeat(tmp_path, monkeypatch):
             if args and str(args[-1]).endswith(".prepared.mkv"):
                 Path(args[-1]).write_bytes(b"prepared-stub")
                 return 0, "", ""
-            if args and str(args[-1]).endswith(".720p.mp4"):
+            if args and str(args[-1]).endswith(".720p.mkv"):
                 Path(args[-1]).write_bytes(b"output-stub")
                 return 0, "", ""
             return 1, "", f"unexpected: {binary} {' '.join(args)}"

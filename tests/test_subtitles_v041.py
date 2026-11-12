@@ -283,11 +283,11 @@ class TestS4SelectedTrackMap:
             ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"), plan, "/fake/mezz.mkv"
         )
 
-    def test_selected_index_map_and_mov_text(self):
+    def test_selected_index_map_and_subrip(self):
         report = _report(subs=[{"codec_name": "srt", "tags": {"language": "eng"}}])
         cmd = self._encode_cmd(report)
         assert "-map" in cmd and "1:2" in cmd
-        assert "mov_text" in cmd
+        assert "subrip" in cmd
         assert "language=eng" in cmd
         assert "1:s?" not in cmd  # the all-or-nothing map is gone
 
@@ -300,7 +300,7 @@ class TestS4SelectedTrackMap:
             ]
         )
         cmd = self._encode_cmd(report)
-        assert "mov_text" in cmd
+        assert "subrip" in cmd
         assert "1:3" in cmd  # the text stream, by index
         # the bitmap stream is NOT mapped in the encode
         assert "1:2" not in cmd
@@ -308,7 +308,7 @@ class TestS4SelectedTrackMap:
     def test_bitmap_only_no_sub_map_in_encode(self):
         report = _report(subs=[{"codec_name": "dvd_subtitle"}])
         cmd = self._encode_cmd(report)
-        assert "mov_text" not in cmd
+        assert "subrip" not in cmd
         assert "1:2" not in cmd
 
     def test_mixed_file_end_to_end_carries_text(self, tmp_path):
@@ -329,7 +329,7 @@ class TestS4SelectedTrackMap:
         )
         assert result.ok
         enc = find_command(result.state.commands, "libx265")
-        assert "mov_text" in enc
+        assert "subrip" in enc
         assert "1:3" in enc
         assert result.state.subtitles["status"] == "carried"
 
@@ -347,7 +347,7 @@ class TestS5StyleLossAndLanguage:
         from vidlift.cli import _render_plan
 
         text = _render_plan(plan)
-        assert "ASS/SSA styling does not survive mov_text" in text
+        assert "ASS/SSA styling does not survive subrip" in text
 
     def test_srt_no_style_loss(self):
         report = _report(subs=[{"codec_name": "srt", "tags": {"language": "eng"}}])
@@ -806,48 +806,54 @@ class TestS11DiagnosisKit:
 
 
 class TestS12Mux:
-    def _mp4(self, tmp_path):
-        mp4 = tmp_path / "movie.mp4"
-        mp4.write_bytes(b"THE-FINISHED-ENCODE")
-        return mp4
+    def _mkv(self, tmp_path):
+        mkv = tmp_path / "movie.mkv"
+        mkv.write_bytes(b"THE-FINISHED-ENCODE")
+        return mkv
 
     def test_temp_then_replace_on_success(self, tmp_path):
-        mp4 = self._mp4(tmp_path)
+        mkv = self._mkv(tmp_path)
         srt = tmp_path / "movie.srt"
         write_srt_file(str(srt), [Cue(0, 1000, "Hi")])
 
         def runner(binary, args):
             tmp_out = Path(args[-1])
-            assert tmp_out.name == "movie.mp4.muxing.mp4"  # sibling temp
+            assert tmp_out.name == "movie.mkv.muxing.mkv"  # sibling temp
             tmp_out.write_bytes(b"MUXED")
             return 0, "", ""
 
-        S.mux_srt_into_mp4(
-            str(mp4), str(srt), language="eng",
+        S.mux_srt_into_video(
+            str(mkv), str(srt), language="eng",
             ffmpeg="ffmpeg", runner=runner,
         )
-        assert mp4.read_bytes() == b"MUXED"
-        assert not (tmp_path / "movie.mp4.muxing.mp4").exists()
+        assert mkv.read_bytes() == b"MUXED"
+        assert not (tmp_path / "movie.mkv.muxing.mkv").exists()
 
-    def test_failure_leaves_mp4_bit_identical(self, tmp_path):
-        mp4 = self._mp4(tmp_path)
-        before = mp4.read_bytes()
+    def test_failure_leaves_mkv_bit_identical(self, tmp_path):
+        mkv = self._mkv(tmp_path)
+        before = mkv.read_bytes()
         srt = tmp_path / "movie.srt"
         write_srt_file(str(srt), [Cue(0, 1000, "Hi")])
 
         def runner(binary, args):
-            return 1, "", "Could not find tag for codec mov_text"
+            # container-real ffmpeg mux failure string (the MP4-era
+            # "Could not find tag for codec mov_text" can no longer
+            # happen: subrip muxes into Matroska natively)
+            return 1, "", (
+                "Could not write header for 'movie.mkv.muxing.mkv': "
+                "Codec not currently supported in container"
+            )
 
         with pytest.raises(S.SubtitleOcrError, match="muxing failed"):
-            S.mux_srt_into_mp4(
-                str(mp4), str(srt), language="eng",
+            S.mux_srt_into_video(
+                str(mkv), str(srt), language="eng",
                 ffmpeg="ffmpeg", runner=runner,
             )
-        assert mp4.read_bytes() == before  # bit-identical
-        assert not (tmp_path / "movie.mp4.muxing.mp4").exists()
+        assert mkv.read_bytes() == before  # bit-identical
+        assert not (tmp_path / "movie.mkv.muxing.mkv").exists()
 
     def test_language_tagged_in_argv(self, tmp_path):
-        mp4 = self._mp4(tmp_path)
+        mkv = self._mkv(tmp_path)
         srt = tmp_path / "movie.srt"
         write_srt_file(str(srt), [Cue(0, 1000, "Hi")])
         argv_seen: list[str] = []
@@ -857,8 +863,8 @@ class TestS12Mux:
             Path(args[-1]).write_bytes(b"ok")
             return 0, "", ""
 
-        S.mux_srt_into_mp4(
-            str(mp4), str(srt), language="ger",
+        S.mux_srt_into_video(
+            str(mkv), str(srt), language="ger",
             ffmpeg="ffmpeg", runner=runner,
         )
         assert "-metadata:s:s:0" in argv_seen
@@ -1180,7 +1186,7 @@ class TestS15VerifyAssertion:
         out.write_bytes(b"output-stub")
         streams = [
             {"codec_type": "video", "width": 1280, "height": 720},
-            {"codec_type": "subtitle", "codec_name": "mov_text"},
+            {"codec_type": "subtitle", "codec_name": "subrip"},
         ]
         result = verify_output(
             ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
@@ -1196,7 +1202,7 @@ class TestS15VerifyAssertion:
         plan = self._plan_with_sub(tmp_path)
         streams = [
             {"codec_type": "video", "width": 1280, "height": 720},
-            {"codec_type": "subtitle", "codec_name": "mov_text"},
+            {"codec_type": "subtitle", "codec_name": "subrip"},
         ]
         result = verify_output(
             ToolBox(ffmpeg="ffmpeg", ffprobe="ffprobe"),
@@ -1267,7 +1273,7 @@ class TestS17ManifestBlock:
         assert block["selected"]["source"] == "embedded"
         assert block["selected"]["kind"] == "text"
         assert block["sidecar_path"].endswith(".srt")
-        assert block["embedded"] == {"codec": "mov_text", "language_tag": "eng"}
+        assert block["embedded"] == {"codec": "subrip", "language_tag": "eng"}
         # plan echo also lands in manifest["plan"]
         assert manifest["plan"]["subtitle_plan"]["stream_index"] == 2
         assert manifest["plan"]["subtitle_style_loss"] is False

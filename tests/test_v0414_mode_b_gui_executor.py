@@ -12,7 +12,7 @@ REAL registry + JobExecutor:
 2. Cancel through the REAL consume path: a cancel flag flip lands
    cancelled (never failed) while the job blocks mid-transcribe —
    the v0.4.13 machinery, kind-blind.
-3. Collision gate: an existing {stem}.subs.mp4 output fails the job
+3. Collision gate: an existing {stem}.subs.mkv output fails the job
    with the never-overwrite error (the run-side guard; the GUI row
    warning is the pre-flight surface, tested on the GUI side).
 """
@@ -84,7 +84,7 @@ def _fake_subs_result(path, **kwargs):
 
     return SubsJobResult(
         source_path=str(path),
-        output_path=str(path)[:-4] + ".subs.mp4",
+        output_path=str(path)[:-4] + ".subs.mkv",
         srt_path=str(path)[:-4] + ".subs.srt",
         cue_count=2,
         language="en",
@@ -243,7 +243,7 @@ def test_executor_cancel_mid_subs_lands_cancelled(
 def test_subs_collision_gate_fails_job_never_overwrites(
     tmp_path, monkeypatch, no_lock
 ):
-    """§4: a picked file whose {stem}.subs.mp4 exists fails the job with
+    """§4: a picked file whose {stem}.subs.mkv exists fails the job with
     the never-overwrite error; sources and prior outputs untouched."""
     import json as _json
 
@@ -268,7 +268,7 @@ def test_subs_collision_gate_fails_job_never_overwrites(
 
     src = tmp_path / "collision.avi"
     src.write_bytes(b"source-bytes")
-    out = tmp_path / "collision.subs.mp4"
+    out = tmp_path / "collision.subs.mkv"
     out.write_bytes(b"already-there")
 
     registry = _reg(tmp_path)

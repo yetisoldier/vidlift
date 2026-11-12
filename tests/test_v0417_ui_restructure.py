@@ -79,10 +79,10 @@ EXPLAINER_TEXT = (
     "are copied (no upscale, no re-encode)."
 )
 SOURCE_FILE_REPLACED = (
-    "Source file: replaced on success — output renamed to <name>.mp4"
+    "Source file: replaced on success — output renamed to <name>.mkv"
 )
-SOURCE_FILE_KEPT = "Source file: kept — output beside it as <name>.subs.mp4"
-COLUMN3_REPLACE = "replace original → .mp4"
+SOURCE_FILE_KEPT = "Source file: kept — output beside it as <name>.subs.mkv"
+COLUMN3_REPLACE = "replace original → .mkv"
 COLUMN3_KEEP = "keep original"
 
 ALL_MODE_A_CONTROLS = (

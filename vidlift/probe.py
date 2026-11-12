@@ -68,8 +68,10 @@ MPEG4_ASP_CODECS = {"mpeg4", "xvid", "divx", "div3", "div4", "div5", "dx50"}
 # MPEG-1/2 video: proper DVD rips and captures.
 MPEG12_CODECS = {"mpeg1video", "mpeg2video", "mpeg1", "mpeg2"}
 
-# Subtitle typing: text subs can pass through to MP4 (mov_text);
-# image subs are detected and reported as "not carried" in v0.2.
+# Subtitle typing: text subs (this vocabulary classifies SOURCE files;
+# mov_text sources are legit and keep mov_text here) carry into MKV
+# (subrip); image subs are detected and reported as "not carried" in
+# v0.2.
 TEXT_SUBTITLE_CODECS = {
     "subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text",
 }

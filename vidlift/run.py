@@ -56,7 +56,7 @@ from .subtitles import (
     SubtitleOcrError,
     SubtitlePlan,
     mux_language,
-    mux_srt_into_mp4,
+    mux_srt_into_video,
     # v0.4.18 (opt-in suppress_srt): the best-effort post-embed removal
     # helper (subtitles.py's own primitive; no circularity — this module
     # already imports subtitles.py at module level).
@@ -132,7 +132,7 @@ PHASE_UPSCALE = "upscale"
 PHASE_ENCODE = "encode"
 PHASE_VERIFY = "verify"
 # v0.4.1 (design §B.4): the subtitles phase between verify and done.
-# OCR operates on the SOURCE file but muxes into the FINISHED MP4, so
+# OCR operates on the SOURCE file but muxes into the FINISHED MKV, so
 # it must run after encode; after verify keeps verify's scope purely
 # A/V structural (§B.5 adds the cheap subtitle assertion there
 # instead of reordering). Optional by presence: no selected track ->
@@ -585,7 +585,7 @@ class VerificationResult:
 
     v0.4.1 additive (design §B.5): ``subtitle_ok``/``subtitle_detail``
     carry the cheap subtitle assertion — when the plan selected a
-    track the output must contain a mov_text stream; when none was
+    track the output must contain a subrip stream; when none was
     selected it asserts none. A mismatch is REPORTED, never a
     verification hard-fail: subtitle loss must not fail an
     otherwise-good 5-hour upscale (fail-open asymmetry, Eric-approved:
@@ -721,7 +721,7 @@ def build_prepare_command(
 def build_encode_command(
     tools: ToolBox, plan: PlannedFile, mezzanine_path: str
 ) -> list[str]:
-    """ffmpeg command encoding the mezzanine to the planned MP4.
+    """ffmpeg command encoding the mezzanine to the planned MKV.
 
     The encode planner is media-agnostic (docs/design.md): HEVC at the
     planned geometry and bitrate (the final lanczos downscale to the
@@ -730,14 +730,15 @@ def build_encode_command(
     subtitles come from the ORIGINAL file -- the mezzanine is
     video-only by contract.
 
-    Subtitle carry rule (v0.4.1, design §B.3): the PLANNED text track
-    maps by explicit stream index (``-map 1:<idx> -c:s mov_text``),
-    replacing v0.4.0's all-or-nothing gate -- a mixed text+bitmap
-    file now ships its text track instead of silently dropping
-    everything. Bitmap tracks are skipped here (mov_text cannot hold
-    them); the selected bitmap track rides the OCR stage and muxes
-    after verify. A sidecar-selected text plan also skips this map
-    (there is nothing embedded to map) and muxes post-encode.
+    Subtitle carry rule (v0.4.1, design §B.3; container per the
+    v0.4.24 ADR): the PLANNED text track maps by explicit stream index
+    (``-map 1:<idx> -c:s subrip``), replacing v0.4.0's all-or-nothing
+    gate -- a mixed text+bitmap file now ships its text track instead
+    of silently dropping everything. Bitmap tracks are skipped here;
+    the selected bitmap track rides the OCR stage and muxes post-verify
+    (bitmap passthrough is follow-up R-1). A sidecar-selected text
+    plan also skips this map (there is nothing embedded to map) and
+    muxes post-encode.
     """
     report = plan.report
     sub_plan = plan.subtitle_plan
@@ -774,11 +775,13 @@ def build_encode_command(
         cmd += ["-c:a", "aac", "-b:a", f"{plan.audio.bitrate_kbps}k"]
     if embed_text_in_encode:
         cmd += [
-            "-c:s", "mov_text",
+            "-c:s", "subrip",
             "-metadata:s:s:0",
             f"language={mux_language(sub_plan.lang)}",
         ]
-    cmd += ["-map_chapters", "-1", "-movflags", "+faststart", "-y", plan.output_path]
+    # v0.4.24 (D7): no `-movflags +faststart` — MP4-specific and
+    # silently ignored by the Matroska muxer (ffmpeg 8.0.1-verified).
+    cmd += ["-map_chapters", "-1", "-y", plan.output_path]
     return cmd
 
 
@@ -878,10 +881,12 @@ def verify_output(
     result.ok = True
     # v0.4.1 (design §B.5): the cheap subtitle assertion — REPORTED,
     # never gating. When the plan selected a track the output must
-    # hold a mov_text stream; when none was selected a stray map must
+    # hold a subrip stream; when none was selected a stray map must
     # not have smuggled one in. A mismatch lands as a run warning via
     # subtitle_detail; verification's ok is untouched (the fail-open
     # asymmetry: A/V integrity gates, subtitle presence reports).
+    # v0.4.24: the scan token moved to `subrip` with the MKV container
+    # (any other subtitle codec in the output is now the anomaly).
     sub_plan = getattr(plan, "subtitle_plan", None)
     expected_sub = bool(
         sub_plan is not None
@@ -889,22 +894,28 @@ def verify_output(
         and sub_plan.kind == "text"
     )
     result.subtitle_expected = expected_sub
-    mov_text = [
-        s
-        for s in streams
-        if s.get("codec_type") == "subtitle"
-        and s.get("codec_name") == "mov_text"
+    # v0.4.24 (D4): the scan collects every subtitle stream ffprobe
+    # reports; the EXPECTED arm requires a subrip one (the token the
+    # encode now writes), and the UNEXPECTED arm names whatever was
+    # found (a stray mov_text, a future bitmap passthrough …) — the
+    # message must not guess the codec set.
+    sub_streams = [
+        s for s in streams if s.get("codec_type") == "subtitle"
     ]
-    if expected_sub and not mov_text:
+    has_subrip = any(s.get("codec_name") == "subrip" for s in sub_streams)
+    if expected_sub and not has_subrip:
         result.subtitle_ok = False
         result.subtitle_detail = (
             "planned subtitle track missing from the encode output "
-            "(no mov_text stream); reported, not gated"
+            "(no subrip stream); reported, not gated"
         )
-    elif not expected_sub and mov_text:
+    elif not expected_sub and sub_streams:
+        codecs = ", ".join(
+            sorted({s.get("codec_name") or "unknown" for s in sub_streams})
+        )
         result.subtitle_ok = False
         result.subtitle_detail = (
-            f"unexpected mov_text stream(s) in the output ({len(mov_text)}); "
+            f"unexpected subtitle stream(s) in the output ({codecs}); "
             "reported, not gated"
         )
     else:
@@ -1978,7 +1989,7 @@ def run_file(
     the redundant .srt sidecar is removed (transcribed/adopted/OCR
     branches) or the post-encode extract is skipped entirely
     (embedded-text branch: the track already rode the encode as
-    mov_text, so there is no mux to gate on and nothing to remove). A
+    subrip, so there is no mux to gate on and nothing to remove). A
     fail-open or mux failure ALWAYS keeps the sidecar as the fallback
     deliverable, no matter how this flag is set (the v0.4.1 fail-open
     contract is untouched); the manifest's subtitles block then carries
@@ -2813,7 +2824,7 @@ def run_file(
                         if lock_acquired:
                             gpu_lock.release()
                     record_step("subtitle-mux")
-                    mux_srt_into_mp4(
+                    mux_srt_into_video(
                         plan.output_path,
                         transcribed.srt_path,
                         language=transcribed.language,
@@ -2836,7 +2847,7 @@ def run_file(
                     else:
                         subtitles_block["sidecar_path"] = transcribed.srt_path
                     subtitles_block["embedded"] = {
-                        "codec": "mov_text",
+                        "codec": "subrip",
                         "language_tag": mux_language(transcribed.language),
                     }
                     subtitles_block["transcription"] = {
@@ -2857,7 +2868,7 @@ def run_file(
                         log(f"subtitles: {note}")
                 elif sub_plan.kind == "text" and sub_plan.source == "embedded":
                     # v0.4.18 (opt-in suppress_srt): the text track rode
-                    # the ENCODE into the MP4 as mov_text — the extract
+                    # the ENCODE into the MKV as subrip — the extract
                     # step (the KEEP convenience) has no mux to gate on
                     # and no failure surface to fall back from, so
                     # suppression simply never runs it.
@@ -2865,7 +2876,7 @@ def run_file(
                         subtitles_block["status"] = "carried"
                         subtitles_block["sidecar_suppressed"] = True
                         subtitles_block["embedded"] = {
-                            "codec": "mov_text",
+                            "codec": "subrip",
                             "language_tag": mux_language(sub_plan.lang),
                         }
                         log(
@@ -2874,7 +2885,7 @@ def run_file(
                         )
                     else:
                         # Embedded text was carried IN the encode
-                        # (mov_text, selected-index map). Extract the
+                        # (subrip, selected-index map). Extract the
                         # same stream as an .srt sidecar post-encode (the
                         # KEEP disposition, §B.3): ffmpeg transcodes the
                         # stream to SRT.
@@ -2892,7 +2903,7 @@ def run_file(
                             subtitles_block["status"] = "carried"
                             subtitles_block["sidecar_path"] = sidecar_target
                             subtitles_block["embedded"] = {
-                                "codec": "mov_text",
+                                "codec": "subrip",
                                 "language_tag": mux_language(sub_plan.lang),
                             }
                         else:
@@ -2901,11 +2912,11 @@ def run_file(
                             )
                 elif sub_plan.kind == "text" and sub_plan.source == "sidecar":
                     # Adopted .srt sidecar (§B.3): copy to the output
-                    # sidecar, mux mov_text into the finished MP4 with
+                    # sidecar, mux subrip into the finished MKV with
                     # the temp-then-replace atomicity.
                     shutil.copyfile(sub_plan.sidecar_path, sidecar_target)
                     record_step("subtitle-mux")
-                    mux_srt_into_mp4(
+                    mux_srt_into_video(
                         plan.output_path,
                         sidecar_target,
                         language=sub_plan.lang,
@@ -2928,7 +2939,7 @@ def run_file(
                     else:
                         subtitles_block["sidecar_path"] = sidecar_target
                     subtitles_block["embedded"] = {
-                        "codec": "mov_text",
+                        "codec": "subrip",
                         "language_tag": mux_language(sub_plan.lang),
                     }
                 else:
@@ -2979,7 +2990,7 @@ def run_file(
                         "notes": list(ocr_result.notes),
                     }
                     record_step("subtitle-mux")
-                    mux_srt_into_mp4(
+                    mux_srt_into_video(
                         plan.output_path,
                         ocr_result.srt_path,
                         language=sub_plan.lang,
@@ -2987,7 +2998,7 @@ def run_file(
                         runner=run_cmd,
                     )
                     subtitles_block["embedded"] = {
-                        "codec": "mov_text",
+                        "codec": "subrip",
                         "language_tag": mux_language(sub_plan.lang),
                     }
                     # v0.4.18 (opt-in suppress_srt): the OCR sidecar sits

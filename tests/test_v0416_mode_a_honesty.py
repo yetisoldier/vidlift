@@ -109,12 +109,12 @@ class Runner:
         if args and str(args[-1]).endswith(".prepared.mkv"):
             Path(args[-1]).write_bytes(b"prepared-stub")
             return 0, "", ""
-        if args and str(args[-1]).endswith(".muxing.mp4"):
+        if args and str(args[-1]).endswith(".muxing.mkv"):
             # the subtitles mux's own temp-then-replace staging
-            # (mux_srt_into_mp4): the "carried" disposition lands here
+            # (mux_srt_into_video): the "carried" disposition lands here
             Path(args[-1]).write_bytes(b"muxed-stub")
             return 0, "", ""
-        if args and str(args[-1]).endswith(".720p.mp4"):
+        if args and str(args[-1]).endswith(".720p.mkv"):
             Path(args[-1]).write_bytes(b"output-stub")
             return 0, "", ""
         if args and args[-1] == "-" and "null" in args:
@@ -259,7 +259,7 @@ def test_run_executor_wires_the_record_into_the_state_box(
         )
         return SimpleNamespace(
             ok=True,
-            plan=SimpleNamespace(output_path="/m/movie.720p.mp4"),
+            plan=SimpleNamespace(output_path="/m/movie.720p.mkv"),
             manifest_path=None,
             state=SimpleNamespace(
                 log=None,

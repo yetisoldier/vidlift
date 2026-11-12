@@ -81,7 +81,7 @@ class PlannedFile:
     # stays for back-compat.
     subtitle_plan: SubtitlePlan | None = None
     # v0.4.1 additive (design §B.3): True when the selected embedded
-    # text track is ASS/SSA — styling does not survive mov_text
+    # text track is ASS/SSA — styling does not survive subrip
     # conversion; stated, never hidden.
     subtitle_style_loss: bool = False
     # v0.4.14 additive (design §Mode A): the Mode A transcription
@@ -154,15 +154,17 @@ def _expected_output_path(
     input_path: str, output_dir: str | None, target: str
 ) -> str:
     # v0.4.12 (item 3): the output name carries the REAL target, not a
-    # hardcoded literal: `Movie.720p.hevc.mp4` → `Movie.720p.mp4`. The
+    # hardcoded literal: `Movie.720p.hevc.mkv` → `Movie.720p.mkv`. The
     # ".hevc" infix made collisions with user files nearly impossible;
-    # the plain `.{target}.mp4` name does not, so the collision life of
+    # the plain `.{target}.mkv` name does not, so the collision life of
     # this name is handled at plan time (the not-ready pre-flight in
     # build_batch_plan) and at run time (the encode-must-not-overwrite
     # guard in run.py).
+    # v0.4.24: the final output container is .mkv (Matroska):
+    # .specs/bob-vidlift-v0.4.24-mkv-container-spec.md ADR.
     source = Path(input_path)
     directory = Path(output_dir) if output_dir else source.parent
-    return str(directory / f"{source.stem}.{target}.mp4")
+    return str(directory / f"{source.stem}.{target}.mkv")
 
 
 def _expectation(report: FileReport) -> str:
@@ -275,7 +277,7 @@ def select_subtitle_track(
             stream_index=-1,
             sidecar_path="",
             kind="text",
-            codec_name="mov_text",
+            codec_name="subrip",
             lang=transcription_language or "",
             ocr_required=False,
         )
@@ -326,30 +328,30 @@ def _subtitle_note(
     if selected.kind == "text" and selected.source == "embedded":
         parts.append(
             f"text track {selected.stream_index} ({selected.codec_name}) "
-            "carried as mov_text + sidecar"
+            "carried as subrip + sidecar"
         )
     elif selected.kind == "text" and selected.source == "sidecar":
         parts.append(
             f"sidecar {os.path.basename(selected.sidecar_path)} adopted "
-            "as the text track (muxed mov_text + copied sidecar)"
+            "as the text track (muxed subrip + copied sidecar)"
         )
     elif selected.kind == "text" and selected.source == "transcribed":
         pin = f" [{selected.lang}]" if selected.lang else ""
         parts.append(
             "no subtitle track; transcribing source audio -> "
-            f"mov_text + sidecar{pin}"
+            f"subrip + sidecar{pin}"
         )
     elif selected.kind == "image" and selected.source == "embedded":
         engine = "seconv" if os.name == "nt" else "tesseract"
         parts.append(
             f"bitmap track {selected.stream_index} ({selected.codec_name}) "
-            f"-> OCR ({engine}) -> mov_text + sidecar"
+            f"-> OCR ({engine}) -> subrip + sidecar"
         )
     elif selected.kind == "image" and selected.source == "sidecar":
         engine = "seconv" if os.name == "nt" else "tesseract"
         parts.append(
             f"sidecar {os.path.basename(selected.sidecar_path)} adopted as "
-            f"OCR candidate -> OCR ({engine}) -> mov_text + sidecar"
+            f"OCR candidate -> OCR ({engine}) -> subrip + sidecar"
         )
     # A sidecar that was NOT adopted (embedded truth wins) is still
     # named — the disk file never surprises anyone (§B.1).
