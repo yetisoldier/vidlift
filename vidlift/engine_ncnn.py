@@ -1340,7 +1340,7 @@ class NcnnVulkanEngine(EngineAdapter):
             # provenance that derived the stamp), max(2.0 s, 0.1%).
             # The old gate M reference (prepared format duration)
             # cannot see a consistently lying clock family; the audio
-            # that reaches the MP4 is the axis viewers experience.
+            # that reaches the output is the axis viewers experience.
             self._step("gate-clock-probe")
             mezzanine_duration = probe_duration_seconds(
                 str(output), ffprobe=tools.ffprobe, runner=runner

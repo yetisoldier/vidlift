@@ -497,7 +497,7 @@ def test_v0412_item4_no_completed_phrased_batch_format_string_in_gui_source():
 
 
 def test_v0412_item3_expected_output_names_carry_target_not_hevc(tmp_path):
-    """The plan boundary: outputs are named {stem}.{target}.mp4 — no
+    """The plan boundary: outputs are named {stem}.{target}.mkv — no
     "hevc" infix (the "Part Two - S01E02.720p.mkv" contract)."""
     from vidlift.plan import _expected_output_path
 

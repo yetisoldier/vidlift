@@ -1,7 +1,7 @@
 [project]
 name = "vidlift"
 version = "0.4.24.0"
-description = "Batch AI upscaler for SD video files (AVI/XviD/DivX, MP4, MOV, MKV, WMV, FLV, MPEG) to 720p HEVC MP4"
+description = "Batch AI upscaler for SD video files (AVI/XviD/DivX, MP4, MOV, MKV, WMV, FLV, MPEG) to 720p HEVC MKV"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["PyQt6>=6.7", "faster-whisper>=1.2", "av<15"]

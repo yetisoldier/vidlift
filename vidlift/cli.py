@@ -407,6 +407,7 @@ def _cmd_subs(
         SUBS_VERDICT_BLOCKED_OUTPUT,
         SUBS_VERDICT_SKIP_SUBTITLES,
         SubsJobError,
+        _legacy_subs_output_path,
         run_subs_job,
         subs_output_path,
         subs_plan_verdict,
@@ -430,9 +431,23 @@ def _cmd_subs(
             print("  skip — already has subtitles")
             continue
         if verdict == SUBS_VERDICT_BLOCKED_OUTPUT:
+            # v0.4.24 (D8/F-1): name whichever output family actually
+            # blocked — the current .subs.mkv or the pre-0.4.24 legacy
+            # .subs.mp4 — mirroring run_subs_job's resolution.
+            blocked = next(
+                (
+                    candidate
+                    for candidate in (
+                        subs_output_path(path),
+                        _legacy_subs_output_path(path),
+                    )
+                    if os.path.exists(candidate)
+                ),
+                subs_output_path(path),
+            )
             print(
                 "  blocked — output already exists (never overwritten): "
-                f"{subs_output_path(path)}"
+                f"{blocked}"
             )
             continue
         try:
