@@ -6,7 +6,7 @@
 - batch pre-flight planner in the CLI and desktop app
 - real Real-ESRGAN ncnn/Vulkan upscale engine
 - decode-truth frame clock and frame-exact chunking
-- 720p HEVC MP4 encode and full output verification
+- 720p HEVC MKV encode and full output verification
 - text-subtitle pass-through and bitmap subtitle OCR
 - logs, manifests, heartbeat activity, cancellation, and resumable chunks
 - benchmark-based ETA support

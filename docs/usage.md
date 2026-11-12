@@ -63,13 +63,13 @@ does not change the 720p output geometry.
 
 ### Choose an output folder
 
-Select **Output Folder** if every planned MP4 should go to one destination.
+Select **Output Folder** if every planned MKV should go to one destination.
 Leave it empty to place each output beside its source.
 
 ### Run the pre-flight plan
 Choose whether **Enable subtitle OCR** should remain on, then select **Plan Batch**.
 
-If you are using the **Add subtitles (no upscale)** mode, you can also choose whether to **Replace original on success**. When enabled, VidLift deletes the source file and renames the output to the source's name with an `.mp4` extension after a successful pass.
+If you are using the **Add subtitles (no upscale)** mode, you can also choose whether to **Replace original on success**. When enabled, VidLift deletes the source file and renames the output to the source's name with an `.mkv` extension after a successful pass.
 
 ![VidLift planned batch](images/vidlift-planned-batch.png)
 
@@ -117,7 +117,7 @@ Use quotes around paths containing spaces.
 ### Useful run options
 
 - **--gbph 1.5** sets the approximate output size per hour.
-- **--output-dir PATH** writes the final MP4 to a chosen folder.
+- **--output-dir PATH** writes the final MKV to a chosen folder.
 - **--log-dir PATH** puts logs and manifests in a chosen folder.
 - **--engine ncnn** requires the real AI engine and reports a clear error if it
   cannot start.
@@ -173,7 +173,7 @@ Each job passes through these phases:
 2. **Plan:** choose output geometry, bitrate, subtitle disposition, and warnings.
 3. **Prepare:** deinterlace, inverse-telecine, or normalize the source as needed.
 4. **Upscale:** process source frames through Real-ESRGAN ncnn/Vulkan.
-5. **Encode:** write a 720p HEVC MP4 with audio.
+5. **Encode:** write a 720p HEVC MKV with audio.
 6. **Verify:** inspect the container, geometry, duration, and full decode.
 7. **Subtitles:** pass text subtitles through or attempt OCR for bitmap tracks.
 8. **Done:** write the final manifest and close the job.
@@ -183,7 +183,7 @@ time without being stuck.
 
 ## 6. Find outputs and logs
 
-By default, the final MP4 is written beside the source. If an output folder was
+By default, the final MKV is written beside the source. If an output folder was
 specified, it is written there instead.
 
 The run record is stored in a **.vidlift-runs** folder and includes:
@@ -193,7 +193,7 @@ The run record is stored in a **.vidlift-runs** folder and includes:
   result, and verification evidence
 
 When **Enable subtitle OCR** is on and OCR produces a subtitle, VidLift writes
-an SRT beside the MP4 and embeds a soft subtitle track where supported. Turning
+an SRT beside the MKV and embeds a soft subtitle track where supported. Turning
 OCR off skips bitmap subtitle conversion while preserving ordinary text subtitle
 handling. OCR failures do not discard a successfully completed video.
 

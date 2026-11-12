@@ -16,11 +16,11 @@ records the version plan.
 VidLift is a batch AI upscaler for SD video FILES. Input: the formats
 of a 1990s-2000s movie shelf (AVI with XviD/DivX, MP4/M4V, MOV, MKV,
 WMV, FLV, MPG/MPEG/VOB), of unknown declared resolution. Output: a
-720p-frame HEVC MP4 per file, anamorphic-safe (16:9 -> 1280x720, 4:3
+720p-frame HEVC MKV per file, anamorphic-safe (16:9 -> 1280x720, 4:3
 -> 960x720), AAC audio, text subtitles passed through.
 
 It is a separate product from bluray-to-mp4 (which is "insert disc,
-get MP4s"); VidLift is "drop files, get better MP4s." The two share
+get MKVs"); VidLift is "drop files, get better MKVs." The two share
 an ENGINE, not a product. VidLift has no concept of discs, rips,
 drives, titles, MakeMKV, subtitle OCR, TMDB, or naming lookups: it
 names its outputs from the input filename. That separation is the
@@ -60,7 +60,7 @@ reports it honestly:
 - `field_order` and both frame rates (`r_frame_rate`,
   `avg_frame_rate`);
 - audio streams with channels; subtitle streams typed text/image
-  (v0.2 passes text subs through as mov_text; image subs are listed
+  (v0.2 passes text subs through as subrip; image subs are listed
   as "not carried," no OCR ever);
 - source-class heuristic: `xvid-divx-avi` (MPEG-4 ASP in an AVI, the
   expected common case), `dvd-mpeg2-rip` (MPEG-1/2), `h264-sd`

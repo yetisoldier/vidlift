@@ -1,16 +1,16 @@
 # VidLift
 
-<p align="center"><em>Turn old SD videos into clean 720p HEVC MP4s using local AI upscaling.</em></p>
+<p align="center"><em>Turn old SD videos into clean 720p HEVC MKVs using local AI upscaling.</em></p>
 
 <p align="center">[Windows 11] [Vulkan/GPU]</p>
 
 VidLift converts older standard-definition video files into clean 720p HEVC
-MP4s using a local Real-ESRGAN ncnn/Vulkan upscale pipeline.
+MKVs using a local Real-ESRGAN ncnn/Vulkan upscale pipeline.
 
 It supports common AVI, DivX, Xvid, MPEG, MP4, MOV, MKV, WMV, FLV, TS, M4V,
 and VOB inputs. VidLift probes each file, chooses safe geometry and
 deinterlacing behavior, preserves usable audio and subtitles, runs the AI
-upscale, encodes the final MP4, and verifies the result.
+upscale, encodes the final MKV, and verifies the result.
 
 ## Download for Windows 11
 
@@ -59,7 +59,7 @@ subtitle OCR should run, and select **Plan Batch**.
 ![VidLift home screen](docs/images/vidlift-home.png)
 
 The plan shows which files are ready, source type, output geometry, exact
-output filename (`<source-name>.720p.mp4` beside the source unless an
+output filename (`<source-name>.720p.mkv` beside the source unless an
 output folder was chosen), estimated size, subtitle handling, and warnings. Select a row
 to see an output preview covering the destination, HEVC video, AAC audio,
 subtitles, and estimated size.
@@ -88,7 +88,7 @@ VidLift performs:
 2. pre-flight plan
 3. deinterlace/prepare when required
 4. Real-ESRGAN AI upscale
-5. 720p HEVC MP4 encode
+5. 720p HEVC MKV encode
 6. full verification
 7. subtitle pass-through or OCR when possible
 
@@ -182,7 +182,7 @@ interface both process bulk queues serially so jobs do not compete for the GPU.
 
 For each successful job, VidLift writes:
 
-- a verified 720p HEVC MP4
+- a verified 720p HEVC MKV
 - an SRT sidecar when a subtitle was selected or recovered (opt-in: the
   "Suppress .srt sidecar on success" option deletes it after a successful
   embed — a failed embed always keeps it as the fallback)
@@ -199,8 +199,8 @@ VidLift includes a built-in pipeline to rescue subtitles from older SD videos. M
 
 **How it works:**
 VidLift uses Optical Character Recognition (OCR) to read these images and convert them into a standard text format. The result is delivered in two ways:
-- **Embedded:** The text is muxed into the final MP4 as a `mov_text` track, which is the universal standard supported by VLC, Plex, and Apple TV.
-- **Sidecar:** A separate `.srt` file is written next to your output MP4, allowing you to edit the subtitles manually in any text editor.
+- **Embedded:** The text is muxed into the final MKV as a `subrip` track, which is the universal standard supported by VLC, Plex, and Apple TV.
+- **Sidecar:** A separate `.srt` file is written next to your output MKV, allowing you to edit the subtitles manually in any text editor.
 
 **The OCR Engine:**
 On Windows, VidLift bundles the **Subtitle Edit (seconv)** headless converter and **Tesseract OCR**. It runs a disciplined two-pass process:

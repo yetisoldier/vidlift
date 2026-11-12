@@ -61,7 +61,7 @@ Options:
 
 - **--target 720p:** output target
 - **--gbph NUMBER:** approximate output gigabytes per hour
-- **--output-dir PATH:** final MP4 destination
+- **--output-dir PATH:** final MKV destination
 - **--log-dir PATH:** run log and manifest directory
 - **--engine auto|ncnn|stub:** engine selection
 - **--ffmpeg PATH / --ffprobe PATH:** override bundled binaries
@@ -93,7 +93,7 @@ Exit codes:
 ~~~
 
 Transcribes the file's own audio and soft-muxes the result into a NEW file
-beside the source as `{stem}.subs.mp4` (plus a `{stem}.subs.srt` sidecar). No
+beside the source as `{stem}.subs.mkv` (plus a `{stem}.subs.srt` sidecar). No
 upscale and no re-encode — the video and audio streams are copied. The source
 file is never modified by default.
 
@@ -111,11 +111,11 @@ Options:
 - **--force:** transcribe even when a usable text subtitle track already exists.
   Note: `--force` does NOT bypass the check for existing output files; if the
   output already exists, the job is still blocked.
-- **--suppress-srt:** after the subtitle track is muxed into the MP4, delete the redundant
+- **--suppress-srt:** after the subtitle track is muxed into the MKV, delete the redundant
   `.srt` sidecar (on a mux failure the sidecar is kept as the fallback; default: keep the sidecar)
 - **--replace-source:** after a verified pass, delete the source video and rename
-  the output to the source's name with an `.mp4` extension (e.g. `movie.avi` →
-  `movie.mp4`). If a file of that name already exists, both files are kept
+  the output to the source's name with an `.mkv` extension (e.g. `movie.avi` →
+  `movie.mkv`). If a file of that name already exists, both files are kept
   (default: off).
 - **--ffmpeg PATH / --ffprobe PATH:** override the bundled binaries
 

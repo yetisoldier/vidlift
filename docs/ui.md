@@ -24,7 +24,7 @@ The settings surface is divided into two titled groups: **Upscale** and **Add su
 - **Add Folder:** add supported videos directly inside one folder.
 - **Clear:** remove the current list.
 - **GB/hour:** set the approximate final size per hour of video.
-- **Output Folder:** send every planned MP4 to one destination.
+- **Output Folder:** send every planned MKV to one destination.
 - **Upscale engine:** choose the AI pass. `Auto (recommended)` tries the
   Real-ESRGAN ncnn/Vulkan engine and falls back to the stub when the
   binary, models, or GPU probe fail — recording the exact reason in the
@@ -48,7 +48,7 @@ The settings surface is divided into two titled groups: **Upscale** and **Add su
 
 **Add subtitles (no upscale) Group**
 - **Add Subtitles…:** Add videos to be processed for subtitles only (no AI upscale).
-- **Replace original on success (deletes source):** After a successful subtitles pass, delete the original file and rename the output to the original name with an `.mp4` extension (e.g. `movie.avi` → `movie.mp4`). If a file of that name already exists, both files are kept.
+- **Replace original on success (deletes source):** After a successful subtitles pass, delete the original file and rename the output to the original name with an `.mkv` extension (e.g. `movie.avi` → `movie.mkv`). If a file of that name already exists, both files are kept.
 - **Scope:** This mode adds subtitles from the file's own audio — video streams are copied without re-encoding or upscaling.
 - **Pre-flight Skip:** To prevent unnecessary runs, VidLift now checks files at the pick stage. Files that already carry a usable text subtitle track are marked as `skip — already has subtitles` and are not enqueued. Files whose output already exists are marked as `blocked — subtitles output already exists` and are not enqueued. These static rows are rendered in the table for visibility but do not become active jobs.
 
